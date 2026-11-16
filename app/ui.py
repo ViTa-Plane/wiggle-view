@@ -1,5 +1,4 @@
-# version 0.2.0
-
+# version 0.2.2
 
 import os
 import tempfile
@@ -91,13 +90,20 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Handle direct argument launch vs normal last-folder boot
         if initial_image_path and os.path.exists(initial_image_path):
             abs_path = os.path.abspath(initial_image_path)
-            folder_dir = os.path.dirname(abs_path)
+
+            if os.path.isdir(abs_path):
+                # Case 1: Argument is a folder path -> open the folder directly in gallery
+                folder_dir = abs_path
+                self.initial_target_image = None
+            else:
+                # Case 2: Argument is an image file -> open its parent folder and select/view the image
+                folder_dir = os.path.dirname(abs_path)
+                self.initial_target_image = abs_path
 
             self.left_browser.set_selected_folder(folder_dir)
             self.path_label.setText(f"{folder_dir}")
             self.save_last_folder(folder_dir)
 
-            self.initial_target_image = abs_path
             self.scan_id += 1
             scanner_task = FolderScannerTask(folder_dir, self.scan_id, self.scanner_signals)
             self.thread_pool.start(scanner_task)
