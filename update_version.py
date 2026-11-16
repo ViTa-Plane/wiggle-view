@@ -1,7 +1,7 @@
 import sys
 import re
 
-# version = 1.0.3
+# version = 1.0.6
 
 def bump_version_in_file(file_path):
     with open(file_path, 'r', encoding='utf-8') as f:
