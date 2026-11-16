@@ -179,4 +179,13 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+
 /.idea
+/backup
+/assets
+run python embeded.bat
+start_backup_script.py
+update_version.py
+settings.json
+
