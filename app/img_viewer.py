@@ -299,9 +299,18 @@ class ImageViewerCanvas(QWidget):
         return fit_scale * self.zoom
 
     def resizeEvent(self, event):
-        super().resizeEvent(event)
         old_size = event.oldSize()
         new_size = event.size()
+
+        # If toggling focus mode, anchor the pan offset using center delta
+        if getattr(self, '_is_toggling_focus', False):
+            if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
+                old_center = QPointF(old_size.width() / 2.0, old_size.height() / 2.0)
+                new_center = QPointF(new_size.width() / 2.0, new_size.height() / 2.0)
+                delta = new_center - old_center
+                self.offset = (QPointF(self.offset) + delta).toPoint()
+            super().resizeEvent(event)
+            return
 
         # Keep the visual center anchored during window resize using QPointF
         if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0 and not self.display_pixmap.isNull():
@@ -673,7 +682,8 @@ class ImageViewerWindow(QWidget):
                     border-radius: 10px;
                 }
             """)
-        self.canvas.reset_fit()
+
+        self.update_title_zoom()
 
     def toggle_fullscreen(self):
         if self.isFullScreen():
