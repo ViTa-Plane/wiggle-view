@@ -1,3 +1,5 @@
 # Core GUI & Utilities
 PySide6
 pillow
+cryptography
+send2trash

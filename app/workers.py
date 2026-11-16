@@ -1,14 +1,15 @@
-# version 0.2.0
+# version 0.2.3
 
 import os
 import hashlib
 
-from PySide6.QtCore import Qt, QSize, QRunnable, Signal, QObject, QRect, QPoint
-from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent,QImageReader
+from PySide6.QtCore import Qt, QSize, QRunnable, Signal, QObject, QBuffer, QIODevice
+from PySide6.QtGui import QColor, QPixmap, QPainter, QImageReader
+from .encryption import encrypt_data
 
 class FolderScannerSignals(QObject):
-    batch_scanned = Signal(int, list)  # scan_id, batch
-    scan_complete = Signal(int, int)   # scan_id, total_count
+    batch_scanned = Signal(int, list)
+    scan_complete = Signal(int, int)
 
 
 class FolderScannerTask(QRunnable):
@@ -80,13 +81,11 @@ class ThumbnailLoaderTask(QRunnable):
             thumb_path = os.path.join(self.cache_dir, thumb_filename)
 
             if not os.path.exists(thumb_path):
-                # Use QImageReader to load huge images safely without memory spikes
                 reader = QImageReader(self.file_path)
                 reader.setAutoTransform(True)
 
                 orig_size = reader.size()
                 if orig_size.isValid():
-                    # Scale down to fit the target thumbnail size while keeping aspect ratio
                     reader.setScaledSize(
                         orig_size.scaled(self.target_size, self.target_size, Qt.AspectRatioMode.KeepAspectRatio))
 
@@ -100,13 +99,20 @@ class ThumbnailLoaderTask(QRunnable):
                     painter = QPainter(canvas)
                     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
-                    # Center the scaled image inside the square thumbnail card
                     x = (self.target_size - pixmap.width()) // 2
                     y = (self.target_size - pixmap.height()) // 2
                     painter.drawPixmap(x, y, pixmap)
                     painter.end()
 
-                    canvas.save(thumb_path, "JPG", 88)
+                    # Save to QBuffer to capture bytes and encrypt them
+                    buffer = QBuffer()
+                    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+                    canvas.save(buffer, "JPG", 88)
+                    raw_bytes = buffer.data().data()
+
+                    encrypted_bytes = encrypt_data(raw_bytes)
+                    with open(thumb_path, "wb") as f_out:
+                        f_out.write(encrypted_bytes)
 
             if os.path.exists(thumb_path):
                 self.signals.thumbnail_ready.emit(self.file_path, thumb_path)

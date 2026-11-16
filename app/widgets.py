@@ -1,14 +1,13 @@
-# version 0.1.7
+# version 0.2.0
 
 import os
 
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon
 from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
+from .encryption import decrypt_data
 
 class WindowDragHandler:
-    """Mixin class to handle window dragging (edge-resizing handled strictly via corner grip)."""
-
     def __init__(self):
         self._drag_pos = QPoint()
 
@@ -29,13 +28,10 @@ class WindowDragHandler:
 
 
 class ResizeHandleWidget(QWidget):
-    """Exclusive interactive bottom-right corner resize handle."""
-
     def __init__(self, parent_window):
         super().__init__()
         self.parent_window = parent_window
         self.setFixedSize(16, 16)
-        # self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         self.hovered = False
 
         self._resizing = False
@@ -83,11 +79,6 @@ class ResizeHandleWidget(QWidget):
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
 
-        # painter.drawLine(13, 3, 3, 13)
-        # painter.drawLine(13, 7, 7, 13)
-        # painter.drawLine(13, 11, 11, 13)
-
-        # Draw a filled corner triangle
         triangle = QPolygon([
             QPoint(15, 15),
             QPoint(15, 5),
@@ -97,8 +88,6 @@ class ResizeHandleWidget(QWidget):
 
 
 class TitleBar(QWidget, WindowDragHandler):
-    """Reusable draggable title bar supporting window controls."""
-
     def __init__(self, title_text, parent_window, show_min_max=False):
         super().__init__()
         WindowDragHandler.__init__(self)
@@ -115,12 +104,8 @@ class TitleBar(QWidget, WindowDragHandler):
         self.title_label = QLabel(title_text)
         self.title_label.setObjectName("TitleLabel")
         self.title_label.setStyleSheet("""
-                color: #94a3b8;
-                font-family: sans-serif;
-                font-size: 12px;
-                font-weight: bold;
-                background-color: transparent;
-            """)
+            color: #94a3b8; font-family: sans-serif; font-size: 12px; font-weight: bold; background-color: transparent;
+        """)
         h_layout.addWidget(self.title_label)
         h_layout.addStretch()
 
@@ -129,19 +114,8 @@ class TitleBar(QWidget, WindowDragHandler):
             self.min_btn.setFixedSize(28, 28)
             self.min_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self.min_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: transparent;
-                    color: #94a3b8;
-                    border: none;
-                    border-radius: 6px;
-                    font-family: sans-serif;
-                    font-size: 13px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #1e293b;
-                    color: #ffffff;
-                }
+                QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-weight: bold; }
+                QPushButton:hover { background-color: #1e293b; color: #ffffff; }
             """)
             self.min_btn.clicked.connect(self.parent_window.showMinimized)
             h_layout.addWidget(self.min_btn)
@@ -150,19 +124,8 @@ class TitleBar(QWidget, WindowDragHandler):
             self.max_btn.setFixedSize(28, 28)
             self.max_btn.setCursor(Qt.CursorShape.PointingHandCursor)
             self.max_btn.setStyleSheet("""
-                QPushButton {
-                    background-color: transparent;
-                    color: #94a3b8;
-                    border: none;
-                    border-radius: 6px;
-                    font-family: sans-serif;
-                    font-size: 13px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #1e293b;
-                    color: #ffffff;
-                }
+                QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-weight: bold; }
+                QPushButton:hover { background-color: #1e293b; color: #ffffff; }
             """)
             self.max_btn.clicked.connect(self.toggle_maximize)
             h_layout.addWidget(self.max_btn)
@@ -171,19 +134,8 @@ class TitleBar(QWidget, WindowDragHandler):
         self.close_btn.setFixedSize(28, 28)
         self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_btn.setStyleSheet("""
-            QPushButton {
-                background-color: transparent;
-                color: #94a3b8;
-                border: none;
-                border-radius: 6px;
-                font-family: sans-serif;
-                font-size: 14px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #c42b1c;
-                color: #ffffff;
-            }
+            QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-weight: bold; }
+            QPushButton:hover { background-color: #c42b1c; color: #ffffff; }
         """)
         self.close_btn.clicked.connect(self.parent_window.close)
         h_layout.addWidget(self.close_btn)
@@ -210,13 +162,9 @@ class TitleBar(QWidget, WindowDragHandler):
 
 
 class ResponsiveGridWidget(QWidget):
-    """
-    Custom grid widget with deterministic sizeHint(), GPU-accelerated painting,
-    RAM caching, multi-selection (Ctrl+Click and Shift+Click range), and double-click image viewer launching.
-    """
-    item_selected = Signal(str, str)  # file_path, display_name
-    selection_changed = Signal(list)  # list of selected file_paths
-    item_double_clicked = Signal(str)  # file_path
+    item_selected = Signal(str, str)
+    selection_changed = Signal(list)
+    item_double_clicked = Signal(str)
 
     def __init__(self, cell_width=200, cell_height=220, image_size=170, parent=None):
         super().__init__(parent)
@@ -225,12 +173,10 @@ class ResponsiveGridWidget(QWidget):
         self.image_size = image_size
         self.cards = []
         self.selected_file_paths = set()
-        self.last_clicked_index = None  # Anchor index for Shift+Click range selection
+        self.last_clicked_index = None
         self.pixmap_cache = {}
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-        # --- GPU Acceleration & Paint Optimizations ---
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WidgetAttribute.WA_StaticContents, True)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
@@ -287,7 +233,6 @@ class ResponsiveGridWidget(QWidget):
                 is_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
 
                 if is_shift and self.last_clicked_index is not None:
-                    # Shift + Click: Range selection
                     start = min(self.last_clicked_index, index)
                     end = max(self.last_clicked_index, index)
                     if not is_ctrl:
@@ -295,24 +240,18 @@ class ResponsiveGridWidget(QWidget):
                     for i in range(start, end + 1):
                         self.selected_file_paths.add(self.cards[i]["file_path"])
                 elif is_ctrl:
-                    # Ctrl + Click: Toggle individual item
                     if path in self.selected_file_paths:
                         self.selected_file_paths.remove(path)
                     else:
                         self.selected_file_paths.add(path)
                     self.last_clicked_index = index
                 else:
-                    # Normal single click
                     self.selected_file_paths = {path}
                     self.last_clicked_index = index
 
-                # Emit selection change first
                 self.selection_changed.emit(list(self.selected_file_paths))
-
-                # ONLY emit item_selected (which triggers single-card inspection) if exactly ONE item is selected and NO modifiers were used
                 if len(self.selected_file_paths) == 1 and not is_shift and not is_ctrl:
                     self.item_selected.emit(path, clicked_item["display_name"])
-
                 self.update()
             else:
                 self.deselect_all()
@@ -324,12 +263,10 @@ class ResponsiveGridWidget(QWidget):
             if 0 <= index < len(self.cards):
                 clicked_item = self.cards[index]
                 path = clicked_item["file_path"]
-                # Force single selection on double-click
                 self.selected_file_paths = {path}
                 self.last_clicked_index = index
                 self.selection_changed.emit(list(self.selected_file_paths))
                 self.update()
-
                 self.item_double_clicked.emit(path)
         super().mouseDoubleClickEvent(event)
 
@@ -342,7 +279,6 @@ class ResponsiveGridWidget(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        # Enable hardware GPU acceleration hints for smooth rendering
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
         painter.setRenderHint(QPainter.RenderHint.TextAntialiasing, True)
@@ -390,7 +326,15 @@ class ResponsiveGridWidget(QWidget):
                 thumb_path = item.get("thumb_path")
                 if thumb_path and os.path.exists(thumb_path):
                     if thumb_path not in self.pixmap_cache:
-                        self.pixmap_cache[thumb_path] = QPixmap(thumb_path)
+                        try:
+                            with open(thumb_path, "rb") as f_in:
+                                encrypted_bytes = f_in.read()
+                            decrypted_bytes = decrypt_data(encrypted_bytes)
+                            px = QPixmap()
+                            px.loadFromData(decrypted_bytes, "JPG")
+                            self.pixmap_cache[thumb_path] = px
+                        except Exception:
+                            self.pixmap_cache[thumb_path] = QPixmap()
 
                     pixmap = self.pixmap_cache[thumb_path]
                     if not pixmap.isNull():

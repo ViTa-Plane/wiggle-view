@@ -1,9 +1,9 @@
-# version 0.1.8
+# version 0.2.8
 
 import os
 import json
 from PIL import Image
-from PIL.ExifTags import TAGS
+from PIL.ExifTags import TAGS, GPSTAGS
 
 # Define your default schema here. Add any future settings keys to this dictionary.
 DEFAULT_SETTINGS = {
@@ -13,7 +13,6 @@ DEFAULT_SETTINGS = {
     "sort_criteria": "name",
     "sort_reverse": False
 }
-
 
 def load_settings(settings_file="settings.json"):
     """Loads settings from JSON, merging with defaults so new keys are always present."""
@@ -27,7 +26,6 @@ def load_settings(settings_file="settings.json"):
         except Exception as e:
             print(f"Error loading settings: {e}")
     return settings
-
 
 def save_settings(settings_file="settings.json", new_values=None):
     """Safely updates and persists settings to JSON without losing other keys."""
@@ -43,14 +41,12 @@ def save_settings(settings_file="settings.json", new_values=None):
     except Exception as e:
         print(f"Error saving settings: {e}")
 
-
 def format_file_size(b_size):
     """Converts raw byte size into a clean human-readable KB or MB string."""
     if b_size >= 1024 * 1024:
         return f"{b_size / (1024 * 1024):.2f} MB"
     else:
         return f"{b_size / 1024:.1f} KB"
-
 
 def extract_exif_metadata(file_path):
     """Extracts and formats comprehensive EXIF metadata and image info headers."""
@@ -106,6 +102,97 @@ def extract_exif_metadata(file_path):
 
     return exif_text
 
+def extract_image_metadata(path):
+    """
+    Extracts raw binary EXIF bytes and a complete human-readable metadata dictionary
+    from WebP, JPEG, and PNG files, handling raw byte stream reloads for WebP.
+    Returns: (exif_data_bytes, exif_dict)
+    """
+    exif_data_bytes = None
+    exif_dict = {}
+
+    EXIF_IFD_TAG = 34665
+    GPS_IFD_TAG = 34853
+    INTEROP_IFD_TAG = 40965
+
+    try:
+        with Image.open(path) as src:
+            # 1. Grab raw binary EXIF bytes block
+            exif_data_bytes = src.info.get('exif')
+
+            # 2. If it's a WebP or format with hidden EXIF bytes, load via Image.Exif() directly from bytes
+            loaded_exif = None
+            if exif_data_bytes:
+                try:
+                    loaded_exif = Image.Exif()
+                    loaded_exif.load(exif_data_bytes)
+                except Exception:
+                    pass
+
+            if not loaded_exif:
+                try:
+                    loaded_exif = src.getexif()
+                except Exception:
+                    pass
+
+            if loaded_exif:
+                if not exif_data_bytes:
+                    try:
+                        exif_data_bytes = loaded_exif.tobytes()
+                    except Exception:
+                        pass
+
+                # Parse root tags (IFD0)
+                for tag_id, val in loaded_exif.items():
+                    tag_name = TAGS.get(tag_id, tag_id)
+                    exif_dict[str(tag_name)] = _clean_metadata_value(val)
+
+                # Parse sub-IFDs (Exif, GPS, Interop)
+                for ifd_tag, tag_lookup in [(EXIF_IFD_TAG, TAGS), (GPS_IFD_TAG, GPSTAGS), (INTEROP_IFD_TAG, TAGS)]:
+                    try:
+                        sub_ifd = loaded_exif.get_ifd(ifd_tag)
+                        for sub_id, sub_val in sub_ifd.items():
+                            sub_name = tag_lookup.get(sub_id, sub_id)
+                            exif_dict[str(sub_name)] = _clean_metadata_value(sub_val)
+                    except Exception:
+                        pass
+
+            # 3. Fallback to _getexif()
+            try:
+                raw_exif = src._getexif()
+                if raw_exif:
+                    for k, v in raw_exif.items():
+                        tag_name = TAGS.get(k, k)
+                        exif_dict[str(tag_name)] = _clean_metadata_value(v)
+            except Exception:
+                pass
+
+            # 4. Extract standard info chunks (PNG text, etc.)
+            if hasattr(src, 'info') and src.info:
+                for k, v in src.info.items():
+                    if k not in ['exif', 'icc_profile', 'jfif'] and isinstance(v, (str, int, float, bytes)):
+                        exif_dict[str(k)] = _clean_metadata_value(v)
+
+    except Exception as e:
+        print(f"Error extracting metadata from {path}: {e}")
+
+    # Strictly filter out JFIF technical header noise, empty keys, and raw digits
+    filtered_exif_dict = {
+        k: v for k, v in exif_dict.items()
+        if k and not k.lower().startswith("jfif") and not k.isdigit() and str(v).strip()
+    }
+
+    return exif_data_bytes, filtered_exif_dict
+
+def _clean_metadata_value(val):
+    if isinstance(val, bytes):
+        try:
+            return val.decode('utf-8', errors='ignore').strip()
+        except Exception:
+            return str(val)
+    elif isinstance(val, tuple):
+        return ", ".join(str(item) for item in val)
+    return str(val)
 
 def add_folder_to_favorites(folder_path, settings_file="settings.json"):
     """Adds a folder to favorites, moving it to the front if it exists, and limits the list to the last 6 added."""

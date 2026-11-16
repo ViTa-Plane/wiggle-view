@@ -1,4 +1,4 @@
-# version 0.1.9
+# version 0.2.6
 
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
@@ -20,6 +20,11 @@ class TopMenuBar(QMenuBar):
     about_requested = Signal()
     favorite_selected = Signal(str)  # Emits selected folder path from favorites
     add_favorite_requested = Signal()  # Emits signal to add current folder to favorites
+    # --- Tool Signals ---
+    convert_requested = Signal()
+    purge_exif_requested = Signal()
+    inject_exif_requested = Signal()
+    export_exif_requested = Signal()
 
     def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False):
         super().__init__(parent)
@@ -128,6 +133,27 @@ class TopMenuBar(QMenuBar):
         select_menu.addAction(select_all_action)
         select_menu.addAction(deselect_action)
         select_menu.addAction(inverse_action)
+
+        # --- Tools Menu ---
+        tools_menu = self.addMenu("Tools")
+
+        convert_action = QAction("Convert...", self)
+        convert_action.triggered.connect(self.convert_requested.emit)
+
+        purge_action = QAction("Purge EXIF data", self)
+        purge_action.triggered.connect(self.purge_exif_requested.emit)
+
+        inject_action = QAction("Inject EXIF data...", self)
+        inject_action.triggered.connect(self.inject_exif_requested.emit)
+
+        export_action = QAction("Export EXIF data...", self)
+        export_action.triggered.connect(self.export_exif_requested.emit)
+
+        tools_menu.addAction(convert_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(purge_action)
+        tools_menu.addAction(inject_action)
+        tools_menu.addAction(export_action)
 
         # --- About Menu ---
         about_action = QAction("About", self)

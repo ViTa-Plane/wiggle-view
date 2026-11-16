@@ -191,4 +191,4 @@ settings.json
 
 /backup
 update_version.py
-settings.json
+*.json

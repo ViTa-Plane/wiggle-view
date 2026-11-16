@@ -1,21 +1,27 @@
-# version 0.2.2
+# version 0.7.3
 
 import os
+import shutil
 import tempfile
+import send2trash
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter
+    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter, QInputDialog, QDialog, QMenu,
+    QMessageBox
 )
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject, QFileSystemWatcher, QMimeData, QUrl
 from PySide6.QtGui import QColor, QImageReader, QGuiApplication
 
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
-from .dialogs import ChildTestDialog, AboutDialog, SettingsDialog
+from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
 from .workers import ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask
 from .widgets import WindowDragHandler, TitleBar, ResponsiveGridWidget, ResizeHandleWidget
 from .components import SidebarPanel, DirectoryBrowserPanel, TopMenuBar
-from .helpers import load_settings, save_settings, format_file_size, extract_exif_metadata,add_folder_to_favorites
+from .helpers import load_settings, save_settings, format_file_size, extract_exif_metadata, add_folder_to_favorites, \
+    extract_image_metadata
 
 SETTINGS_FILE = "settings.json"
 
@@ -26,6 +32,7 @@ class MetadataWorkerSignals(QObject):
 
 class MetadataLoaderTask(QRunnable):
     """Background worker task to load QImage dimensions and EXIF metadata off the main GUI thread."""
+
     def __init__(self, file_path, filename, size_str, signals):
         super().__init__()
         self.file_path = file_path
@@ -84,6 +91,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Sorting state tracking
         self.current_sort_criteria = "name"
         self.sort_reverse = False
+
+        # Initialize the File System Watcher
+        self.file_watcher = QFileSystemWatcher(self)
+        self.file_watcher.directoryChanged.connect(self._on_directory_changed)
+        self.current_watched_dir = None
 
         self._setup_ui()
 
@@ -171,7 +183,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             sort_criteria=self.current_sort_criteria,
             sort_reverse=self.sort_reverse
         )
-        
+
         self.menu_bar.open_folder_requested.connect(self.open_folder_dialog)
         self.menu_bar.exit_requested.connect(self.close)
         self.menu_bar.sort_criteria_changed.connect(self.set_sort_criteria)
@@ -183,7 +195,10 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.add_favorite_requested.connect(self.add_current_folder_to_favorites)
-
+        self.menu_bar.convert_requested.connect(self.batch_convert_images)
+        self.menu_bar.purge_exif_requested.connect(self.batch_purge_exif)
+        self.menu_bar.inject_exif_requested.connect(self.batch_inject_exif)
+        self.menu_bar.export_exif_requested.connect(self.batch_export_exif)
 
         container_layout.addWidget(self.menu_bar)
 
@@ -239,6 +254,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
             cell_height=self.GRID_CELL_HEIGHT,
             image_size=self.CARD_IMAGE_SIZE
         )
+
+        # Configure Grid Context Menu & Focus Policy
+        self.workspace_grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.workspace_grid.customContextMenuRequested.connect(self.show_grid_context_menu)
+        self.workspace_grid.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
         self.workspace_grid.item_selected.connect(self.on_card_selected)
         self.workspace_grid.selection_changed.connect(self.on_selection_changed)
         self.workspace_grid.item_double_clicked.connect(self.open_image_viewer)
@@ -317,6 +338,15 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_images_from_folder(folder_path)
 
     def load_images_from_folder(self, folder_path):
+        if not folder_path or not os.path.exists(folder_path):
+            return
+
+        # Update watched directory for QFileSystemWatcher
+        if self.current_watched_dir:
+            self.file_watcher.removePath(self.current_watched_dir)
+
+        self.current_watched_dir = folder_path
+        self.file_watcher.addPath(folder_path)
         self.batch_timer.stop()
         self.loaded_items.clear()
         self.workspace_grid.set_cards(self.loaded_items)
@@ -443,30 +473,47 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.detached_viewers.append(detached_viewer)
             return
 
-        # Standard behavior[cite: 1, 2]
+        # Standard behavior[cite: 1]
         self.set_status(f"Opening viewer for: {os.path.basename(file_path)}")
         self.hide()
         self.viewer_window = ImageViewerWindow(file_path, self)
         self.viewer_window.show()
 
-    def open_child_window(self):
-        self.set_status("Opening Child Window...")
-        dialog = ChildTestDialog(self, custom_title="✨ Child Test Dialog Window")
-        dialog.exec()
-        self.set_status("Ready")
+    def open_current_folder_in_explorer(self):
+        data = load_settings(SETTINGS_FILE)
+        folder = data.get("last_folder", "")
 
-    def show_about_dialog(self):
-        self.set_status("Viewing About Dialog...")
-        dialog = AboutDialog(self)
-        dialog.exec()
-        self.set_status("Ready")
+        if folder and os.path.isdir(folder):
+            import subprocess
+            import platform
 
-    def open_settings_dialog(self):
-        self.set_status("Opening Settings Window...")
-        dialog = SettingsDialog(self)
-        dialog.exec()
-        self.set_status("Ready")
+            try:
+                if platform.system() == "Windows":
+                    os.startfile(folder)
+                elif platform.system() == "Darwin":
+                    subprocess.run(["open", folder])
+                else:
+                    subprocess.run(["xdg-open", folder])
+                self.set_status(f"Opened folder in Explorer: {os.path.basename(folder)}")
+            except Exception as e:
+                self.set_status(f"Could not open explorer: {e}")
+        else:
+            self.set_status("No active folder to open.")
 
+    def _get_target_file_paths(self):
+        """Returns currently selected absolute paths if any, otherwise all loaded items."""
+        paths = []
+        if hasattr(self.workspace_grid, 'selected_file_paths') and self.workspace_grid.selected_file_paths:
+            paths = list(self.workspace_grid.selected_file_paths)
+        else:
+            paths = [item["file_path"] for item in self.loaded_items]
+
+        # Filter down to absolute paths of files that physically exist
+        valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
+        print(f"DEBUG: Resolved target file paths for deletion -> {valid_paths}")
+        return valid_paths
+
+    #  -----------sort menu functions--------------
     def set_sort_criteria(self, criteria):
         self.current_sort_criteria = criteria
         save_settings(SETTINGS_FILE, {"sort_criteria": criteria})
@@ -498,27 +545,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self.workspace_grid.set_cards(self.loaded_items)
 
-    def open_current_folder_in_explorer(self):
-        data = load_settings(SETTINGS_FILE)
-        folder = data.get("last_folder", "")
-
-        if folder and os.path.isdir(folder):
-            import subprocess
-            import platform
-
-            try:
-                if platform.system() == "Windows":
-                    os.startfile(folder)
-                elif platform.system() == "Darwin":
-                    subprocess.run(["open", folder])
-                else:
-                    subprocess.run(["xdg-open", folder])
-                self.set_status(f"Opened folder in Explorer: {os.path.basename(folder)}")
-            except Exception as e:
-                self.set_status(f"Could not open explorer: {e}")
-        else:
-            self.set_status("No active folder to open.")
-
+    #  -----------select menu functions--------------
     def select_all_items(self):
         if self.loaded_items:
             self.workspace_grid.select_all()
@@ -558,6 +585,202 @@ class MainWindow(QMainWindow, WindowDragHandler):
             )
             self.set_status(f"Selected {count} of {total} items ({size_str})")
 
+    #  -----------grid context menu and file operations--------------
+    def show_grid_context_menu(self, pos):
+        """Displays the right-click context menu on the image grid."""
+        selected_paths = self._get_target_file_paths()
+
+        menu = QMenu(self)
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #0d1321;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #3b82f6;
+                color: white;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #1e293b;
+                margin: 4px 0px;
+            }
+        """)
+
+        copy_action = menu.addAction("Copy")
+        cut_action = menu.addAction("Cut")
+        paste_action = menu.addAction("Paste")
+        menu.addSeparator()
+        delete_action = menu.addAction("Delete")
+
+        has_selection = len(selected_paths) > 0
+        copy_action.setEnabled(has_selection)
+        cut_action.setEnabled(has_selection)
+        delete_action.setEnabled(has_selection)
+
+        clipboard = QGuiApplication.clipboard()
+        mime_data = clipboard.mimeData()
+        has_files_in_clipboard = mime_data.hasUrls()
+        paste_action.setEnabled(has_files_in_clipboard)
+
+        action = menu.exec(self.workspace_grid.mapToGlobal(pos))
+
+        if action == copy_action:
+            self.copy_selected_files(selected_paths, cut=False)
+        elif action == cut_action:
+            self.copy_selected_files(selected_paths, cut=True)
+        elif action == paste_action:
+            self.paste_files_from_clipboard()
+        elif action == delete_action:
+            self.delete_selected_files(selected_paths)
+
+
+
+    def paste_files_from_clipboard(self):
+        """Pastes files from clipboard into the currently active folder directory."""
+        if not hasattr(self, 'current_watched_dir') or not self.current_watched_dir:
+            self.set_status("No active folder destination for pasting.")
+            return
+
+        clipboard = QGuiApplication.clipboard()
+        mime_data = clipboard.mimeData()
+
+        if not mime_data.hasUrls():
+            self.set_status("No files found in clipboard to paste.")
+            return
+
+        success_count = 0
+        for url in mime_data.urls():
+            src_path = url.toLocalFile()
+            if src_path and os.path.exists(src_path):
+                try:
+                    filename = os.path.basename(src_path)
+                    dest_path = os.path.join(self.current_watched_dir, filename)
+
+                    base, ext = os.path.splitext(filename)
+                    counter = 1
+                    while os.path.exists(dest_path):
+                        dest_path = os.path.join(self.current_watched_dir, f"{base}_copy{counter}{ext}")
+                        counter += 1
+
+                    if hasattr(self, '_cut_source_paths') and src_path in self._cut_source_paths:
+                        shutil.move(src_path, dest_path)
+                    else:
+                        shutil.copy2(src_path, dest_path)
+
+                    success_count += 1
+                except Exception as e:
+                    print(f"Failed to paste {src_path}: {e}")
+
+        if hasattr(self, '_cut_source_paths'):
+            self._cut_source_paths = []
+
+        self.set_status(f"Pasted {success_count} file(s) into current folder.")
+        self.load_images_from_folder(self.current_watched_dir)
+
+    def copy_selected_files(self, paths, cut=False):
+        """Copies or cuts selected file paths to the system clipboard. If no selection, copies the whole gallery."""
+        # If no specific paths are selected, fallback to copying the entire loaded gallery
+        if not paths:
+            paths = [item["file_path"] for item in self.loaded_items if os.path.exists(item["file_path"])]
+
+        if not paths:
+            self.set_status("No images available to copy.")
+            return
+
+        clipboard = QGuiApplication.clipboard()
+        mime_data = QMimeData()
+        urls = [QUrl.fromLocalFile(p) for p in paths if os.path.exists(p)]
+        mime_data.setUrls(urls)
+
+        clipboard.setMimeData(mime_data)
+
+        if cut:
+            self._cut_source_paths = paths
+        else:
+            self._cut_source_paths = []
+
+        action_name = "Cut" if cut else "Copied"
+        target_desc = "selected file(s)" if self.workspace_grid.selected_file_paths else "entire gallery"
+        self.set_status(f"{action_name} {len(paths)} file(s) ({target_desc}) to clipboard.")
+
+    def delete_selected_files(self, paths):
+        """Safely sends selected image files to the Recycle Bin and updates the grid in-place without folder re-scans."""
+        if not paths:
+            print("DEBUG: delete_selected_files called with empty paths list.")
+            self.status_label.setText("Status: Deletion failed - No valid images selected.")
+            return
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete",
+            f"Are you sure you want to move {len(paths)} selected file(s) to the Recycle Bin?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        deleted_paths = set()
+        try:
+            from send2trash import send2trash
+            for path in paths:
+                norm_path = os.path.abspath(path)
+                if os.path.exists(norm_path):
+                    send2trash(norm_path)
+                    deleted_paths.add(norm_path)
+        except ImportError:
+            print("DEBUG Error: 'send2trash' module is not installed! Falling back to os.remove().")
+            for path in paths:
+                try:
+                    norm_path = os.path.abspath(path)
+                    if os.path.exists(norm_path):
+                        os.remove(norm_path)
+                        deleted_paths.add(norm_path)
+                except Exception as e:
+                    print(f"DEBUG Error: Permanent deletion failed for {path}: {e}")
+        except Exception as e:
+            print(f"DEBUG Error encountered during delete execution: {e}")
+
+        if deleted_paths:
+            # 1. Instantly filter out deleted items from loaded_items memory cache
+            self.loaded_items = [
+                item for item in self.loaded_items
+                if os.path.abspath(item["file_path"]) not in deleted_paths
+            ]
+
+            # 2. Update the workspace grid cards in-place without scrolling/focus jump
+            self.workspace_grid.set_cards(self.loaded_items)
+
+            deleted_count = len(deleted_paths)
+            total_remaining = len(self.loaded_items)
+            self.set_status(f"Moved {deleted_count} file(s) to Recycle Bin. Total remaining: {total_remaining}")
+
+            # Update sidebar summary label without full scan
+            self.right_sidebar.inspector_label.setText(
+                f"Inspector Properties:\n\n• Folder Selected\n• Total Images: {total_remaining}\n• Selected: None"
+            )
+        else:
+            self.set_status("Deletion failed: No files were removed.")
+
+    def keyPressEvent(self, event):
+        """Handles keyboard shortcuts like Delete/Backspace for removing selected images."""
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            selected_paths = self._get_target_file_paths()
+            if selected_paths:
+                self.delete_selected_files(selected_paths)
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+    #  -----------favorites  menu functions--------------
     def jump_to_favorite_folder(self, folder_path):
         if folder_path and os.path.isdir(folder_path):
             # 1. Load the images and start the thumbnail batch pipeline
@@ -592,6 +815,330 @@ class MainWindow(QMainWindow, WindowDragHandler):
         else:
             self.set_status("No active folder to add to favorites.")
 
+    #  -----------tools menu functions--------------
+    def batch_convert_images(self):
+        paths = self._get_target_file_paths()
+        if not paths:
+            self.set_status("No images available for conversion.")
+            return
+
+        dialog = BatchConvertDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        target_format = dialog.format_combo.currentText()
+        quality = dialog.quality_slider.value()
+        transfer_exif = dialog.transfer_exif_cb.isChecked()
+        remove_original = dialog.remove_original_cb.isChecked()
+
+        success_count = 0
+        failed_count = 0
+        target_ext = target_format.lower()
+        if target_ext == "jpg":
+            target_ext = "jpeg"
+
+        _TAGS_r = {v: k for k, v in TAGS.items()}
+
+        for path in paths:
+            try:
+                base, _ = os.path.splitext(path)
+                new_path = f"{base}_converted.{target_ext}"
+
+                # 1. Extract source metadata if transfer_exif is enabled
+                exif_data_bytes = None
+                exif_dict = {}
+                if transfer_exif:
+                    exif_data_bytes, exif_dict = extract_image_metadata(path)
+
+                # Filter out JFIF noise
+                filtered_exif_dict = {
+                    k: v for k, v in exif_dict.items()
+                    if not k.lower().startswith("jfif")
+                }
+
+                # 2. Perform conversion and save
+                with Image.open(path) as img:
+                    if target_ext in ["jpg", "jpeg"] and (
+                            img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)):
+                        background = Image.new("RGB", img.size, (255, 255, 255))
+                        if img.mode == "P":
+                            img = img.convert("RGBA")
+                        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                        img_to_save = background
+                    else:
+                        img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
+
+                    save_format = "JPEG" if target_ext == "jpeg" else target_format.upper()
+
+                    # Initial save with quality if applicable
+                    if target_ext in ["jpeg", "jpg", "webp"]:
+                        img_to_save.save(new_path, save_format, quality=quality)
+                    else:
+                        img_to_save.save(new_path, save_format)
+
+                # 3. Apply EXIF/Metadata transfer to the newly converted file if enabled
+                if transfer_exif:
+                    with Image.open(new_path) as target:
+                        if target_ext in ["png"]:
+                            from PIL import PngImagePlugin
+                            meta = PngImagePlugin.PngInfo()
+                            for k, v in exif_dict.items():
+                                meta.add_text(str(k), str(v))
+                            target.save(new_path, pnginfo=meta)
+                        else:
+                            # For JPEGs: Build clean EXIF object directly from our extracted dictionary (fixing the direct transfer bug)
+                            try:
+                                exif_obj = target.getexif()
+                                if exif_obj is None:
+                                    exif_obj = Image.Exif()
+
+                                _TAGS_r = {v: k for k, v in TAGS.items()}
+                                _GPSTAGS_r = {v: k for k, v in GPSTAGS.items()}
+
+                                for k, v in exif_dict.items():
+                                    tag_id = _TAGS_r.get(k) or _GPSTAGS_r.get(k)
+                                    if tag_id is not None:
+                                        try:
+                                            exif_obj[tag_id] = v
+                                        except Exception:
+                                            pass
+
+                                target.save(new_path, exif=exif_obj.tobytes(),
+                                            quality=quality if target_ext in ["jpeg", "jpg", "webp"] else None)
+                            except Exception as save_err:
+                                print(f"Direct EXIF transfer fallback save error: {save_err}")
+                                target.save(new_path)
+
+                # 4. Remove original source file if requested
+                if remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
+                    os.remove(path)
+
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"Failed to convert {path}: {e}")
+
+        if success_count > 0:
+            qual_str = f" (Quality: {quality})" if target_format != "PNG" else ""
+            msg = f"Successfully converted {success_count} images to {target_format}{qual_str}."
+            if failed_count > 0:
+                msg += f" ({failed_count} failed)."
+            self.set_status(msg)
+
+            if paths and os.path.dirname(paths[0]):
+                self.load_images_from_folder(os.path.dirname(paths[0]))
+
+            complete_dialog = BatchCompleteDialog(self, "Batch Conversion Complete", msg)
+            complete_dialog.exec()
+        else:
+            err_msg = f"Conversion failed for all {len(paths)} selected images."
+            self.set_status(err_msg)
+            complete_dialog = BatchCompleteDialog(self, "Batch Conversion Failed", err_msg)
+            complete_dialog.exec()
+
+    def batch_purge_exif(self):
+        paths = self._get_target_file_paths()
+        if not paths:
+            self.set_status("No images selected for EXIF purge.")
+            return
+
+        success_count = 0
+        for path in paths:
+            try:
+                with Image.open(path) as img:
+                    data = list(img.getdata())
+                    clean_img = Image.new(img.mode, img.size)
+                    clean_img.putdata(data)
+                    clean_img.save(path)  # Overwrites original or saves clean copy
+                success_count += 1
+            except Exception as e:
+                print(f"Failed to purge EXIF for {path}: {e}")
+        self.set_status(f"Purged EXIF data from {success_count} images.")
+        dialog = BatchCompleteDialog(self, "EXIF Purge Complete",
+                                     f"Successfully purged EXIF data from {success_count} images.")
+        dialog.exec()
+
+    def batch_export_exif(self):
+        paths = self._get_target_file_paths()
+        if not paths:
+            self.set_status("No images selected for EXIF export.")
+            return
+
+        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory for EXIF JSON")
+        if not export_dir:
+            return
+
+        import json
+        success_count = 0
+        last_json_filename = ""
+
+        for path in paths:
+            try:
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                json_filename = f"{base_name}_EXIF.json"
+                out_json = os.path.join(export_dir, json_filename)
+                last_json_filename = json_filename
+
+                # Use helper function to extract metadata dictionary
+                _, metadata_dict = extract_image_metadata(path)
+
+                with open(out_json, "w", encoding="utf-8") as f:
+                    json.dump(metadata_dict, f, indent=4)
+                success_count += 1
+            except Exception as e:
+                print(f"Failed to export EXIF for {path}: {e}")
+
+        if success_count == 1:
+            msg = f"Exported EXIF report as {last_json_filename}"
+        elif success_count > 1:
+            msg = f"Exported {success_count} EXIF reports (e.g., {last_json_filename})"
+        else:
+            msg = "Failed to export EXIF reports."
+
+        self.set_status(msg)
+        dialog = BatchCompleteDialog(self, "EXIF Export Complete", msg)
+        dialog.exec()
+
+    def batch_inject_exif(self):
+        paths = self._get_target_file_paths()
+        if not paths:
+            self.set_status("No images selected for EXIF injection.")
+            return
+
+        import json
+        source_filter = "Source Files (*.jpg *.jpeg *.png *.json)"
+        source_file, _ = QFileDialog.getOpenFileName(
+            self, "Select EXIF Source (Image or JSON Report)", "", source_filter
+        )
+
+        if not source_file:
+            return
+
+        try:
+            exif_data_bytes = None
+            exif_dict = {}
+
+            # Case 1: Source is a JSON report (*_EXIF.json)
+            if source_file.endswith(".json"):
+                with open(source_file, "r", encoding="utf-8") as f:
+                    content = json.load(f)
+                    if isinstance(content, dict):
+                        exif_dict = content
+
+            # Case 2: Source is a reference image file (JPG, PNG, WebP, etc.)
+            else:
+                exif_data_bytes, exif_dict = extract_image_metadata(source_file)
+
+            # Build reverse TAGS lookup for JPEGs
+            _TAGS_r = {v: k for k, v in TAGS.items()}
+
+            success_count = 0
+            for path in paths:
+                file_ext = os.path.splitext(path)[1].lower()
+                with Image.open(path) as target:
+                    if file_ext == '.png':
+                        from PIL import PngImagePlugin
+                        meta = PngImagePlugin.PngInfo()
+                        if hasattr(target, 'text') and target.text:
+                            for k, v in target.text.items():
+                                if not k.lower().startswith("jfif"):
+                                    meta.add_text(k, str(v))
+                        for k, v in exif_dict.items():
+                            meta.add_text(str(k), str(v))
+                        target.save(path, pnginfo=meta)
+                    else:
+                        if exif_data_bytes:
+                            target.save(path, exif=exif_data_bytes)
+                        elif exif_dict:
+                            try:
+                                exif_obj = target.getexif()
+                                if exif_obj is None:
+                                    exif_obj = Image.Exif()
+                                for k, v in exif_dict.items():
+                                    if k in _TAGS_r:
+                                        tag_id = _TAGS_r[k]
+                                        try:
+                                            exif_obj[tag_id] = v
+                                        except Exception:
+                                            pass
+                                target.save(path, exif=exif_obj.tobytes())
+                            except Exception:
+                                target.save(path)
+                        else:
+                            target.save(path)
+                success_count += 1
+
+            msg = f"Successfully injected metadata into {success_count} images."
+            self.set_status(msg)
+            dialog = BatchCompleteDialog(self, "EXIF Injection Complete", msg)
+            dialog.exec()
+        except Exception as e:
+            self.set_status(f"EXIF injection failed: {e}")
+
+    #  -----------settings menu functions--------------
+    def open_settings_dialog(self):
+        self.set_status("Opening Settings Window...")
+        dialog = SettingsDialog(self)
+        dialog.exec()
+        self.set_status("Ready")
+
+    #  -----------about menu functions--------------
+    def show_about_dialog(self):
+        self.set_status("Viewing About Dialog...")
+        dialog = AboutDialog(self)
+        dialog.exec()
+        self.set_status("Ready")
+
+    #  -----------directory changes watch--------------
+    def _on_directory_changed(self, path):
+        """Triggered when files are added, modified, or deleted externally in the current folder."""
+        if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
+            return
+
+        # Use a short 300ms debounce timer to batch rapid-fire filesystem triggers together
+        if not hasattr(self, '_watcher_debounce_timer'):
+            self._watcher_debounce_timer = QTimer(self)
+            self._watcher_debounce_timer.setSingleShot(True)
+            self._watcher_debounce_timer.timeout.connect(self._perform_smooth_folder_sync)
+
+        self._watcher_debounce_timer.start(300)
+
+    def _perform_smooth_folder_sync(self):
+        """Smart sync that checks for new/external file changes without harsh UI resets."""
+        if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
+            return
+
+        # Quick directory file scan just to check diffs
+        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
+        try:
+            current_disk_files = {
+                os.path.abspath(os.path.join(self.current_watched_dir, f))
+                for f in os.listdir(self.current_watched_dir)
+                if os.path.isfile(os.path.join(self.current_watched_dir, f))
+                   and os.path.splitext(f)[1].lower() in valid_exts
+            }
+
+            loaded_paths = {os.path.abspath(item["file_path"]) for item in self.loaded_items}
+
+            # If disk matches memory exactly, do nothing (prevents unnecessary layout reloads)
+            if current_disk_files == loaded_paths:
+                return
+
+            # If files were only removed externally, prune them locally without a full scan
+            if current_disk_files.issubset(loaded_paths):
+                removed = loaded_paths - current_disk_files
+                self.loaded_items = [
+                    item for item in self.loaded_items
+                    if os.path.abspath(item["file_path"]) not in removed
+                ]
+                self.workspace_grid.set_cards(self.loaded_items)
+                return
+
+            # Only if brand new files were added externally do we run a soft background refresh
+            self.load_images_from_folder(self.current_watched_dir)
+        except Exception as e:
+            print(f"Error during smooth folder sync: {e}")
+    #  -----------mouse events functions--------------
     def mousePressEvent(self, event):
         self.handle_mouse_press(self, event)
 
