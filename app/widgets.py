@@ -1,11 +1,10 @@
-# version 0.0.17
+# version 0.1.7
 
 import os
 
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon
 from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
-
 
 class WindowDragHandler:
     """Mixin class to handle window dragging (edge-resizing handled strictly via corner grip)."""

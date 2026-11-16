@@ -1,4 +1,4 @@
-# version 0.0.17
+# version 0.1.9
 
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
@@ -7,7 +7,6 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QModelIndex, QDir
 from PySide6.QtGui import QAction
 import os
-
 
 class TopMenuBar(QMenuBar):
     """Encapsulated top menu bar emitting signals for File, Sort, Select, Favorites, and About actions."""
@@ -22,13 +21,15 @@ class TopMenuBar(QMenuBar):
     favorite_selected = Signal(str)  # Emits selected folder path from favorites
     add_favorite_requested = Signal()  # Emits signal to add current folder to favorites
 
-    def __init__(self, parent=None, favorites=None):
+    def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False):
         super().__init__(parent)
         self.sort_date_action = None
         self.sort_name_action = None
         self.sort_size_action = None
         self.sort_reverse_action = None
         self.favorites = favorites or []
+        self.initial_sort_criteria = sort_criteria
+        self.initial_sort_reverse = sort_reverse
         self.setup_ui()
 
     def update_favorites(self, favorites_list):
@@ -88,13 +89,15 @@ class TopMenuBar(QMenuBar):
         # --- Sort Menu ---
         sort_menu = self.addMenu("Sort")
         self.sort_name_action = QAction("By Name", self, checkable=True)
-        self.sort_name_action.setChecked(True)
+        self.sort_name_action.setChecked(self.initial_sort_criteria == "name")
         self.sort_name_action.triggered.connect(lambda: self._on_sort_selected("name"))
 
         self.sort_date_action = QAction("By Date Modified", self, checkable=True)
+        self.sort_date_action.setChecked(self.initial_sort_criteria == "date")
         self.sort_date_action.triggered.connect(lambda: self._on_sort_selected("date"))
 
         self.sort_size_action = QAction("By File Size", self, checkable=True)
+        self.sort_size_action.setChecked(self.initial_sort_criteria == "size")
         self.sort_size_action.triggered.connect(lambda: self._on_sort_selected("size"))
 
         sort_menu.addAction(self.sort_name_action)
@@ -103,7 +106,7 @@ class TopMenuBar(QMenuBar):
         sort_menu.addSeparator()
 
         self.sort_reverse_action = QAction("Reverse Order", self, checkable=True)
-        self.sort_reverse_action.setChecked(False)
+        self.sort_reverse_action.setChecked(self.initial_sort_reverse)
         self.sort_reverse_action.triggered.connect(lambda checked: self.sort_reverse_toggled.emit(checked))
         sort_menu.addAction(self.sort_reverse_action)
 

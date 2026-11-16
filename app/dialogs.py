@@ -1,4 +1,4 @@
-# version 0.0.17
+# version 0.1.9
 
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout,
@@ -11,7 +11,6 @@ from .widgets import (
     WindowDragHandler, TitleBar,
     ResizeHandleWidget
                       )
-
 
 class ChildTestDialog(QDialog, WindowDragHandler):
     """Standalone resizable child window class."""

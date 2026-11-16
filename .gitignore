@@ -189,3 +189,6 @@ start_backup_script.py
 update_version.py
 settings.json
 
+/backup
+update_version.py
+settings.json

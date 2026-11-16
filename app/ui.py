@@ -1,4 +1,5 @@
-# version 0.0.17
+# version 0.2.0
+
 
 import os
 import tempfile
@@ -154,9 +155,17 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # --- Load favorites from settings ---
         settings_data = load_settings(SETTINGS_FILE)
         favorites_list = settings_data.get("favorites", [])
+        self.current_sort_criteria = settings_data.get("sort_criteria", "name")
+        self.sort_reverse = settings_data.get("sort_reverse", False)
 
         # --- Top Menu Panel ---
-        self.menu_bar = TopMenuBar(self, favorites=favorites_list)
+        self.menu_bar = TopMenuBar(
+            self,
+            favorites=favorites_list,
+            sort_criteria=self.current_sort_criteria,
+            sort_reverse=self.sort_reverse
+        )
+        
         self.menu_bar.open_folder_requested.connect(self.open_folder_dialog)
         self.menu_bar.exit_requested.connect(self.close)
         self.menu_bar.sort_criteria_changed.connect(self.set_sort_criteria)
@@ -168,6 +177,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.add_favorite_requested.connect(self.add_current_folder_to_favorites)
+
 
         container_layout.addWidget(self.menu_bar)
 
@@ -453,10 +463,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
     def set_sort_criteria(self, criteria):
         self.current_sort_criteria = criteria
+        save_settings(SETTINGS_FILE, {"sort_criteria": criteria})
         self.apply_sorting()
 
     def toggle_sort_reverse(self, is_reversed):
         self.sort_reverse = is_reversed
+        save_settings(SETTINGS_FILE, {"sort_reverse": is_reversed})
         self.apply_sorting()
 
     def apply_sorting(self):

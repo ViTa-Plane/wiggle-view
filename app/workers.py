@@ -1,11 +1,10 @@
-# version 0.0.17
+# version 0.2.0
 
 import os
 import hashlib
 
 from PySide6.QtCore import Qt, QSize, QRunnable, Signal, QObject, QRect, QPoint
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent,QImageReader
-
 
 class FolderScannerSignals(QObject):
     batch_scanned = Signal(int, list)  # scan_id, batch

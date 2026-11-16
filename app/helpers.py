@@ -1,16 +1,17 @@
-# version 0.0.17
+# version 0.1.8
 
 import os
 import json
 from PIL import Image
 from PIL.ExifTags import TAGS
 
-
 # Define your default schema here. Add any future settings keys to this dictionary.
 DEFAULT_SETTINGS = {
     "last_folder": "",
     "keep_detached_viewers_alive": False,
-    "favorites": []  # List of directory paths, e.g., ["C:/Users/Name/Pictures/Vacation"]
+    "favorites": [],
+    "sort_criteria": "name",
+    "sort_reverse": False
 }
 
 
