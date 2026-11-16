@@ -1,0 +1,128 @@
+# version 0.0.17
+
+import os
+import json
+from PIL import Image
+from PIL.ExifTags import TAGS
+
+
+# Define your default schema here. Add any future settings keys to this dictionary.
+DEFAULT_SETTINGS = {
+    "last_folder": "",
+    "keep_detached_viewers_alive": False,
+    "favorites": []  # List of directory paths, e.g., ["C:/Users/Name/Pictures/Vacation"]
+}
+
+
+def load_settings(settings_file="settings.json"):
+    """Loads settings from JSON, merging with defaults so new keys are always present."""
+    settings = DEFAULT_SETTINGS.copy()
+    if os.path.exists(settings_file):
+        try:
+            with open(settings_file, "r", encoding="utf-8") as f:
+                user_data = json.load(f)
+                if isinstance(user_data, dict):
+                    settings.update(user_data)
+        except Exception as e:
+            print(f"Error loading settings: {e}")
+    return settings
+
+
+def save_settings(settings_file="settings.json", new_values=None):
+    """Safely updates and persists settings to JSON without losing other keys."""
+    # Load current settings first to preserve existing values
+    current_settings = load_settings(settings_file)
+
+    if new_values and isinstance(new_values, dict):
+        current_settings.update(new_values)
+
+    try:
+        with open(settings_file, "w", encoding="utf-8") as f:
+            json.dump(current_settings, f, indent=4)
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+
+
+def format_file_size(b_size):
+    """Converts raw byte size into a clean human-readable KB or MB string."""
+    if b_size >= 1024 * 1024:
+        return f"{b_size / (1024 * 1024):.2f} MB"
+    else:
+        return f"{b_size / 1024:.1f} KB"
+
+
+def extract_exif_metadata(file_path):
+    """Extracts and formats comprehensive EXIF metadata and image info headers."""
+    exif_text = "<b>EXIF Camera Data:</b><br><br>"
+    found_exif = False
+    try:
+        with Image.open(file_path) as img:
+            raw_exif = img._getexif()
+            exif_dict = {}
+
+            if raw_exif:
+                for tag_id, val in raw_exif.items():
+                    tag_name = TAGS.get(tag_id, tag_id)
+                    if isinstance(val, bytes):
+                        try:
+                            val = val.decode('utf-8', errors='ignore').strip()
+                        except Exception:
+                            val = str(val)
+                    elif isinstance(val, tuple):
+                        val = ", ".join(str(v) for v in val)
+                    exif_dict[str(tag_name)] = val
+
+            if hasattr(img, 'info') and img.info:
+                for k, v in img.info.items():
+                    if k not in ['exif', 'icc_profile'] and isinstance(v, (str, int, float)):
+                        exif_dict[str(k)] = v
+
+            if exif_dict:
+                exif_lines = []
+                priority_keys = [
+                    "Make", "Model", "LensModel", "DateTimeOriginal",
+                    "ExposureTime", "FNumber", "ISOSpeedRatings",
+                    "FocalLength", "ExposureBiasValue", "Flash"
+                ]
+
+                for k in priority_keys:
+                    if k in exif_dict:
+                        exif_lines.append(f"<b>{k}:</b> {exif_dict[k]}")
+                        del exif_dict[k]
+
+                for k, v in sorted(exif_dict.items()):
+                    if len(str(v)) < 150:
+                        exif_lines.append(f"<b>{k}:</b> {v}")
+
+                if exif_lines:
+                    exif_text += "<br>".join(exif_lines)
+                    found_exif = True
+    except Exception as e:
+        exif_text += f"<i>Error reading EXIF: {str(e)}</i>"
+
+    if not found_exif:
+        exif_text = "<i>No EXIF metadata found for this image (common in web PNGs or screenshots).</i>"
+
+    return exif_text
+
+
+def add_folder_to_favorites(folder_path, settings_file="settings.json"):
+    """Adds a folder to favorites, moving it to the front if it exists, and limits the list to the last 6 added."""
+    settings = load_settings(settings_file)
+    favorites = settings.get("favorites", [])
+
+    # Normalize path for consistency
+    norm_path = os.path.normpath(folder_path)
+
+    # Remove if already present so it gets pushed to the most recent position
+    favorites = [p for p in favorites if os.path.normpath(p) != norm_path]
+
+    # Insert at the beginning (most recent)
+    favorites.insert(0, folder_path)
+
+    # Limit list to maximum 6 items
+    favorites = favorites[:15]
+
+    # Save back to settings
+    save_settings(settings_file, {"favorites": favorites})
+    return favorites
