@@ -1,4 +1,4 @@
-# version 0.2.8
+# version 0.3.3
 
 import os
 import json
@@ -208,9 +208,27 @@ def add_folder_to_favorites(folder_path, settings_file="settings.json"):
     # Insert at the beginning (most recent)
     favorites.insert(0, folder_path)
 
-    # Limit list to maximum 6 items
+    # Limit list to maximum 15 items
     favorites = favorites[:15]
 
     # Save back to settings
     save_settings(settings_file, {"favorites": favorites})
     return favorites
+
+def extract_comfyui_workflow(path):
+    """Extracts raw ComfyUI workflow or prompt metadata from PNG info chunks if present."""
+    try:
+        with Image.open(path) as img:
+            if img.format == "PNG" and hasattr(img, "text") and img.text:
+                for key in ["workflow", "prompt"]:
+                    if key in img.text:
+                        import json
+                        try:
+                            # Pretty-print JSON for readable display
+                            parsed = json.loads(img.text[key])
+                            return json.dumps(parsed, indent=4)
+                        except Exception:
+                            return img.text[key]
+    except Exception as e:
+        print(f"Error reading ComfyUI metadata: {e}")
+    return None

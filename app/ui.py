@@ -1,4 +1,4 @@
-# version 0.7.3
+# version 0.9.9
 
 import os
 import shutil
@@ -17,7 +17,9 @@ from PySide6.QtGui import QColor, QImageReader, QGuiApplication
 
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
 from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
-from .workers import ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask
+from .workers import ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask, \
+    BatchConvertWorker ,BatchConvertWorkerSignals
+
 from .widgets import WindowDragHandler, TitleBar, ResponsiveGridWidget, ResizeHandleWidget
 from .components import SidebarPanel, DirectoryBrowserPanel, TopMenuBar
 from .helpers import load_settings, save_settings, format_file_size, extract_exif_metadata, add_folder_to_favorites, \
@@ -27,11 +29,11 @@ SETTINGS_FILE = "settings.json"
 
 
 class MetadataWorkerSignals(QObject):
-    metadata_ready = Signal(str, str, str, str)  # file_path, filename, dims_str, exif_text
+    metadata_ready = Signal(str, str, str, str, str)  # file_path, filename, dims_str, exif_text, comfy_text
 
 
 class MetadataLoaderTask(QRunnable):
-    """Background worker task to load QImage dimensions and EXIF metadata off the main GUI thread."""
+    """Background worker task to load QImage dimensions, EXIF, and ComfyUI metadata off the main GUI thread."""
 
     def __init__(self, file_path, filename, size_str, signals):
         super().__init__()
@@ -49,14 +51,34 @@ class MetadataLoaderTask(QRunnable):
                 dims_str = f"{img_size.width()} × {img_size.height()} px"
 
         exif_text = extract_exif_metadata(self.file_path)
-        self.signals.metadata_ready.emit(self.file_path, self.filename, dims_str, exif_text)
+
+        # Check for ComfyUI workflow/prompt in PNG metadata
+        comfy_text = ""
+        if self.file_path.lower().endswith(".png"):
+            try:
+                with Image.open(self.file_path) as img:
+                    if hasattr(img, "text") and img.text:
+                        for key in ["workflow", "prompt"]:
+                            if key in img.text:
+                                import json
+                                try:
+                                    parsed = json.loads(img.text[key])
+                                    comfy_text = json.dumps(parsed, indent=4)
+                                    break
+                                except Exception:
+                                    comfy_text = img.text[key]
+                                    break
+            except Exception as e:
+                print(f"Error scanning ComfyUI metadata: {e}")
+
+        self.signals.metadata_ready.emit(self.file_path, self.filename, dims_str, exif_text, comfy_text)
 
 
 class MainWindow(QMainWindow, WindowDragHandler):
     def __init__(self, initial_image_path=None):
         super().__init__(parent=None)
         WindowDragHandler.__init__(self)
-        self.resize(1360, 860)
+        self.resize(1420, 860)
         self.setMinimumSize(750, 500)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -193,12 +215,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.inverse_selection_requested.connect(self.inverse_selection)
         self.menu_bar.about_requested.connect(self.show_about_dialog)
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
-        self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.add_favorite_requested.connect(self.add_current_folder_to_favorites)
         self.menu_bar.convert_requested.connect(self.batch_convert_images)
         self.menu_bar.purge_exif_requested.connect(self.batch_purge_exif)
         self.menu_bar.inject_exif_requested.connect(self.batch_inject_exif)
         self.menu_bar.export_exif_requested.connect(self.batch_export_exif)
+        self.menu_bar.export_comfy_workflow_requested.connect(self.batch_export_comfy_workflow)
 
         container_layout.addWidget(self.menu_bar)
 
@@ -275,8 +297,27 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         body_split_layout.addWidget(main_splitter, stretch=1)
 
-        # --- Right Panel ---
+        # --- Right Panel (Includes ComfyUI Metadata Tab) ---
         self.right_sidebar = SidebarPanel(self)
+
+        # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
+        if hasattr(self.right_sidebar, 'tab_widget'):
+            if not hasattr(self.right_sidebar, 'comfy_view'):
+                from PySide6.QtWidgets import QTextEdit
+                self.right_sidebar.comfy_view = QTextEdit()
+                self.right_sidebar.comfy_view.setReadOnly(True)
+                self.right_sidebar.comfy_view.setStyleSheet("""
+                    QTextEdit {
+                        background-color: #0b0f19;
+                        color: #38bdf8;
+                        border: 1px solid #1e293b;
+                        border-radius: 6px;
+                        font-family: monospace;
+                        font-size: 11px;
+                    }
+                """)
+                self.right_sidebar.tab_widget.addTab(self.right_sidebar.comfy_view, "ComfyUI")
+
         body_split_layout.addWidget(self.right_sidebar)
 
         container_layout.addLayout(body_split_layout)
@@ -370,13 +411,25 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.thread_pool.start(scanner_task)
 
     def on_batch_scanned(self, scan_id, batch):
-        # Ignore batches from outdated scans
         if scan_id != self.scan_id:
             return
 
         for item_data in batch:
+            file_path = item_data["file_path"]
+
+            # Efficiently evaluate ComfyUI metadata for scanned PNGs
+            has_comfy = False
+            if file_path.lower().endswith(".png"):
+                try:
+                    with Image.open(file_path) as img:
+                        if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
+                            has_comfy = True
+                except Exception:
+                    pass
+            item_data["has_comfy"] = has_comfy
+
             self.loaded_items.append(item_data)
-            self.pending_thumbnail_files.append(item_data["file_path"])
+            self.pending_thumbnail_files.append(file_path)
 
         self.workspace_grid.set_cards(self.loaded_items)
 
@@ -440,13 +493,14 @@ class MainWindow(QMainWindow, WindowDragHandler):
             f"Inspector Properties:\n\n• File: {filename}\n• Size: {size_str}\n• Resolution: Loading (BG)...\n• Path: {file_path}"
         )
         self.right_sidebar.exif_view.setHtml("<i>Loading metadata in background thread...</i>")
+        if hasattr(self.right_sidebar, 'comfy_view'):
+            self.right_sidebar.comfy_view.setPlainText("Loading ComfyUI workflow...")
 
         # 2. Offload heavy metadata & EXIF disk reads to background thread pool
         task = MetadataLoaderTask(file_path, filename, size_str, self.meta_signals)
         self.thread_pool.start(task)
 
-    def on_metadata_ready(self, file_path, filename, dims_str, exif_text):
-        # Update UI only if this file is still the active selection
+    def on_metadata_ready(self, file_path, filename, dims_str, exif_text, comfy_text):
         if not self.workspace_grid.selected_file_paths or file_path not in self.workspace_grid.selected_file_paths:
             return
 
@@ -457,6 +511,15 @@ class MainWindow(QMainWindow, WindowDragHandler):
             f"Inspector Properties:\n\n• File: {filename}\n• Size: {size_str}\n• Resolution: {dims_str}\n• Path: {file_path}"
         )
         self.right_sidebar.exif_view.setHtml(exif_text)
+
+        if hasattr(self.right_sidebar, 'comfy_view'):
+            if comfy_text:
+                self.right_sidebar.comfy_view.setPlainText(comfy_text)
+            elif file_path.lower().endswith(".png"):
+                self.right_sidebar.comfy_view.setPlainText("No ComfyUI workflow or prompt found in this PNG.")
+            else:
+                self.right_sidebar.comfy_view.setPlainText("ComfyUI workflows are only stored in PNG metadata.")
+
         self.status_label.setText(f"Status: Selected: {filename}  |  Size: {size_str}  |  Dimensions: {dims_str}")
 
     def open_image_viewer(self, file_path):
@@ -510,7 +573,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         # Filter down to absolute paths of files that physically exist
         valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
-        print(f"DEBUG: Resolved target file paths for deletion -> {valid_paths}")
+        print(f"DEBUG: Resolved target file paths batch operation -> {valid_paths}")
         return valid_paths
 
     #  -----------sort menu functions--------------
@@ -568,7 +631,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.right_sidebar.exif_view.setHtml(
                 "<i>No EXIF metadata available.<br>Select an image to inspect camera details.</i>"
             )
-            # Display total image count when selection is cleared / none selected
+            if hasattr(self.right_sidebar, 'comfy_view'):
+                self.right_sidebar.comfy_view.setPlainText("Select a PNG with ComfyUI workflow to view data.")
+			# Display total image count when selection is cleared / none selected
             self.set_status(f"Ready — Total images in gallery: {total}")
         elif count == 1:
             self.on_card_selected(selected_paths[0], os.path.basename(selected_paths[0]))
@@ -583,6 +648,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.right_sidebar.exif_view.setHtml(
                 f"<i>{count} images selected.<br>Select a single image to inspect EXIF metadata.</i>"
             )
+            if hasattr(self.right_sidebar, 'comfy_view'):
+                self.right_sidebar.comfy_view.setPlainText("Multiple items selected.")
             self.set_status(f"Selected {count} of {total} items ({size_str})")
 
     #  -----------grid context menu and file operations--------------
@@ -620,7 +687,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         menu.addSeparator()
         delete_action = menu.addAction("Delete")
 
-        has_selection = len(selected_paths) > 0
+        # Check if any cards are explicitly selected in the grid
+        has_selection = hasattr(self.workspace_grid, 'selected_file_paths') and len(
+            self.workspace_grid.selected_file_paths) > 0
+
+        # Disable Copy, Cut, and Delete if no image cards are selected
         copy_action.setEnabled(has_selection)
         cut_action.setEnabled(has_selection)
         delete_action.setEnabled(has_selection)
@@ -641,10 +712,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         elif action == delete_action:
             self.delete_selected_files(selected_paths)
 
-
-
     def paste_files_from_clipboard(self):
-        """Pastes files from clipboard into the currently active folder directory."""
         if not hasattr(self, 'current_watched_dir') or not self.current_watched_dir:
             self.set_status("No active folder destination for pasting.")
             return
@@ -656,34 +724,84 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.set_status("No files found in clipboard to paste.")
             return
 
+        if self.current_watched_dir:
+            self.file_watcher.removePath(self.current_watched_dir)
+
+        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
+        newly_added_items = []
         success_count = 0
+
+        # Capture cut source paths securely before processing URLs
+        cut_paths = getattr(self, '_cut_source_paths', [])
+
         for url in mime_data.urls():
             src_path = url.toLocalFile()
             if src_path and os.path.exists(src_path):
+                ext = os.path.splitext(src_path)[1].lower()
+                if ext not in valid_exts:
+                    continue
                 try:
                     filename = os.path.basename(src_path)
                     dest_path = os.path.join(self.current_watched_dir, filename)
 
-                    base, ext = os.path.splitext(filename)
+                    base, file_ext = os.path.splitext(filename)
                     counter = 1
                     while os.path.exists(dest_path):
-                        dest_path = os.path.join(self.current_watched_dir, f"{base}_copy{counter}{ext}")
+                        dest_path = os.path.join(self.current_watched_dir, f"{base}_copy{counter}{file_ext}")
                         counter += 1
 
-                    if hasattr(self, '_cut_source_paths') and src_path in self._cut_source_paths:
+                    # Check if this specific source path was marked as a cut operation
+                    if cut_paths and os.path.abspath(src_path) in [os.path.abspath(p) for p in cut_paths]:
                         shutil.move(src_path, dest_path)
+                        action_performed = "Moved"
                     else:
                         shutil.copy2(src_path, dest_path)
+                        action_performed = "Copied"
 
+                    file_stats = os.stat(dest_path)
+                    file_name = os.path.basename(dest_path)
+
+                    has_comfy = False
+                    if dest_path.lower().endswith(".png"):
+                        try:
+                            with Image.open(dest_path) as img:
+                                if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
+                                    has_comfy = True
+                        except Exception:
+                            pass
+
+                    item_data = {
+                        "file_path": dest_path,
+                        "filename": file_name,
+                        "display_name": file_name,
+                        "size": file_stats.st_size,
+                        "mtime": file_stats.st_mtime,
+                        "thumb_path": None,
+                        "has_comfy": has_comfy
+                    }
+
+                    newly_added_items.append(item_data)
+                    self.pending_thumbnail_files.append(dest_path)
                     success_count += 1
                 except Exception as e:
-                    print(f"Failed to paste {src_path}: {e}")
+                    print(f"Failed to paste/move {src_path}: {e}")
 
-        if hasattr(self, '_cut_source_paths'):
-            self._cut_source_paths = []
+        # Clear cut source paths after operation is finished
+        self._cut_source_paths = []
 
-        self.set_status(f"Pasted {success_count} file(s) into current folder.")
-        self.load_images_from_folder(self.current_watched_dir)
+        if self.current_watched_dir:
+            self.file_watcher.addPath(self.current_watched_dir)
+
+        if success_count > 0:
+            self.loaded_items.extend(newly_added_items)
+            self.apply_sorting()
+
+            if not self.batch_timer.isActive() and self.pending_thumbnail_files:
+                self.batch_timer.start()
+
+            self.set_status(f"Successfully processed {success_count} file(s).")
+        else:
+            self.set_status("No valid image files pasted.")
 
     def copy_selected_files(self, paths, cut=False):
         """Copies or cuts selected file paths to the system clipboard. If no selection, copies the whole gallery."""
@@ -787,8 +905,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_images_from_folder(folder_path)
 
             # 2. Sync the directory browser tree panel so it highlights the folder
-            if hasattr(self, 'directory_browser') and self.directory_browser:
-                self.directory_browser.set_selected_folder(folder_path)
+            if hasattr(self, 'directory_browser') and self.left_browser:
+                self.left_browser.set_selected_folder(folder_path)
 
             # 3. Re-apply the active sort criteria and order
             self.apply_sorting()
@@ -831,110 +949,23 @@ class MainWindow(QMainWindow, WindowDragHandler):
         transfer_exif = dialog.transfer_exif_cb.isChecked()
         remove_original = dialog.remove_original_cb.isChecked()
 
-        success_count = 0
-        failed_count = 0
-        target_ext = target_format.lower()
-        if target_ext == "jpg":
-            target_ext = "jpeg"
+        self.set_status("Starting background batch image conversion...")
 
-        _TAGS_r = {v: k for k, v in TAGS.items()}
+        # Setup background worker signals and task
+        self.convert_signals = BatchConvertWorkerSignals()
+        self.convert_signals.progress_update.connect(self.set_status)
+        self.convert_signals.finished.connect(lambda s, f, msg: self.on_batch_convert_finished(s, f, msg, paths))
 
-        for path in paths:
-            try:
-                base, _ = os.path.splitext(path)
-                new_path = f"{base}_converted.{target_ext}"
+        worker = BatchConvertWorker(paths, target_format, quality, transfer_exif, remove_original, self.convert_signals)
+        self.thread_pool.start(worker)
 
-                # 1. Extract source metadata if transfer_exif is enabled
-                exif_data_bytes = None
-                exif_dict = {}
-                if transfer_exif:
-                    exif_data_bytes, exif_dict = extract_image_metadata(path)
+    def on_batch_convert_finished(self, success_count, failed_count, msg, original_paths):
+        self.set_status(msg)
+        if success_count > 0 and original_paths and os.path.dirname(original_paths[0]):
+            self.load_images_from_folder(os.path.dirname(original_paths[0]))
 
-                # Filter out JFIF noise
-                filtered_exif_dict = {
-                    k: v for k, v in exif_dict.items()
-                    if not k.lower().startswith("jfif")
-                }
-
-                # 2. Perform conversion and save
-                with Image.open(path) as img:
-                    if target_ext in ["jpg", "jpeg"] and (
-                            img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)):
-                        background = Image.new("RGB", img.size, (255, 255, 255))
-                        if img.mode == "P":
-                            img = img.convert("RGBA")
-                        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
-                        img_to_save = background
-                    else:
-                        img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
-
-                    save_format = "JPEG" if target_ext == "jpeg" else target_format.upper()
-
-                    # Initial save with quality if applicable
-                    if target_ext in ["jpeg", "jpg", "webp"]:
-                        img_to_save.save(new_path, save_format, quality=quality)
-                    else:
-                        img_to_save.save(new_path, save_format)
-
-                # 3. Apply EXIF/Metadata transfer to the newly converted file if enabled
-                if transfer_exif:
-                    with Image.open(new_path) as target:
-                        if target_ext in ["png"]:
-                            from PIL import PngImagePlugin
-                            meta = PngImagePlugin.PngInfo()
-                            for k, v in exif_dict.items():
-                                meta.add_text(str(k), str(v))
-                            target.save(new_path, pnginfo=meta)
-                        else:
-                            # For JPEGs: Build clean EXIF object directly from our extracted dictionary (fixing the direct transfer bug)
-                            try:
-                                exif_obj = target.getexif()
-                                if exif_obj is None:
-                                    exif_obj = Image.Exif()
-
-                                _TAGS_r = {v: k for k, v in TAGS.items()}
-                                _GPSTAGS_r = {v: k for k, v in GPSTAGS.items()}
-
-                                for k, v in exif_dict.items():
-                                    tag_id = _TAGS_r.get(k) or _GPSTAGS_r.get(k)
-                                    if tag_id is not None:
-                                        try:
-                                            exif_obj[tag_id] = v
-                                        except Exception:
-                                            pass
-
-                                target.save(new_path, exif=exif_obj.tobytes(),
-                                            quality=quality if target_ext in ["jpeg", "jpg", "webp"] else None)
-                            except Exception as save_err:
-                                print(f"Direct EXIF transfer fallback save error: {save_err}")
-                                target.save(new_path)
-
-                # 4. Remove original source file if requested
-                if remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
-                    os.remove(path)
-
-                success_count += 1
-            except Exception as e:
-                failed_count += 1
-                print(f"Failed to convert {path}: {e}")
-
-        if success_count > 0:
-            qual_str = f" (Quality: {quality})" if target_format != "PNG" else ""
-            msg = f"Successfully converted {success_count} images to {target_format}{qual_str}."
-            if failed_count > 0:
-                msg += f" ({failed_count} failed)."
-            self.set_status(msg)
-
-            if paths and os.path.dirname(paths[0]):
-                self.load_images_from_folder(os.path.dirname(paths[0]))
-
-            complete_dialog = BatchCompleteDialog(self, "Batch Conversion Complete", msg)
-            complete_dialog.exec()
-        else:
-            err_msg = f"Conversion failed for all {len(paths)} selected images."
-            self.set_status(err_msg)
-            complete_dialog = BatchCompleteDialog(self, "Batch Conversion Failed", err_msg)
-            complete_dialog.exec()
+        complete_dialog = BatchCompleteDialog(self, "Batch Conversion Complete" if success_count > 0 else "Batch Conversion Failed", msg)
+        complete_dialog.exec()
 
     def batch_purge_exif(self):
         paths = self._get_target_file_paths()
@@ -1074,6 +1105,65 @@ class MainWindow(QMainWindow, WindowDragHandler):
             dialog.exec()
         except Exception as e:
             self.set_status(f"EXIF injection failed: {e}")
+
+    def batch_export_comfy_workflow(self):
+        """Exports ComfyUI workflows or prompts from selected PNG images to JSON reports named imageName_workflow.json."""
+        paths = self._get_target_file_paths()
+        if not paths:
+            self.set_status("No images selected for ComfyUI workflow export.")
+            return
+
+        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory for ComfyUI Workflows")
+        if not export_dir:
+            return
+
+        import json
+        success_count = 0
+        failed_count = 0
+
+        for path in paths:
+            if not path.lower().endswith(".png"):
+                continue  # ComfyUI workflows are stored exclusively in PNG metadata
+
+            try:
+                workflow_content = None
+                with Image.open(path) as img:
+                    if hasattr(img, "text") and img.text:
+                        for key in ["workflow", "prompt"]:
+                            if key in img.text:
+                                workflow_content = img.text[key]
+                                break
+
+                if workflow_content:
+                    base_name = os.path.splitext(os.path.basename(path))[0]
+                    out_json = os.path.join(export_dir, f"{base_name}_workflow.json")
+
+                    try:
+                        parsed_json = json.loads(workflow_content)
+                        with open(out_json, "w", encoding="utf-8") as f:
+                            json.dump(parsed_json, f, indent=4)
+                    except Exception:
+                        # Fallback to saving raw string data if JSON parsing fails
+                        with open(out_json, "w", encoding="utf-8") as f:
+                            f.write(workflow_content)
+
+                    success_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"Failed to export workflow for {path}: {e}")
+
+        if success_count > 0:
+            msg = f"Successfully exported {success_count} ComfyUI workflow(s)."
+            if failed_count > 0:
+                msg += f" ({failed_count} skipped/failed)."
+            self.set_status(msg)
+            BatchCompleteDialog(self, "ComfyUI Workflow Export Complete", msg).exec()
+        else:
+            self.set_status("No valid ComfyUI workflows found in the selected images.")
+            BatchCompleteDialog(self, "Export Failed",
+                                "No valid ComfyUI workflows found in the selected images.").exec()
 
     #  -----------settings menu functions--------------
     def open_settings_dialog(self):

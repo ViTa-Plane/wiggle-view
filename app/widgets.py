@@ -1,4 +1,4 @@
-# version 0.2.0
+# version 0.2.2
 
 import os
 
@@ -341,6 +341,34 @@ class ResponsiveGridWidget(QWidget):
                         img_x = x + (card_w - self.image_size) // 2
                         img_y = y + 8
                         painter.drawPixmap(img_x, img_y, pixmap)
+
+                        # --- ComfyUI Badge Overlay ---
+                        if item.get("has_comfy"):
+                            badge_text = "ComfyUI"
+                            painter.setFont(QFont("sans-serif", 8, QFont.Weight.Bold))
+
+                            # Calculate pill badge dimensions based on text length
+                            font_metrics = painter.fontMetrics()
+                            text_width = font_metrics.horizontalAdvance(badge_text)
+                            badge_w = text_width + 12
+                            badge_h = 18
+
+                            # Position at top-right corner of the thumbnail image
+                            badge_x = img_x + self.image_size - badge_w - 6
+                            badge_y = img_y + 6
+                            badge_rect = QRect(badge_x, badge_y, badge_w, badge_h)
+
+                            # Draw dark semi-transparent background with cyan border
+                            painter.save()
+                            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+                            painter.setBrush(QColor(15, 23, 42, 220)) # Dark slate fill
+                            painter.setPen(QPen(QColor("#38bdf8"), 1))    # Cyan accent border
+                            painter.drawRoundedRect(badge_rect, 4, 4)
+
+                            # Draw text
+                            painter.setPen(QColor("#f8fafc"))
+                            painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+                            painter.restore()
 
                 painter.setPen(QColor("#ffffff" if is_selected else "#cbd5e1"))
                 font = QFont("sans-serif", 10)

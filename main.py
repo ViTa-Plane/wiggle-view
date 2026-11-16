@@ -1,4 +1,4 @@
-# version 0.2.1
+# version 0.2.3
 
 import sys
 from PySide6.QtWidgets import QApplication

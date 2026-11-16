@@ -1,11 +1,15 @@
-# version 0.2.3
+# version 0.2.7
 
 import os
 import hashlib
+from PIL import Image
+from PIL.ExifTags import TAGS, GPSTAGS
 
 from PySide6.QtCore import Qt, QSize, QRunnable, Signal, QObject, QBuffer, QIODevice
 from PySide6.QtGui import QColor, QPixmap, QPainter, QImageReader
 from .encryption import encrypt_data
+from .helpers import extract_image_metadata
+
 
 class FolderScannerSignals(QObject):
     batch_scanned = Signal(int, list)
@@ -118,3 +122,92 @@ class ThumbnailLoaderTask(QRunnable):
                 self.signals.thumbnail_ready.emit(self.file_path, thumb_path)
         except Exception:
             pass
+             
+class BatchConvertWorkerSignals(QObject):
+    progress_update = Signal(str)
+    finished = Signal(int, int, str) # success_count, failed_count, message
+
+class BatchConvertWorker(QRunnable):
+    def __init__(self, paths, target_format, quality, transfer_exif, remove_original, signals):
+        super().__init__()
+        self.paths = paths
+        self.target_format = target_format
+        self.quality = quality
+        self.transfer_exif = transfer_exif
+        self.remove_original = remove_original
+        self.signals = signals
+
+    def run(self):
+        success_count = 0
+        failed_count = 0
+        target_ext = self.target_format.lower()
+        if target_ext == "jpg":
+            target_ext = "jpeg"
+
+        for path in self.paths:
+            try:
+                base, _ = os.path.splitext(path)
+                new_path = f"{base}.{target_ext}"
+                self.signals.progress_update.emit(f"Converting: {os.path.basename(path)}")
+
+                exif_data_bytes = None
+                exif_dict = {}
+                if self.transfer_exif:
+                    exif_data_bytes, exif_dict = extract_image_metadata(path)
+
+                with Image.open(path) as img:
+                    if target_ext in ["jpg", "jpeg"] and (
+                            img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)):
+                        background = Image.new("RGB", img.size, (255, 255, 255))
+                        if img.mode == "P":
+                            img = img.convert("RGBA")
+                        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                        img_to_save = background
+                    else:
+                        img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
+
+                    save_format = "JPEG" if target_ext == "jpeg" else self.target_format.upper()
+
+                    if target_ext in ["jpeg", "jpg", "webp"]:
+                        img_to_save.save(new_path, save_format, quality=self.quality)
+                    else:
+                        img_to_save.save(new_path, save_format)
+
+                if self.transfer_exif and exif_dict:
+                    with Image.open(new_path) as target:
+                        if target_ext in ["png"]:
+                            from PIL import PngImagePlugin
+                            meta = PngImagePlugin.PngInfo()
+                            for k, v in exif_dict.items():
+                                meta.add_text(str(k), str(v))
+                            target.save(new_path, pnginfo=meta)
+                        else:
+                            try:
+                                exif_obj = target.getexif()
+                                if exif_obj is None:
+                                    exif_obj = Image.Exif()
+                                for k, v in exif_dict.items():
+                                    tag_id = TAGS.get(k) or GPSTAGS.get(k)
+                                    if tag_id is not None:
+                                        try:
+                                            exif_obj[tag_id] = v
+                                        except Exception:
+                                            pass
+                                target.save(new_path, exif=exif_obj.tobytes(),
+                                            quality=self.quality if target_ext in ["jpeg", "jpg", "webp"] else None)
+                            except Exception:
+                                target.save(new_path)
+
+                if self.remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
+                    os.remove(path)
+
+                success_count += 1
+            except Exception as e:
+                failed_count += 1
+                print(f"Failed to convert {path}: {e}")
+
+        qual_str = f" (Quality: {self.quality})" if self.target_format != "PNG" else ""
+        msg = f"Successfully converted {success_count} images to {self.target_format}{qual_str}."
+        if failed_count > 0:
+            msg += f" ({failed_count} failed)."
+        self.signals.finished.emit(success_count, failed_count, msg)

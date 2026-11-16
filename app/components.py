@@ -1,4 +1,4 @@
-# version 0.2.6
+# version 0.3.3
 
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
@@ -25,6 +25,7 @@ class TopMenuBar(QMenuBar):
     purge_exif_requested = Signal()
     inject_exif_requested = Signal()
     export_exif_requested = Signal()
+    export_comfy_workflow_requested = Signal()
 
     def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False):
         super().__init__(parent)
@@ -149,11 +150,15 @@ class TopMenuBar(QMenuBar):
         export_action = QAction("Export EXIF data...", self)
         export_action.triggered.connect(self.export_exif_requested.emit)
 
+        export_comfy_action = tools_menu.addAction("Export ComfyUI Workflows...")
+        export_comfy_action.triggered.connect(self.export_comfy_workflow_requested.emit)
+
         tools_menu.addAction(convert_action)
         tools_menu.addSeparator()
         tools_menu.addAction(purge_action)
         tools_menu.addAction(inject_action)
         tools_menu.addAction(export_action)
+        tools_menu.addAction(export_comfy_action)
 
         # --- About Menu ---
         about_action = QAction("About", self)
@@ -170,7 +175,7 @@ class TopMenuBar(QMenuBar):
 class SidebarPanel(QFrame):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(240)
+        self.setFixedWidth(300)
         self.setup_ui()
 
     def setup_ui(self):
