@@ -1,4 +1,4 @@
-# version 1.1.6
+# version 1.1.7
 
 import os
 import shutil
@@ -484,11 +484,18 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 break
         self.workspace_grid.update()  # Refresh grid badges dynamically as they are discovered
 
-    def on_thumbnail_ready(self, file_path, thumb_path):
+    def on_thumbnail_ready(self, file_path, thumb_path, px=None):
         for item in self.loaded_items:
             if item["file_path"] == file_path:
                 item["thumb_path"] = thumb_path
                 break
+
+        '''Proactively inject the generated QPixmap straight into the grid's RAM cache 
+           so it NEVER has to perform a redundant disk read-back!'''
+        if px and not px.isNull() and hasattr(self.workspace_grid, 'pixmap_cache'):
+            self.workspace_grid.pixmap_cache[thumb_path] = px
+            self.workspace_grid.pixmap_cache.move_to_end(thumb_path)
+
         self.workspace_grid.update()
 
     def on_card_selected(self, file_path, display_name):

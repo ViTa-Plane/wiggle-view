@@ -1,4 +1,4 @@
-# version 0.3.8
+# version 0.4.3
 
 import os
 import hashlib
@@ -81,7 +81,8 @@ class FolderScannerTask(QRunnable):
 
 
 class ThumbnailSignalEmitter(QObject):
-    thumbnail_ready = Signal(str, str)
+    """ Pass the file_path, thumb_path, and the freshly generated QPixmap object directly!"""
+    thumbnail_ready = Signal(str, str, object)
 
 
 class ThumbnailLoaderTask(QRunnable):
@@ -94,8 +95,6 @@ class ThumbnailLoaderTask(QRunnable):
 
     def run(self):
         try:
-            # Include file last-modified time (mtime) in the hash string
-            # so if the file changes or is replaced, the cache automatically updates.
             try:
                 mtime = os.path.getmtime(self.file_path)
             except Exception:
@@ -107,7 +106,13 @@ class ThumbnailLoaderTask(QRunnable):
             thumb_filename = f"thumb_{path_hash}_{self.target_size}.jpg"
             thumb_path = os.path.join(self.cache_dir, thumb_filename)
 
-            if not os.path.exists(thumb_path):
+            px = QPixmap()
+
+            if os.path.exists(thumb_path):
+                # If it already exists on disk, we don't need to write anything.
+                # We can just let the paint event load it or pre-load it.
+                pass
+            else:
                 reader = QImageReader(self.file_path)
                 reader.setAutoTransform(True)
 
@@ -131,7 +136,9 @@ class ThumbnailLoaderTask(QRunnable):
                     painter.drawPixmap(x, y, pixmap)
                     painter.end()
 
-                    # Save to QBuffer to capture bytes and encrypt them
+                    px = canvas  # Keep the QPixmap reference for RAM injection
+
+                    # Save to disk cache once
                     buffer = QBuffer()
                     buffer.open(QIODevice.OpenModeFlag.WriteOnly)
                     canvas.save(buffer, "JPG", 88)
@@ -142,7 +149,8 @@ class ThumbnailLoaderTask(QRunnable):
                         f_out.write(encrypted_bytes)
 
             if os.path.exists(thumb_path):
-                self.signals.thumbnail_ready.emit(self.file_path, thumb_path)
+                # Send thumb_path and the QPixmap object directly to the main thread
+                self.signals.thumbnail_ready.emit(self.file_path, thumb_path, px)
         except Exception:
             pass
 
