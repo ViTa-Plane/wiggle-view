@@ -1,4 +1,4 @@
-# version 1.0.1
+# version 1.0.2
 
 import os
 import shutil
@@ -415,21 +415,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
             return
 
         for item_data in batch:
-            file_path = item_data["file_path"]
-
-            # Efficiently evaluate ComfyUI metadata for scanned PNGs
-            has_comfy = False
-            if file_path.lower().endswith(".png"):
-                try:
-                    with Image.open(file_path) as img:
-                        if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
-                            has_comfy = True
-                except Exception:
-                    pass
-            item_data["has_comfy"] = has_comfy
-
+            # ComfyUI evaluation is now handled asynchronously in FolderScannerTask
             self.loaded_items.append(item_data)
-            self.pending_thumbnail_files.append(file_path)
+            self.pending_thumbnail_files.append(item_data["file_path"])
 
         self.workspace_grid.set_cards(self.loaded_items)
 

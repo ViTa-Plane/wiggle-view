@@ -1,4 +1,4 @@
-# version 0.2.7
+# version 0.2.9
 
 import os
 import hashlib
@@ -9,7 +9,6 @@ from PySide6.QtCore import Qt, QSize, QRunnable, Signal, QObject, QBuffer, QIODe
 from PySide6.QtGui import QColor, QPixmap, QPainter, QImageReader
 from .encryption import encrypt_data
 from .helpers import extract_image_metadata
-
 
 class FolderScannerSignals(QObject):
     batch_scanned = Signal(int, list)
@@ -44,13 +43,24 @@ class FolderScannerTask(QRunnable):
                         file_size = 0
                         file_mtime = 0
 
+                    # Evaluate ComfyUI metadata in the background thread
+                    has_comfy = False
+                    if file_path.lower().endswith(".png"):
+                        try:
+                            with Image.open(file_path) as img:
+                                if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
+                                    has_comfy = True
+                        except Exception:
+                            pass
+
                     batch.append({
                         "file_path": file_path,
                         "display_name": display_name,
                         "thumb_path": None,
                         "size": file_size,
                         "mtime": file_mtime,
-                        "filename": f.lower()
+                        "filename": f.lower(),
+                        "has_comfy": has_comfy
                     })
                     total_count += 1
 
@@ -122,10 +132,12 @@ class ThumbnailLoaderTask(QRunnable):
                 self.signals.thumbnail_ready.emit(self.file_path, thumb_path)
         except Exception:
             pass
+
              
 class BatchConvertWorkerSignals(QObject):
     progress_update = Signal(str)
     finished = Signal(int, int, str) # success_count, failed_count, message
+
 
 class BatchConvertWorker(QRunnable):
     def __init__(self, paths, target_format, quality, transfer_exif, remove_original, signals):
