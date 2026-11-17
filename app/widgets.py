@@ -1,4 +1,4 @@
-# version 0.2.5
+# version 0.2.6
 
 import os
 from collections import OrderedDict
@@ -391,3 +391,8 @@ class ResponsiveGridWidget(QWidget):
 
                 text_rect = QRect(x + 6, y + card_h - 32, card_w - 12, 26)
                 painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, item.get("display_name", ""))
+
+    def clear_cache_if_needed(self, max_allowed=1500):
+        """Trims the pixmap cache if it exceeds safety limits during heavy usage."""
+        while len(self.pixmap_cache) > max_allowed:
+            self.pixmap_cache.popitem(last=False)  # Evict oldest items

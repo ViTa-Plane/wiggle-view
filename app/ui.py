@@ -1,4 +1,4 @@
-# version 1.1.0
+# version 1.1.2
 
 import os
 import shutil
@@ -392,14 +392,20 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self.current_watched_dir = folder_path
         self.file_watcher.addPath(folder_path)
-        self.loaded_items.clear()
+
         self.workspace_grid.set_cards(self.loaded_items)
         self.pending_thumbnail_files.clear()
 
         # Increment scan_id to invalidate any older running background folder tasks
         self.scan_id += 1
         current_scan_id = self.scan_id
+        self.loaded_items.clear()
 
+        # Trim pixmap cache to free RAM when switching folders
+        if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
+            self.workspace_grid.clear_cache_if_needed(max_allowed=1000)
+
+        
         self.set_status(f"Scanning folder (threaded): {os.path.basename(folder_path)}")
 
         self.save_last_folder(folder_path)
