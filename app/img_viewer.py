@@ -1,4 +1,4 @@
-# version 0.2.4
+# version 0.2.7
 
 
 import os
@@ -878,6 +878,62 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             Qt.WindowType.WindowStaysOnTopHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+    def _display_ready_pixmap(self, file_path, pixmap, full_size):
+        self.full_pixmap_size = full_size
+
+        if full_size.isValid() and not self.isFullScreen():
+            h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
+            main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
+            padding_w = h_margins + main_margins + 4
+
+            title_h = self.title_container.sizeHint().height() if hasattr(self, 'title_container') else 30
+            bottom_h = 30
+            v_spacing = self.container_layout.spacing() * 2
+            v_margins = self.container_layout.contentsMargins().top() + self.container_layout.contentsMargins().bottom()
+            main_v_margins = self.main_layout.contentsMargins().top() + self.main_layout.contentsMargins().bottom()
+
+            padding_h = title_h + bottom_h + v_spacing + v_margins + main_v_margins
+
+            img_w = full_size.width()
+            img_h = full_size.height()
+            img_aspect = img_w / img_h if img_h > 0 else 1.0
+
+            screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
+
+            # Max allowed screen bounds
+            max_w = screen_geom.width() / 2
+            max_h = screen_geom.height() / 2
+
+            target_w = img_w
+            target_h = img_h
+
+            if target_w > (max_w - padding_w) or target_h > (max_h - padding_h):
+                if img_aspect > ((max_w - padding_w) / (max_h - padding_h)):
+                    target_w = max_w - padding_w
+                    target_h = int(target_w / img_aspect)
+                else:
+                    target_h = max_h - padding_h
+                    target_w = int(target_h * img_aspect)
+
+            final_w = max(400, target_w + padding_w)
+            final_h = max(300, target_h + padding_h)
+
+            self.resize(final_w, final_h)
+
+            center_point = screen_geom.center()
+            window_geom = self.frameGeometry()
+            window_geom.moveCenter(center_point)
+            self.move(window_geom.topLeft())
+
+        self.canvas.display_pixmap = pixmap
+        self.canvas.image_path = file_path
+        self.canvas.full_res_pixmap = None
+
+        self.canvas.reset_fit()
+        QTimer.singleShot(10, self.canvas.reset_fit)
+
+        self.update_title_zoom()
 
     def closeEvent(self, event):
         if self.main_parent and hasattr(self.main_parent, 'detached_viewers'):
