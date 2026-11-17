@@ -1,4 +1,4 @@
-# version 1.0.0
+# version 1.0.1
 
 import os
 import shutil
@@ -1243,11 +1243,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Close all active detached viewers if keep_alive is False
         if hasattr(self, 'detached_viewers') and not keep_alive:
             for viewer in list(self.detached_viewers):
-                # Safely check if the underlying C++ object is still valid before calling close()
-                if viewer and not viewer.isHidden():
+                if viewer:
                     try:
-                        viewer.close()
+                        # Safely check if the C++ object is deleted before calling methods or closing
+                        if not viewer.isHidden():
+                            viewer.close()
                     except RuntimeError:
+                        # Catch shiboken deleted object error safely
                         pass
 
         event.accept()
