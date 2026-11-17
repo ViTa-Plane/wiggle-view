@@ -1,4 +1,4 @@
-# version 1.0.2
+# version 1.1.0
 
 import os
 import shutil
@@ -18,7 +18,7 @@ from PySide6.QtGui import QColor, QImageReader, QGuiApplication
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
 from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
 from .workers import ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask, \
-    BatchConvertWorker ,BatchConvertWorkerSignals
+    BatchConvertWorker , BatchConvertWorkerSignals, ComfyMetadataScannerSignals, ComfyMetadataScannerTask
 
 from .widgets import WindowDragHandler, TitleBar, ResponsiveGridWidget, ResizeHandleWidget
 from .components import SidebarPanel, DirectoryBrowserPanel, TopMenuBar
@@ -106,9 +106,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.loaded_items = []
         self.pending_thumbnail_files = []
         self.scan_id = 0  # Track active scan generation
-        self.batch_timer = QTimer(self)
-        self.batch_timer.setInterval(25)
-        self.batch_timer.timeout.connect(self.process_next_thumbnail_batch)
+
 
         # Sorting state tracking
         self.current_sort_criteria = "name"
@@ -118,6 +116,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.file_watcher = QFileSystemWatcher(self)
         self.file_watcher.directoryChanged.connect(self._on_directory_changed)
         self.current_watched_dir = None
+
+        '''Trigger the lazy ComfyUI scanner once the scan completes so badges 
+        fade/pop in smoothly without slowing down the initial grid population:'''
+        self.comfy_signals = ComfyMetadataScannerSignals()
+        self.comfy_signals.comfy_status_ready.connect(self.on_comfy_status_ready)
+
 
         self._setup_ui()
 
@@ -388,7 +392,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self.current_watched_dir = folder_path
         self.file_watcher.addPath(folder_path)
-        self.batch_timer.stop()
         self.loaded_items.clear()
         self.workspace_grid.set_cards(self.loaded_items)
         self.pending_thumbnail_files.clear()
@@ -415,50 +418,48 @@ class MainWindow(QMainWindow, WindowDragHandler):
             return
 
         for item_data in batch:
-            # ComfyUI evaluation is now handled asynchronously in FolderScannerTask
             self.loaded_items.append(item_data)
-            self.pending_thumbnail_files.append(item_data["file_path"])
 
+            # Immediately spawn a thumbnail loader task for this single image
+            # so huge images start generating thumbnails right away without waiting.
+            task = ThumbnailLoaderTask(
+                item_data["file_path"],
+                self.thumb_cache_dir,
+                self.CARD_IMAGE_SIZE,
+                self.thumbnail_signals
+            )
+            self.thread_pool.start(task)
+
+        # Refresh grid layout immediately as items are streamed in
         self.workspace_grid.set_cards(self.loaded_items)
 
-        if not self.batch_timer.isActive() and self.pending_thumbnail_files:
-            self.batch_timer.start()
-
     def on_scan_complete(self, scan_id, total_count):
-        # Ignore completions from outdated scans
         if scan_id != self.scan_id:
             return
 
         if total_count == 0:
             self.set_status("No images found in folder")
-            self.right_sidebar.inspector_label.setText(
-                "Inspector Properties:\n\n• Folder Selected\n• Total Images: 0\n• Selected: None"
-            )
         else:
-            # Apply sorting here once all files are loaded into memory
-            self.apply_sorting()
-            self.set_status(f"Ready — Total images in gallery: {total_count}")
-            self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n• Folder Selected\n• Total Images: {total_count}\n• Selected: None"
-            )
+            if self.current_sort_criteria != "name" or self.sort_reverse:
+                self.apply_sorting()
+            else:
+                self.set_status(f"Ready — Total images in gallery: {total_count}")
+
+            # Kick off lazy background ComfyUI metadata scan so badges render after grid is visible
+            comfy_task = ComfyMetadataScannerTask(self.loaded_items, scan_id, self.comfy_signals)
+            self.thread_pool.start(comfy_task)
+
             if hasattr(self, 'initial_target_image') and self.initial_target_image:
                 target = self.initial_target_image
                 self.initial_target_image = None
                 self.open_image_viewer(target)
 
-    def process_next_thumbnail_batch(self):
-        if not self.pending_thumbnail_files:
-            self.batch_timer.stop()
-            total = len(self.loaded_items)
-            self.set_status(f"Ready — Total images in gallery: {total}")
-            return
-
-        batch = self.pending_thumbnail_files[:15]
-        self.pending_thumbnail_files = self.pending_thumbnail_files[15:]
-
-        for file_path in batch:
-            task = ThumbnailLoaderTask(file_path, self.thumb_cache_dir, self.CARD_IMAGE_SIZE, self.thumbnail_signals)
-            self.thread_pool.start(task)
+    def on_comfy_status_ready(self, file_path, has_comfy):
+        for item in self.loaded_items:
+            if item["file_path"] == file_path:
+                item["has_comfy"] = has_comfy
+                break
+        self.workspace_grid.update()  # Refresh grid badges dynamically as they are discovered
 
     def on_thumbnail_ready(self, file_path, thumb_path):
         for item in self.loaded_items:
@@ -783,10 +784,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if success_count > 0:
             self.loaded_items.extend(newly_added_items)
             self.apply_sorting()
-
-            if not self.batch_timer.isActive() and self.pending_thumbnail_files:
-                self.batch_timer.start()
-
             self.set_status(f"Successfully processed {success_count} file(s).")
         else:
             self.set_status("No valid image files pasted.")

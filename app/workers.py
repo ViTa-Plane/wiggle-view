@@ -1,7 +1,8 @@
-# version 0.2.9
+# version 0.3.8
 
 import os
 import hashlib
+import tempfile
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 
@@ -24,6 +25,8 @@ class FolderScannerTask(QRunnable):
 
     def run(self):
         valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
+        thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
+
         try:
             if not os.path.isdir(self.folder_path):
                 return
@@ -43,24 +46,25 @@ class FolderScannerTask(QRunnable):
                         file_size = 0
                         file_mtime = 0
 
-                    # Evaluate ComfyUI metadata in the background thread
-                    has_comfy = False
-                    if file_path.lower().endswith(".png"):
-                        try:
-                            with Image.open(file_path) as img:
-                                if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
-                                    has_comfy = True
-                        except Exception:
-                            pass
+                    precomputed_thumb_path = None
+                    try:
+                        hash_input = f"{file_path}_{file_mtime}".encode('utf-8')
+                        path_hash = hashlib.md5(hash_input).hexdigest()
+                        candidate_thumb = os.path.join(thumb_cache_dir, f"thumb_{path_hash}_170.jpg")
+                        if os.path.exists(candidate_thumb):
+                            precomputed_thumb_path = candidate_thumb
+                    except Exception:
+                        pass
 
+                    # ComfyUI check skipped here for maximum initial scan speed!
                     batch.append({
                         "file_path": file_path,
                         "display_name": display_name,
-                        "thumb_path": None,
+                        "thumb_path": precomputed_thumb_path,
                         "size": file_size,
                         "mtime": file_mtime,
                         "filename": f.lower(),
-                        "has_comfy": has_comfy
+                        "has_comfy": False  # Evaluated lazily in background
                     })
                     total_count += 1
 
@@ -90,7 +94,16 @@ class ThumbnailLoaderTask(QRunnable):
 
     def run(self):
         try:
-            path_hash = hashlib.md5(self.file_path.encode('utf-8')).hexdigest()
+            # Include file last-modified time (mtime) in the hash string
+            # so if the file changes or is replaced, the cache automatically updates.
+            try:
+                mtime = os.path.getmtime(self.file_path)
+            except Exception:
+                mtime = 0
+
+            hash_input = f"{self.file_path}_{mtime}".encode('utf-8')
+            path_hash = hashlib.md5(hash_input).hexdigest()
+
             thumb_filename = f"thumb_{path_hash}_{self.target_size}.jpg"
             thumb_path = os.path.join(self.cache_dir, thumb_filename)
 
@@ -223,3 +236,27 @@ class BatchConvertWorker(QRunnable):
         if failed_count > 0:
             msg += f" ({failed_count} failed)."
         self.signals.finished.emit(success_count, failed_count, msg)
+
+'''Create a lightweight worker that checks PNG files for ComfyUI workflows 
+in the background after the grid has already rendered:'''
+class ComfyMetadataScannerSignals(QObject):
+    comfy_status_ready = Signal(str, bool) # file_path, has_comfy
+
+class ComfyMetadataScannerTask(QRunnable):
+    def __init__(self, items, scan_id, signals):
+        super().__init__()
+        self.items = items
+        self.scan_id = scan_id
+        self.signals = signals
+
+    def run(self):
+        for item in self.items:
+            file_path = item["file_path"]
+            if file_path.lower().endswith(".png"):
+                try:
+                    with Image.open(file_path) as img:
+                        if hasattr(img, "text") and img.text:
+                            if any(k in img.text for k in ["workflow", "prompt"]):
+                                self.signals.comfy_status_ready.emit(file_path, True)
+                except Exception:
+                    pass

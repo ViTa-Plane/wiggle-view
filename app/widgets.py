@@ -1,7 +1,7 @@
-# version 0.2.2
+# version 0.2.5
 
 import os
-
+from collections import OrderedDict
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon
 from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
@@ -174,7 +174,10 @@ class ResponsiveGridWidget(QWidget):
         self.cards = []
         self.selected_file_paths = set()
         self.last_clicked_index = None
-        self.pixmap_cache = {}
+
+        # --- Optimized LRU Cache for Pixmaps ---
+        self.pixmap_cache = OrderedDict()
+        self._MAX_PIXMAP_CACHE_ITEMS = 2000  # Holds up to 2,000 cached thumbnails smoothly in RAM
 
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
@@ -187,7 +190,10 @@ class ResponsiveGridWidget(QWidget):
         valid_paths = {item["file_path"] for item in cards_data}
         self.selected_file_paths.intersection_update(valid_paths)
         self.last_clicked_index = None
-        self.pixmap_cache.clear()
+
+        # NOTE: Do NOT clear pixmap_cache here! Keeping it intact allows
+        # jumping back to recently scanned folders to load instantly from RAM.
+
         self.updateGeometry()
         self.update()
 
@@ -325,22 +331,30 @@ class ResponsiveGridWidget(QWidget):
 
                 thumb_path = item.get("thumb_path")
                 if thumb_path and os.path.exists(thumb_path):
-                    if thumb_path not in self.pixmap_cache:
+                    # --- LRU Cache Lookup ---
+                    if thumb_path in self.pixmap_cache:
+                        self.pixmap_cache.move_to_end(thumb_path)
+                        px = self.pixmap_cache[thumb_path]
+                    else:
                         try:
                             with open(thumb_path, "rb") as f_in:
                                 encrypted_bytes = f_in.read()
                             decrypted_bytes = decrypt_data(encrypted_bytes)
                             px = QPixmap()
                             px.loadFromData(decrypted_bytes, "JPG")
-                            self.pixmap_cache[thumb_path] = px
-                        except Exception:
-                            self.pixmap_cache[thumb_path] = QPixmap()
 
-                    pixmap = self.pixmap_cache[thumb_path]
-                    if not pixmap.isNull():
+                            # Store in LRU cache and enforce capacity limit
+                            self.pixmap_cache[thumb_path] = px
+                            if len(self.pixmap_cache) > self._MAX_PIXMAP_CACHE_ITEMS:
+                                self.pixmap_cache.popitem(last=False)  # Evict oldest
+                        except Exception:
+                            px = QPixmap()
+                            self.pixmap_cache[thumb_path] = px
+
+                    if not px.isNull():
                         img_x = x + (card_w - self.image_size) // 2
                         img_y = y + 8
-                        painter.drawPixmap(img_x, img_y, pixmap)
+                        painter.drawPixmap(img_x, img_y, px)
 
                         # --- ComfyUI Badge Overlay ---
                         if item.get("has_comfy"):
