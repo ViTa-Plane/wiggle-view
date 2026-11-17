@@ -1,4 +1,4 @@
-# version 0.2.7
+# version 0.3.2
 
 
 import os
@@ -415,6 +415,16 @@ class ImageViewerWindow(QWidget):
 
         # Guarantee initial zoom reads correctly right after layout settles
         QTimer.singleShot(30, self.update_title_zoom)
+
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def enterEvent(self, event):
+        """Automatically activate window and grant keyboard focus when the mouse hovers over."""
+        self.activateWindow()
+        self.setFocus()
+        if hasattr(self, 'canvas') and self.canvas:
+            self.canvas.setFocus()
+        super().enterEvent(event)
 
     def _store_in_cache(self, file_path, pixmap, full_size):
         """Stores a QPixmap in the persistent shared LRU cache."""
@@ -867,6 +877,7 @@ class DetachedImageViewerWindow(ImageViewerWindow):
     """
 
     def __init__(self, image_path, items_list=None, parent=None):
+        self._is_first_open = True  # Initialize before super().__init__() because loading starts immediately
         super().__init__(image_path, items_list, parent=None)
 
         file_title = os.path.basename(image_path)
@@ -882,7 +893,9 @@ class DetachedImageViewerWindow(ImageViewerWindow):
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         self.full_pixmap_size = full_size
 
-        if full_size.isValid() and not self.isFullScreen():
+        # Center and resize using half screen bounds ONLY on first opening
+        if self._is_first_open and full_size.isValid() and not self.isFullScreen():
+            self._is_first_open = False
             h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
             main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
             padding_w = h_margins + main_margins + 4
@@ -901,7 +914,7 @@ class DetachedImageViewerWindow(ImageViewerWindow):
 
             screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
 
-            # Max allowed screen bounds
+            # Max allowed screen bounds (half screen)
             max_w = screen_geom.width() / 2
             max_h = screen_geom.height() / 2
 
@@ -926,6 +939,7 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             window_geom.moveCenter(center_point)
             self.move(window_geom.topLeft())
 
+        # Assign pixmap to canvas without changing position/size on subsequent image navigations
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
         self.canvas.full_res_pixmap = None
