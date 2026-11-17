@@ -1,4 +1,4 @@
-# version 0.2.3
+# version 0.2.4
 
 
 import os
@@ -11,6 +11,7 @@ from .widgets import WindowDragHandler, ResizeHandleWidget
 class ImageLoaderSignals(QObject):
     image_loaded = Signal(str, QImage, QSize)       # file_path, decoded_qimage, full_size
     image_prefetched = Signal(str, QImage, QSize)   # file_path, decoded_qimage, full_size
+    full_res_loaded = Signal(str, QPixmap)          # file_path, loaded_full_pixmap
 
 
 def _decode_image_proxy(file_path):
@@ -63,6 +64,21 @@ class ImageLoaderTask(QRunnable):
         self.signals.image_loaded.emit(self.file_path, image, orig_size)
 
 
+class FullResLoaderTask(QRunnable):
+    """Background worker task to load full-resolution pixmaps asynchronously without freezing the UI."""
+
+    def __init__(self, file_path, signals):
+        super().__init__()
+        self.file_path = file_path
+        self.signals = signals
+
+    def run(self):
+        if self.file_path and os.path.exists(self.file_path):
+            pixmap = QPixmap(self.file_path)
+            if not pixmap.isNull():
+                self.signals.full_res_loaded.emit(self.file_path, pixmap)
+
+
 
 class ImageViewerCanvas(QWidget):
     """Custom paint canvas handling high-performance rendering, zooming, panning, and lazy full-res switching."""
@@ -72,6 +88,7 @@ class ImageViewerCanvas(QWidget):
     close_requested = Signal()
     zoom_changed = Signal(float)
     focus_mode_toggled = Signal()
+    request_full_res = Signal(str)  # Signal to trigger async full-res loading
 
     def __init__(self, pixmap, image_path, parent=None):
         super().__init__(parent)
@@ -125,7 +142,8 @@ class ImageViewerCanvas(QWidget):
     def check_full_res_load(self):
         if self.zoom > 1.2 and self.full_res_pixmap is None:
             if self.image_path and os.path.exists(self.image_path):
-                self.full_res_pixmap = QPixmap(self.image_path)
+                # Trigger asynchronous background loading instead of synchronous blocking
+                self.request_full_res.emit(self.image_path)
 
     def wheelEvent(self, event: QWheelEvent):
         angle = event.angleDelta().y()
@@ -384,6 +402,7 @@ class ImageViewerWindow(QWidget):
         self.loader_signals = ImageLoaderSignals()
         self.loader_signals.image_loaded.connect(self.on_image_loaded)
         self.loader_signals.image_prefetched.connect(self.on_image_prefetched)
+        self.loader_signals.full_res_loaded.connect(self.on_full_res_loaded)
 
         self.in_flight_prefetches = set()
         self.full_pixmap_size = QSize(0, 0)
@@ -438,6 +457,18 @@ class ImageViewerWindow(QWidget):
         if file_path not in cache:
             pixmap = QPixmap.fromImage(image)
             self._store_in_cache(file_path, pixmap, full_size)
+
+    def on_full_res_loaded(self, file_path, pixmap):
+        if file_path == self.image_path:
+            self.canvas.full_res_pixmap = pixmap
+            self.canvas.update()
+            self.update_title_zoom()
+
+    def request_async_full_res(self, file_path):
+        """Starts background task to load full resolution image."""
+        if file_path and os.path.exists(file_path):
+            task = FullResLoaderTask(file_path, self.loader_signals)
+            self.thread_pool.start(task)
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         self.full_pixmap_size = full_size
@@ -636,6 +667,7 @@ class ImageViewerWindow(QWidget):
         self.canvas.close_requested.connect(self.close)
         self.canvas.zoom_changed.connect(lambda z: self.update_title_zoom())
         self.canvas.focus_mode_toggled.connect(self.toggle_focus_mode)
+        self.canvas.request_full_res.connect(self.request_async_full_res)
         self.container_layout.addWidget(self.canvas, stretch=1)
 
         # --- Add Resize Handle at the bottom right corner ---
