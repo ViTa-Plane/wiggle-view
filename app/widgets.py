@@ -1,4 +1,4 @@
-# version 0.2.7
+# version 0.2.8
 
 import os
 from collections import OrderedDict
@@ -137,10 +137,17 @@ class TitleBar(QWidget, WindowDragHandler):
             QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-weight: bold; }
             QPushButton:hover { background-color: #c42b1c; color: #ffffff; }
         """)
-        self.close_btn.clicked.connect(self.parent_window.close)
+        # Safely route to reject() for dialogs or close() for main windows
+        self.close_btn.clicked.connect(self.close_window)
         h_layout.addWidget(self.close_btn)
 
         layout.addLayout(h_layout)
+
+    def close_window(self):
+        if hasattr(self.parent_window, "reject") and callable(self.parent_window.reject):
+            self.parent_window.reject()
+        else:
+            self.parent_window.close()
 
     def toggle_maximize(self):
         if self.parent_window.isMaximized():

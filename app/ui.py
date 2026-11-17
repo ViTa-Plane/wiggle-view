@@ -1,4 +1,4 @@
-# version 1.1.7
+# version 1.2.6
 
 import os
 import shutil
@@ -230,6 +230,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.inject_exif_requested.connect(self.batch_inject_exif)
         self.menu_bar.export_exif_requested.connect(self.batch_export_exif)
         self.menu_bar.export_comfy_workflow_requested.connect(self.batch_export_comfy_workflow)
+        self.menu_bar.settings_requested.connect(self.open_settings_dialog)
 
         container_layout.addWidget(self.menu_bar)
 
@@ -652,7 +653,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             )
             if hasattr(self.right_sidebar, 'comfy_view'):
                 self.right_sidebar.comfy_view.setPlainText("Select a PNG with ComfyUI workflow to view data.")
-			# Display total image count when selection is cleared / none selected
+            # Display total image count when selection is cleared / none selected
             self.set_status(f"Ready — Total images in gallery: {total}")
         elif count == 1:
             self.on_card_selected(selected_paths[0], os.path.basename(selected_paths[0]))
@@ -955,25 +956,25 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.set_status("No images available for conversion.")
             return
 
-        dialog = BatchConvertDialog(self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        # Store as instance variable to prevent premature GC crash
+        self._active_dialog = BatchConvertDialog(self)
+        if self._active_dialog.exec() != QDialog.DialogCode.Accepted:
             return
 
-        target_format = dialog.format_combo.currentText()
-        quality = dialog.quality_slider.value()
-        transfer_exif = dialog.transfer_exif_cb.isChecked()
-        remove_original = dialog.remove_original_cb.isChecked()
+        target_format = self._active_dialog.format_combo.currentText()
+        quality = self._active_dialog.quality_slider.value()
+        transfer_exif = self._active_dialog.transfer_exif_cb.isChecked()
+        remove_original = self._active_dialog.remove_original_cb.isChecked()
 
         self.set_status("Starting background batch image conversion...")
 
-        # Setup background worker signals and task
         self.convert_signals = BatchConvertWorkerSignals()
         self.convert_signals.progress_update.connect(self.set_status)
         self.convert_signals.finished.connect(lambda s, f, msg: self.on_batch_convert_finished(s, f, msg, paths))
 
         worker = BatchConvertWorker(paths, target_format, quality, transfer_exif, remove_original, self.convert_signals)
         self.thread_pool.start(worker)
-
+        
     def on_batch_convert_finished(self, success_count, failed_count, msg, original_paths):
         self.set_status(msg)
         if success_count > 0 and original_paths and os.path.dirname(original_paths[0]):
@@ -1183,17 +1184,19 @@ class MainWindow(QMainWindow, WindowDragHandler):
     #  -----------settings menu functions--------------
     def open_settings_dialog(self):
         self.set_status("Opening Settings Window...")
-        dialog = SettingsDialog(self)
-        dialog.exec()
+        # Store as instance variable
+        self._active_dialog = SettingsDialog(self)
+        self._active_dialog.exec()
         self.set_status("Ready")
 
     #  -----------about menu functions--------------
     def show_about_dialog(self):
         self.set_status("Viewing About Dialog...")
-        dialog = AboutDialog(self)
-        dialog.exec()
+        # Store as instance variable
+        self._active_dialog = AboutDialog(self)
+        self._active_dialog.exec()
         self.set_status("Ready")
-
+        
     #  -----------directory changes watch--------------
     def _on_directory_changed(self, path):
         """Triggered when files are added, modified, or deleted externally in the current folder."""
@@ -1244,11 +1247,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         except Exception as e:
             print(f"Error during smooth folder sync: {e}")
     #  -----------mouse events functions--------------
-    def mousePressEvent(self, event):
-        self.handle_mouse_press(self, event)
-
-    def mouseMoveEvent(self, event):
-        self.handle_mouse_move(self, event)
+    # def mousePressEvent(self, event):
+    #     self.handle_mouse_press(self, event)
+    #
+    # def mouseMoveEvent(self, event):
+    #     self.handle_mouse_move(self, event)
 
     def closeEvent(self, event):
         # Read keep_alive preference dynamically from your settings/config backend

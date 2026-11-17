@@ -1,4 +1,4 @@
-# version 0.3.5
+# version 0.3.8
 
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
@@ -26,6 +26,7 @@ class TopMenuBar(QMenuBar):
     inject_exif_requested = Signal()
     export_exif_requested = Signal()
     export_comfy_workflow_requested = Signal()
+    settings_requested = Signal()
 
     def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False):
         super().__init__(parent)
@@ -152,6 +153,9 @@ class TopMenuBar(QMenuBar):
         convert_action = QAction("Convert...", self)
         convert_action.triggered.connect(self.convert_requested.emit)
 
+        settings_action = QAction("Settings...", self)
+        settings_action.triggered.connect(self.settings_requested.emit)
+
         purge_action = QAction("Purge EXIF data", self)
         purge_action.triggered.connect(self.purge_exif_requested.emit)
 
@@ -170,6 +174,8 @@ class TopMenuBar(QMenuBar):
         tools_menu.addAction(inject_action)
         tools_menu.addAction(export_action)
         tools_menu.addAction(export_comfy_action)
+        tools_menu.addSeparator()
+        tools_menu.addAction(settings_action)
 
         # --- About Menu ---
         about_action = QAction("About", self)
