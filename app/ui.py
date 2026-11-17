@@ -1,9 +1,10 @@
-# version 1.1.2
+# version 1.1.6
 
 import os
 import shutil
 import tempfile
 import send2trash
+from collections import OrderedDict
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 
@@ -121,6 +122,10 @@ class MainWindow(QMainWindow, WindowDragHandler):
         fade/pop in smoothly without slowing down the initial grid population:'''
         self.comfy_signals = ComfyMetadataScannerSignals()
         self.comfy_signals.comfy_status_ready.connect(self.on_comfy_status_ready)
+        
+        '''folder-state dictionary cache'''
+        self.folder_scan_cache = OrderedDict()
+        self._MAX_FOLDER_CACHE = 10  # Remembers the last 10 scanned directories instantly
 
 
         self._setup_ui()
@@ -386,13 +391,26 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if not folder_path or not os.path.exists(folder_path):
             return
 
+        # Check if we already have this folder's scanned items cached in RAM!
+        if folder_path in self.folder_scan_cache:
+            self.folder_scan_cache.move_to_end(folder_path)
+            cached_items = self.folder_scan_cache[folder_path]
+
+            self.loaded_items = cached_items
+            self.workspace_grid.set_cards(self.loaded_items)
+            self.set_status(f"Ready (Cached) — Total images: {len(self.loaded_items)}")
+
+            # Kick off lazy ComfyUI check in case files were modified externally
+            comfy_task = ComfyMetadataScannerTask(self.loaded_items, self.scan_id, self.comfy_signals)
+            self.thread_pool.start(comfy_task)
+            return
+
         # Update watched directory for QFileSystemWatcher
         if self.current_watched_dir:
             self.file_watcher.removePath(self.current_watched_dir)
 
         self.current_watched_dir = folder_path
         self.file_watcher.addPath(folder_path)
-
         self.workspace_grid.set_cards(self.loaded_items)
         self.pending_thumbnail_files.clear()
 
@@ -405,7 +423,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
             self.workspace_grid.clear_cache_if_needed(max_allowed=1000)
 
-        
         self.set_status(f"Scanning folder (threaded): {os.path.basename(folder_path)}")
 
         self.save_last_folder(folder_path)
