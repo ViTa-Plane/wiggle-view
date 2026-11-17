@@ -1,4 +1,4 @@
-# version 0.2.6
+# version 0.2.7
 
 import os
 from collections import OrderedDict
@@ -228,7 +228,7 @@ class ResponsiveGridWidget(QWidget):
         self.updateGeometry()
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton:
+        if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             index = self._get_index_at_pos(event.position().toPoint())
             if 0 <= index < len(self.cards):
                 clicked_item = self.cards[index]
@@ -238,29 +238,41 @@ class ResponsiveGridWidget(QWidget):
                 is_shift = bool(modifiers & Qt.KeyboardModifier.ShiftModifier)
                 is_ctrl = bool(modifiers & Qt.KeyboardModifier.ControlModifier)
 
-                if is_shift and self.last_clicked_index is not None:
-                    start = min(self.last_clicked_index, index)
-                    end = max(self.last_clicked_index, index)
-                    if not is_ctrl:
-                        self.selected_file_paths.clear()
-                    for i in range(start, end + 1):
-                        self.selected_file_paths.add(self.cards[i]["file_path"])
-                elif is_ctrl:
-                    if path in self.selected_file_paths:
-                        self.selected_file_paths.remove(path)
-                    else:
-                        self.selected_file_paths.add(path)
-                    self.last_clicked_index = index
-                else:
+                # If right-clicking an item that is NOT already in the active selection,
+                # make it the sole selection so context actions apply directly to it.
+                if event.button() == Qt.MouseButton.RightButton and path not in self.selected_file_paths:
                     self.selected_file_paths = {path}
                     self.last_clicked_index = index
-
-                self.selection_changed.emit(list(self.selected_file_paths))
-                if len(self.selected_file_paths) == 1 and not is_shift and not is_ctrl:
+                    self.selection_changed.emit(list(self.selected_file_paths))
                     self.item_selected.emit(path, clicked_item["display_name"])
-                self.update()
+                    self.update()
+
+                elif event.button() == Qt.MouseButton.LeftButton:
+                    if is_shift and self.last_clicked_index is not None:
+                        start = min(self.last_clicked_index, index)
+                        end = max(self.last_clicked_index, index)
+                        if not is_ctrl:
+                            self.selected_file_paths.clear()
+                        for i in range(start, end + 1):
+                            self.selected_file_paths.add(self.cards[i]["file_path"])
+                    elif is_ctrl:
+                        if path in self.selected_file_paths:
+                            self.selected_file_paths.remove(path)
+                        else:
+                            self.selected_file_paths.add(path)
+                        self.last_clicked_index = index
+                    else:
+                        self.selected_file_paths = {path}
+                        self.last_clicked_index = index
+
+                    self.selection_changed.emit(list(self.selected_file_paths))
+                    if len(self.selected_file_paths) == 1 and not is_shift and not is_ctrl:
+                        self.item_selected.emit(path, clicked_item["display_name"])
+                    self.update()
             else:
-                self.deselect_all()
+                # Clicking empty grid space with left click clears selection
+                if event.button() == Qt.MouseButton.LeftButton:
+                    self.deselect_all()
         super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
