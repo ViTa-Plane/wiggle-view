@@ -1,4 +1,4 @@
-# version 0.3.3
+# version 0.3.5
 
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
@@ -42,6 +42,28 @@ class TopMenuBar(QMenuBar):
         """Allows updating the favorites menu dynamically if settings change."""
         self.favorites = favorites_list
         # Rebuild or update favorites menu items here if needed
+        if hasattr(self, 'favorites_menu'):
+            self.favorites_menu.clear()
+            add_fav_action = QAction("⭐ Add to Favorites", self)
+            add_fav_action.triggered.connect(self.add_favorite_requested.emit)
+            self.favorites_menu.addAction(add_fav_action)
+            self.favorites_menu.addSeparator()
+            self._populate_favorites_actions()
+
+    def _populate_favorites_actions(self):
+        """Helper method to populate favorite folder actions."""
+        if self.favorites:
+            for path in self.favorites:
+                if path and os.path.isdir(path):
+                    folder_name = os.path.basename(os.path.normpath(path))
+                    fav_action = QAction(folder_name, self)
+                    # Bind path securely using default argument in lambda
+                    fav_action.triggered.connect(lambda checked=False, p=path: self.favorite_selected.emit(p))
+                    self.favorites_menu.addAction(fav_action)
+        else:
+            empty_action = QAction("(No favorites configured)", self)
+            empty_action.setEnabled(False)
+            self.favorites_menu.addAction(empty_action)
 
     def setup_ui(self):
         self.setStyleSheet("""
@@ -72,25 +94,14 @@ class TopMenuBar(QMenuBar):
         file_menu.addAction(exit_action)
 
         # --- Favorites Menu ---
-        favorites_menu = self.addMenu("Favorites")
+        self.favorites_menu = self.addMenu("Favorites")
         # Add "Add to Favorites" command at the top
         add_fav_action = QAction("⭐ Add to Favorites", self)
         add_fav_action.triggered.connect(self.add_favorite_requested.emit)
-        favorites_menu.addAction(add_fav_action)
-        favorites_menu.addSeparator()
+        self.favorites_menu.addAction(add_fav_action)
+        self.favorites_menu.addSeparator()
 
-        if self.favorites:
-            for path in self.favorites:
-                if path and os.path.isdir(path):
-                    folder_name = os.path.basename(os.path.normpath(path))
-                    fav_action = QAction(folder_name, self)
-                    # Bind path securely using default argument in lambda
-                    fav_action.triggered.connect(lambda checked=False, p=path: self.favorite_selected.emit(p))
-                    favorites_menu.addAction(fav_action)
-        else:
-            empty_action = QAction("(No favorites configured)", self)
-            empty_action.setEnabled(False)
-            favorites_menu.addAction(empty_action)
+        self._populate_favorites_actions()
 
         # --- Sort Menu ---
         sort_menu = self.addMenu("Sort")
