@@ -487,6 +487,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.loaded_items.clear()
         self.items_by_path.clear()
         self.workspace_grid.set_cards(self.loaded_items)
+        # Track total items processed during the active scan
+        self._current_scan_count = 0
+        # Track thumbnail generation progress
+        self._total_thumbs_to_generate = 0
+        self._thumbs_ready_count = 0
 
         # Trim pixmap cache to free RAM when switching folders
         if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
@@ -509,6 +514,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if scan_id != self.scan_id:
             return
 
+        new_thumbs_needed = 0
         for item_data in batch:
             file_path = item_data["file_path"]
             self.loaded_items.append(item_data)
@@ -516,6 +522,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
             # Only spawn worker if QPixmap isn't already in RAM cache
             if not self.workspace_grid.has_cached_pixmap(file_path):
+                new_thumbs_needed += 1
                 task = ThumbnailLoaderTask(
                     file_path,
                     self.thumb_cache_dir,
@@ -527,7 +534,17 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 )
                 self.thread_pool.start(task)
 
-        # Refresh grid layout immediately as items are streamed in
+        # self._total_thumbs_to_generate += new_thumbs_needed
+        # self._current_scan_count = len(self.loaded_items)
+        #
+        # # Show live count of discovered items & active thumbnail generation
+        # if self._total_thumbs_to_generate > 0:
+        #     left_to_gen = max(0, self._total_thumbs_to_generate - self._thumbs_ready_count)
+        #     self.set_status(
+        #         f"Scanning... Discovered {self._current_scan_count} images | Thumbnails Ready: {self._thumbs_ready_count} | Left: {left_to_gen}")
+        # else:
+        #     self.set_status(f"Scanning folder... Discovered {self._current_scan_count} images (Cached)")
+
         self.workspace_grid.set_cards(self.loaded_items)
 
     def on_scan_complete(self, scan_id, total_count):
@@ -579,6 +596,36 @@ class MainWindow(QMainWindow, WindowDragHandler):
             item["thumb_path"] = thumb_path
         self.workspace_grid.cache_thumbnail_image(file_path, qimage)
         self._schedule_grid_repaint(relayout=False)
+
+        # Track completed count quietly without hammering set_status()
+        self._thumbs_ready_count += 1
+
+        # Throttle status bar updates using a single-shot timer (e.g., every 150ms)
+        if not hasattr(self, '_status_throttle_timer'):
+            self._status_throttle_timer = QTimer(self)
+            self._status_throttle_timer.setSingleShot(True)
+            self._status_throttle_timer.timeout.connect(self._flush_thumbnail_status)
+
+        if not self._status_throttle_timer.isActive():
+            self._status_throttle_timer.start(150)
+
+
+    def _flush_thumbnail_status(self):
+        """Batch-updates the status footer smoothly with live RAM cache consumption."""
+        left_to_gen = max(0, self._total_thumbs_to_generate - self._thumbs_ready_count)
+
+        # Get live RAM usage from the grid cache
+        cache_bytes = self.workspace_grid.get_cache_memory_usage()
+        cache_size_str = format_file_size(cache_bytes)
+        cache_count = len(self.workspace_grid.pixmap_cache)
+        max_cache = self.workspace_grid._MAX_PIXMAP_CACHE_ITEMS
+
+        if left_to_gen > 0:
+            self.set_status(
+                f"Generating thumbnails... Ready: {self._thumbs_ready_count} | Left: {left_to_gen} | RAM Cache: {cache_count}/{max_cache} items ({cache_size_str})")
+        else:
+            self.set_status(
+                f"Ready — Total images in gallery: {len(self.loaded_items)} | RAM Cache: {cache_count} items ({cache_size_str})")
 
     def on_card_selected(self, file_path, display_name):
         filename = os.path.basename(file_path)

@@ -1,8 +1,9 @@
 from collections import OrderedDict
-from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint
+from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint, QTimer
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon
 from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
 from .helpers import load_settings
+from .workers import ThumbnailLoaderTask
 
 class WindowDragHandler:
     def __init__(self):
@@ -366,6 +367,29 @@ class ResponsiveGridWidget(QWidget):
                     # Lightweight placeholder while background worker decodes/generates thumbnail
                     painter.fillRect(QRect(img_x, img_y, self.image_size, self.image_size), placeholder_bg)
 
+                    # --- Auto-reload evicted or missing thumbnail on viewport exposure ---
+                    main_window = self.window()
+                    if hasattr(main_window, 'thread_pool') and hasattr(main_window, 'thumbnail_signals'):
+                        if not hasattr(self, '_pending_reloads'):
+                            self._pending_reloads = set()
+
+                        if file_path not in self._pending_reloads:
+                            self._pending_reloads.add(file_path, )
+                            # Clear pending flag after scheduling
+                            QTimer.singleShot(100, lambda fp=file_path: self._pending_reloads.discard(fp))
+
+                            task = ThumbnailLoaderTask(
+                                file_path,
+                                main_window.thumb_cache_dir,
+                                self.image_size,
+                                main_window.thumbnail_signals,
+                                scan_id=getattr(main_window, 'scan_id', 0),
+                                active_scan_getter=getattr(main_window, '_get_active_scan_id', None),
+                                existing_thumb_path=item.get("thumb_path")
+                            )
+                            main_window.thread_pool.start(task)
+                    # ------------------------------------------------------------------
+
                 # ComfyUI Badge Overlay
                 if item.get("has_comfy"):
                     badge_text = "ComfyUI"
@@ -395,11 +419,15 @@ class ResponsiveGridWidget(QWidget):
         while len(self.pixmap_cache) > max_allowed:
             self.pixmap_cache.popitem(last=False)
 
+    # RAM cache limits
     def update_cache_limit_from_settings(self):
         settings = load_settings()
-        cache_setting = settings.get("max_thumbnail_cache", "2000 Thumbnails")
+        cache_setting = settings.get("max_thumbnail_cache", "Auto (System RAM)")
 
-        if "250" in cache_setting:
+        if "Auto" in cache_setting or not cache_setting:
+            from .helpers import get_optimal_thumbnail_cache_limit
+            self._MAX_PIXMAP_CACHE_ITEMS = get_optimal_thumbnail_cache_limit()
+        elif "250" in cache_setting:
             self._MAX_PIXMAP_CACHE_ITEMS = 250
         elif "500" in cache_setting:
             self._MAX_PIXMAP_CACHE_ITEMS = 500
@@ -407,6 +435,19 @@ class ResponsiveGridWidget(QWidget):
             self._MAX_PIXMAP_CACHE_ITEMS = 1000
         elif "5,000" in cache_setting:
             self._MAX_PIXMAP_CACHE_ITEMS = 5000
+        elif "10,000" in cache_setting:
+            self._MAX_PIXMAP_CACHE_ITEMS = 10000
         else:
             self._MAX_PIXMAP_CACHE_ITEMS = 2000
+
         print(f"MAX_PIXMAP_CACHE_ITEMS: {self._MAX_PIXMAP_CACHE_ITEMS}")
+
+
+    def get_cache_memory_usage(self):
+        """Calculates the total approximate RAM usage of all cached QPixmaps in bytes."""
+        total_bytes = 0
+        for px in self.pixmap_cache.values():
+            if not px.isNull():
+                # width * height * 4 bytes per pixel (ARGB32) + basic QPixmap overhead
+                total_bytes += (px.width() * px.height() * 4) + 512
+        return total_bytes

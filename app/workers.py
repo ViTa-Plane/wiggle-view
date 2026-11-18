@@ -179,9 +179,11 @@ class ThumbnailLoaderTask(QRunnable):
                 canvas.save(buffer, "JPG", jpeg_quality)
                 raw_bytes = bytes(buffer.data())
 
-                output_bytes = encrypt_data(raw_bytes) if encrypt_enabled else raw_bytes
-                with open(thumb_path, "wb") as f_out:
-                    f_out.write(output_bytes)
+                # Only save to disk cache if disk caching is NOT disabled
+                if settings.get("disk_cache_limit_mb", "1 GB") != "Disabled":
+                    output_bytes = encrypt_data(raw_bytes) if encrypt_enabled else raw_bytes
+                    with open(thumb_path, "wb") as f_out:
+                        f_out.write(output_bytes)
 
                 if not self._is_cancelled():
                     self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, thumb_path, canvas)
@@ -333,8 +335,28 @@ class CacheCleanupTask(QRunnable):
             settings = load_settings()
             limit_str = settings.get("disk_cache_limit_mb", "1 GB")
 
+            if not os.path.exists(self.cache_dir):
+                return
+
+            # --- Handle Disabled state: Purge all disk cache files ---
+            if limit_str == "Disabled":
+                purged_count = 0
+                with os.scandir(self.cache_dir) as entries:
+                    for entry in entries:
+                        if entry.is_file():
+                            try:
+                                os.remove(entry.path)
+                                purged_count += 1
+                            except Exception:
+                                pass
+                if purged_count > 0:
+                    print(f"Disk cache disabled: Purged {purged_count} cached thumbnail file(s) from disk.")
+                return
+            # ---------------------------------------------------------
+
             if not limit_str or "Unlimited" in limit_str:
                 return
+
 
             limit_bytes = 1024 * 1024 * 1024  # Default 1 GB
             parts = limit_str.strip().split()

@@ -378,6 +378,17 @@ class SettingsDialog(QDialog, WindowDragHandler):
             self.container.setGraphicsEffect(None)
         super().done(result)
 
+    def _on_disk_limit_changed(self, text):
+        """Disables disk-dependent cache checkboxes when disk cache is disabled."""
+        is_enabled = (text != "Disabled")
+        self.purge_thumb_chk.setEnabled(is_enabled)
+        self.encrypt_thumb_chk.setEnabled(is_enabled)
+
+        # Add subtle opacity hint when disabled
+        style = "" if is_enabled else "color: #475569;"
+        self.purge_thumb_chk.setStyleSheet(style)
+        self.encrypt_thumb_chk.setStyleSheet(style)
+
     def load_current_settings(self):
         """Loads latest settings from settings.json and maps them to UI controls."""
         settings = load_settings()  # Defaults to "settings.json" via helpers.py[cite: 13]
@@ -396,9 +407,16 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.purge_thumb_chk.setChecked(settings.get("purge_thumb_cache_on_exit", False))
         self.encrypt_thumb_chk.setChecked(settings.get("encrypt_thumbnail_cache", True))
 
-        cache_map = {"250 Thumbnails": 0, "500 Thumbnails": 1, "1,000 Thumbnails": 2, "2,000 Thumbnails (Default)": 3,
-                     "5,000 Thumbnails": 4}
-        self.max_cache_combo.setCurrentIndex(cache_map.get(settings.get("max_thumbnail_cache"), 1))
+        cache_map = {
+            "Auto (System RAM)": 0,
+            "250 Thumbnails": 1,
+            "500 Thumbnails": 2,
+            "1,000 Thumbnails": 3,
+            "2,000 Thumbnails": 4,
+            "5,000 Thumbnails": 5,
+            "10,000 Thumbnails": 6
+        }
+        self.max_cache_combo.setCurrentIndex(cache_map.get(settings.get("max_thumbnail_cache"), 0))
 
         # Thumbnail Tab (Quality Slider)
         q_val = settings.get("thumbnail_jpeg_quality", 88)
@@ -409,8 +427,11 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.confirm_delete_chk.setChecked(settings.get("confirm_on_delete", True))
         self.loop_nav_chk.setChecked(settings.get("loop_gallery_navigation", True))
 
-        disk_limit_map = {"500 MB": 0, "1 GB": 1, "2 GB": 2, "Unlimited": 3}
-        self.disk_limit_combo.setCurrentIndex(disk_limit_map.get(settings.get("disk_cache_limit_mb"), 1))
+        disk_limit_map = {"Disabled": 0, "500 MB": 1, "1 GB": 2, "2 GB": 3, "Unlimited": 4}
+        current_limit = settings.get("disk_cache_limit_mb", "Disabled")
+        self.disk_limit_combo.setCurrentIndex(disk_limit_map.get(settings.get("disk_cache_limit_mb"), 0))
+        # Apply initial enabled state based on loaded setting
+        self._on_disk_limit_changed(current_limit)
 
         thread_map = {"2 Threads": 0, "4 Threads": 1, "Auto (Max Cores)": 2}
         self.thread_combo.setCurrentIndex(thread_map.get(settings.get("thread_pool_concurrency"), 2))
@@ -630,9 +651,16 @@ class SettingsDialog(QDialog, WindowDragHandler):
         thumb_layout.addWidget(info_lbl)
 
         self.max_cache_combo = QComboBox()
-        self.max_cache_combo.addItems(
-            ["250 Thumbnails", "500 Thumbnails", "1,000 Thumbnails", "2,000 Thumbnails (Default)", "5,000 Thumbnails"])
-        self.max_cache_combo.setCurrentIndex(1)  # Default to 500 Thumbnails
+        self.max_cache_combo.addItems([
+            "Auto (System RAM)",
+            "250 Thumbnails",
+            "500 Thumbnails",
+            "1,000 Thumbnails",
+            "2,000 Thumbnails",
+            "5,000 Thumbnails",
+            "10,000 Thumbnails"
+        ])
+        self.max_cache_combo.setCurrentIndex(0)  # Default to Auto scaling
         self.max_cache_combo.setToolTip(
             "Sets the maximum number of thumbnails held in RAM. Requires an application restart to take full effect.")
         thumb_layout.addWidget(self.max_cache_combo)
@@ -663,14 +691,16 @@ class SettingsDialog(QDialog, WindowDragHandler):
         advanced_form.setSpacing(10)
 
         self.disk_limit_combo = QComboBox()
-        self.disk_limit_combo.addItems(["500 MB", "1 GB", "2 GB", "Unlimited"])
-        self.disk_limit_combo.setToolTip("Sets the maximum disk footprint allowed for cached thumbnail files.")
-        advanced_form.addRow("Thumbnail Disk Cache Limit:", self.disk_limit_combo)
+        self.disk_limit_combo.addItems(["Disabled", "500 MB", "1 GB", "2 GB", "Unlimited"])
+        self.disk_limit_combo.setToolTip("Sets the maximum disk footprint allowed for cached thumbnail files (disable falls back to ram disk caching).")
+        # --- Connect signal to toggle dependent checkboxes ---
+        self.disk_limit_combo.currentTextChanged.connect(self._on_disk_limit_changed)
+        advanced_form.addRow("Thumbnail Disk Cache", self.disk_limit_combo)
 
         self.thread_combo = QComboBox()
         self.thread_combo.addItems(["2 Threads", "4 Threads", "Auto (Max Cores)"])
         self.thread_combo.setToolTip("Configures background worker concurrency for folder scanning and decoding.")
-        advanced_form.addRow("Background Concurrency:", self.thread_combo)
+        advanced_form.addRow("Background Tasks:", self.thread_combo)
 
 
         self.prefetch_chk = QCheckBox("Prefetch adjacent images")

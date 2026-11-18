@@ -16,9 +16,9 @@ DEFAULT_SETTINGS = {
     "smooth_scaling": True,
     "purge_thumb_cache_on_exit": False,
     "encrypt_thumbnail_cache": True,
-    "max_thumbnail_cache": "500 Thumbnails",  # Default to a tighter memory footprint
+    "max_thumbnail_cache": "Auto (System RAM)",  # Default to a tighter memory footprint
     "thumbnail_jpeg_quality": 88,
-    "disk_cache_limit_mb": "1 GB",
+    "disk_cache_limit_mb": "Disabled",
     "thread_pool_concurrency": "Auto (Max Cores)",
     "confirm_on_delete": True,
     "loop_gallery_navigation": True,
@@ -245,3 +245,22 @@ def extract_comfyui_workflow(path):
     except Exception as e:
         print(f"Error reading ComfyUI metadata: {e}")
     return None
+
+def get_optimal_thumbnail_cache_limit():
+    """Calculates optimal RAM cache item count based on total system memory."""
+    try:
+        import psutil
+        total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
+    except ImportError:
+        # Fallback estimation if psutil is not installed (assume 16 GB standard)
+        total_ram_gb = 16.0
+
+    # Allocate ~3% to 5% of total system RAM to thumbnail caching, capped reasonably
+    if total_ram_gb <= 8.0:
+        return 2000    # ~225 MB for 8GB RAM systems
+    elif total_ram_gb <= 16.0:
+        return 5000    # ~560 MB for 16GB RAM systems
+    elif total_ram_gb <= 32.0:
+        return 10000   # ~1.1 GB for 32GB RAM systems
+    else:
+        return 20000   # ~2.2 GB for high-end workstations (64GB+)
