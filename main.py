@@ -1,5 +1,3 @@
-# version 0.2.4
-
 import sys
 from PySide6.QtWidgets import QApplication
 from app.ui import MainWindow

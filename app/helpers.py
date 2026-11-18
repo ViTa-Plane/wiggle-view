@@ -1,5 +1,3 @@
-# version 0.3.3
-
 import os
 import json
 from PIL import Image
@@ -11,7 +9,22 @@ DEFAULT_SETTINGS = {
     "keep_detached_viewers_alive": False,
     "favorites": [],
     "sort_criteria": "name",
-    "sort_reverse": False
+    "sort_reverse": False,
+    "theme_style": "Cool Blue-Slate (Default)",
+    "language": "English (US)",
+    "prefetch_images": True,
+    "smooth_scaling": True,
+    "purge_thumb_cache_on_exit": False,
+    "encrypt_thumbnail_cache": True,
+    "max_thumbnail_cache": "500 Thumbnails",  # Default to a tighter memory footprint
+    "thumbnail_jpeg_quality": 88,
+    "disk_cache_limit_mb": "1 GB",
+    "thread_pool_concurrency": "Auto (Max Cores)",
+    "confirm_on_delete": True,
+    "loop_gallery_navigation": True,
+    "default_zoom_mode": "Fit to Window (Default)",
+    "invert_mouse_wheel_zoom": False,
+    "viewer_always_on_top": True
 }
 
 def load_settings(settings_file="settings.json"):

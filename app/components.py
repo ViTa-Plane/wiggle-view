@@ -1,5 +1,3 @@
-# version 0.3.8
-
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
     QPushButton, QTreeView, QFileSystemModel, QMenuBar

@@ -1,30 +1,31 @@
-# version 1.2.6
-
 import os
 import shutil
 import tempfile
-import send2trash
 from collections import OrderedDict
 from PIL import Image
-from PIL.ExifTags import TAGS, GPSTAGS
+from PIL.ExifTags import TAGS
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter, QInputDialog, QDialog, QMenu,
-    QMessageBox
+    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter, QDialog, QMenu,
+    QMessageBox, QTextEdit
 )
 from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject, QFileSystemWatcher, QMimeData, QUrl
-from PySide6.QtGui import QColor, QImageReader, QGuiApplication
+from PySide6.QtGui import QColor, QImageReader, QGuiApplication, QImage
 
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
 from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
-from .workers import ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask, \
-    BatchConvertWorker , BatchConvertWorkerSignals, ComfyMetadataScannerSignals, ComfyMetadataScannerTask
-
+from .workers import (
+    ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask,
+    BatchConvertWorker, BatchConvertWorkerSignals, ComfyMetadataScannerSignals, ComfyMetadataScannerTask,
+    CacheCleanupTask
+)
 from .widgets import WindowDragHandler, TitleBar, ResponsiveGridWidget, ResizeHandleWidget
 from .components import SidebarPanel, DirectoryBrowserPanel, TopMenuBar
-from .helpers import load_settings, save_settings, format_file_size, extract_exif_metadata, add_folder_to_favorites, \
-    extract_image_metadata
+from .helpers import (
+    load_settings, save_settings, format_file_size, extract_exif_metadata,
+    add_folder_to_favorites, extract_image_metadata
+)
 
 SETTINGS_FILE = "settings.json"
 
@@ -88,6 +89,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.GRID_CELL_WIDTH = 200
         self.GRID_CELL_HEIGHT = 220
 
+        self.apply_concurrency_settings()
+
         self.thread_pool = QThreadPool.globalInstance()
 
         self.thumbnail_signals = ThumbnailSignalEmitter()
@@ -101,13 +104,26 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.meta_signals = MetadataWorkerSignals()
         self.meta_signals.metadata_ready.connect(self.on_metadata_ready)
 
+        # thumbnail directory
         self.thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
         os.makedirs(self.thumb_cache_dir, exist_ok=True)
 
-        self.loaded_items = []
-        self.pending_thumbnail_files = []
-        self.scan_id = 0  # Track active scan generation
+        # --- Trigger initial background cache cleanup on startup ---
+        from .workers import CacheCleanupTask
+        self.thread_pool.start(CacheCleanupTask(self.thumb_cache_dir))
+        # -----------------------------------------------------------
 
+        self.loaded_items = []
+        self.items_by_path = {}  # O(1) lookup map: file_path -> item_dict
+        self.pending_thumbnail_files = []
+        self.scan_id = 0	# Track active scan generation
+
+        # Coalesced grid repaint timer (prevents thousands of redundant repaints)
+        self._grid_repaint_timer = QTimer(self)
+        self._grid_repaint_timer.setSingleShot(True)
+        self._grid_repaint_timer.setInterval(50)
+        self._grid_repaint_timer.timeout.connect(self._flush_grid_repaint)
+        self._needs_layout_update = False
 
         # Sorting state tracking
         self.current_sort_criteria = "name"
@@ -120,12 +136,16 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         '''Trigger the lazy ComfyUI scanner once the scan completes so badges 
         fade/pop in smoothly without slowing down the initial grid population:'''
+
+        # Replace comfy_status_ready with comfy_batch_ready
         self.comfy_signals = ComfyMetadataScannerSignals()
-        self.comfy_signals.comfy_status_ready.connect(self.on_comfy_status_ready)
+        self.comfy_signals.comfy_batch_ready.connect(self.on_comfy_batch_ready)
         
         '''folder-state dictionary cache'''
         self.folder_scan_cache = OrderedDict()
-        self._MAX_FOLDER_CACHE = 10  # Remembers the last 10 scanned directories instantly
+        self._MAX_FOLDER_CACHE = 10	# Remembers the last 10 scanned directories instantly
+
+        self.startup_setings_print()
 
 
         self._setup_ui()
@@ -133,7 +153,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Handle direct argument launch vs normal last-folder boot
         if initial_image_path and os.path.exists(initial_image_path):
             abs_path = os.path.abspath(initial_image_path)
-
             if os.path.isdir(abs_path):
                 # Case 1: Argument is a folder path -> open the folder directly in gallery
                 folder_dir = abs_path
@@ -152,6 +171,25 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.thread_pool.start(scanner_task)
         else:
             self.load_last_folder()
+
+    def _get_active_scan_id(self):
+        return self.scan_id
+
+    def _schedule_grid_repaint(self, relayout=False):
+        if relayout:
+            self._needs_layout_update = True
+        if not self._grid_repaint_timer.isActive():
+            self._grid_repaint_timer.start()
+
+    def _flush_grid_repaint(self):
+        if self._needs_layout_update:
+            self._needs_layout_update = False
+            self.workspace_grid.set_cards(self.loaded_items)
+        else:
+            self.workspace_grid.update()
+
+    def _rebuild_path_index(self):
+        self.items_by_path = {item["file_path"]: item for item in self.loaded_items}
 
     def _setup_ui(self):
         central_widget = QWidget(self)
@@ -309,27 +347,23 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         # --- Right Panel (Includes ComfyUI Metadata Tab) ---
         self.right_sidebar = SidebarPanel(self)
-
-        # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
-        if hasattr(self.right_sidebar, 'tab_widget'):
-            if not hasattr(self.right_sidebar, 'comfy_view'):
-                from PySide6.QtWidgets import QTextEdit
-                self.right_sidebar.comfy_view = QTextEdit()
-                self.right_sidebar.comfy_view.setReadOnly(True)
-                self.right_sidebar.comfy_view.setStyleSheet("""
-                    QTextEdit {
-                        background-color: #0b0f19;
-                        color: #38bdf8;
-                        border: 1px solid #1e293b;
-                        border-radius: 6px;
-                        font-family: monospace;
-                        font-size: 11px;
-                    }
-                """)
-                self.right_sidebar.tab_widget.addTab(self.right_sidebar.comfy_view, "ComfyUI")
+       # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
+        if hasattr(self.right_sidebar, 'tab_widget') and not hasattr(self.right_sidebar, 'comfy_view'):
+            self.right_sidebar.comfy_view = QTextEdit()
+            self.right_sidebar.comfy_view.setReadOnly(True)
+            self.right_sidebar.comfy_view.setStyleSheet("""
+                QTextEdit {
+                    background-color: #0b0f19;
+                    color: #38bdf8;
+                    border: 1px solid #1e293b;
+                    border-radius: 6px;
+                    font-family: monospace;
+                    font-size: 11px;
+                }
+            """)
+            self.right_sidebar.tab_widget.addTab(self.right_sidebar.comfy_view, "ComfyUI")
 
         body_split_layout.addWidget(self.right_sidebar)
-
         container_layout.addLayout(body_split_layout)
 
         # Footer Status bar
@@ -341,7 +375,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
             "color: #94a3b8; font-family: sans-serif; font-size: 12px; background: transparent;"
         )
         footer_layout.addWidget(self.status_label)
-
         footer_layout.addStretch()
 
         self.resize_handle = ResizeHandleWidget(self)
@@ -350,6 +383,27 @@ class MainWindow(QMainWindow, WindowDragHandler):
         container_layout.addLayout(footer_layout)
         main_layout.addWidget(self.container)
         self.setCentralWidget(central_widget)
+
+    def apply_concurrency_settings(self):
+        settings = load_settings(SETTINGS_FILE)
+        concurrency = settings.get("thread_pool_concurrency", "Auto (Max Cores)")
+
+        max_threads = QThreadPool.globalInstance().maxThreadCount()
+        if "2 Threads" in concurrency:
+            max_threads = 2
+        elif "4 Threads" in concurrency:
+            max_threads = 4
+        elif "Auto" in concurrency:
+            import multiprocessing
+            max_threads = max(2, multiprocessing.cpu_count())
+
+        QThreadPool.globalInstance().setMaxThreadCount(max_threads)
+
+    def startup_setings_print(self):
+        from .helpers import load_settings
+        settings = load_settings()
+        print(f"thumbnail_jpeg_quality: {settings.get("thumbnail_jpeg_quality", None)}")
+        print(f"encrypt_thumbnail_cache: {settings.get("encrypt_thumbnail_cache", None)}")
 
     def load_last_folder(self):
         data = load_settings(SETTINGS_FILE)
@@ -392,49 +446,63 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if not folder_path or not os.path.exists(folder_path):
             return
 
-        # Check if we already have this folder's scanned items cached in RAM!
-        if folder_path in self.folder_scan_cache:
-            self.folder_scan_cache.move_to_end(folder_path)
-            cached_items = self.folder_scan_cache[folder_path]
-
-            self.loaded_items = cached_items
-            self.workspace_grid.set_cards(self.loaded_items)
-            self.set_status(f"Ready (Cached) — Total images: {len(self.loaded_items)}")
-
-            # Kick off lazy ComfyUI check in case files were modified externally
-            comfy_task = ComfyMetadataScannerTask(self.loaded_items, self.scan_id, self.comfy_signals)
-            self.thread_pool.start(comfy_task)
-            return
-
-        # Update watched directory for QFileSystemWatcher
-        if self.current_watched_dir:
+        if self.current_watched_dir and self.current_watched_dir != folder_path:
             self.file_watcher.removePath(self.current_watched_dir)
-
         self.current_watched_dir = folder_path
-        self.file_watcher.addPath(folder_path)
-        self.workspace_grid.set_cards(self.loaded_items)
-        self.pending_thumbnail_files.clear()
-
-        # Increment scan_id to invalidate any older running background folder tasks
-        self.scan_id += 1
-        current_scan_id = self.scan_id
-        self.loaded_items.clear()
-
-        # Trim pixmap cache to free RAM when switching folders
-        if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
-            self.workspace_grid.clear_cache_if_needed(max_allowed=1000)
-
-        self.set_status(f"Scanning folder (threaded): {os.path.basename(folder_path)}")
+        if folder_path not in self.file_watcher.directories():
+            self.file_watcher.addPath(folder_path)
 
         self.save_last_folder(folder_path)
         self.left_browser.set_selected_folder(folder_path)
         self.path_label.setText(f"{folder_path}")
 
+        self.scan_id += 1
+        current_scan_id = self.scan_id
+
+        # Instant RAM cache hit when switching back to a recently visited directory
+        if folder_path in self.folder_scan_cache:
+            self.folder_scan_cache.move_to_end(folder_path)
+            self.loaded_items = list(self.folder_scan_cache[folder_path])
+            self._rebuild_path_index()
+
+            # Ensure any uncached pixmaps are decoded in background
+            for item in self.loaded_items:
+                if not self.workspace_grid.has_cached_pixmap(item["file_path"]):
+                    task = ThumbnailLoaderTask(
+                        item["file_path"],
+                        self.thumb_cache_dir,
+                        self.CARD_IMAGE_SIZE,
+                        self.thumbnail_signals,
+                        scan_id=current_scan_id,
+                        active_scan_getter=self._get_active_scan_id,
+                        existing_thumb_path=item.get("thumb_path")
+                    )
+                    self.thread_pool.start(task)
+
+            self.apply_sorting()
+            self.set_status(f"Ready (Cached) — Total images: {len(self.loaded_items)}")
+            return
+
+        self.pending_thumbnail_files.clear()
+        self.loaded_items.clear()
+        self.items_by_path.clear()
+        self.workspace_grid.set_cards(self.loaded_items)
+
+        # Trim pixmap cache to free RAM when switching folders
+        if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
+            self.workspace_grid.clear_cache_if_needed(max_allowed=3000)
+
+        self.set_status(f"Scanning folder: {os.path.basename(folder_path)}")
         self.right_sidebar.inspector_label.setText(
             f"Inspector Properties:\n\n• Folder: {os.path.basename(folder_path)}\n• Scanning..."
         )
 
-        scanner_task = FolderScannerTask(folder_path, current_scan_id, self.scanner_signals)
+        scanner_task = FolderScannerTask(
+            folder_path,
+            current_scan_id,
+            self.scanner_signals,
+            active_scan_getter=self._get_active_scan_id
+        )
         self.thread_pool.start(scanner_task)
 
     def on_batch_scanned(self, scan_id, batch):
@@ -442,17 +510,22 @@ class MainWindow(QMainWindow, WindowDragHandler):
             return
 
         for item_data in batch:
+            file_path = item_data["file_path"]
             self.loaded_items.append(item_data)
+            self.items_by_path[file_path] = item_data
 
-            # Immediately spawn a thumbnail loader task for this single image
-            # so huge images start generating thumbnails right away without waiting.
-            task = ThumbnailLoaderTask(
-                item_data["file_path"],
-                self.thumb_cache_dir,
-                self.CARD_IMAGE_SIZE,
-                self.thumbnail_signals
-            )
-            self.thread_pool.start(task)
+            # Only spawn worker if QPixmap isn't already in RAM cache
+            if not self.workspace_grid.has_cached_pixmap(file_path):
+                task = ThumbnailLoaderTask(
+                    file_path,
+                    self.thumb_cache_dir,
+                    self.CARD_IMAGE_SIZE,
+                    self.thumbnail_signals,
+                    scan_id=scan_id,
+                    active_scan_getter=self._get_active_scan_id,
+                    existing_thumb_path=item_data.get("thumb_path")
+                )
+                self.thread_pool.start(task)
 
         # Refresh grid layout immediately as items are streamed in
         self.workspace_grid.set_cards(self.loaded_items)
@@ -467,10 +540,21 @@ class MainWindow(QMainWindow, WindowDragHandler):
             if self.current_sort_criteria != "name" or self.sort_reverse:
                 self.apply_sorting()
             else:
+                self._schedule_grid_repaint(relayout=True)
                 self.set_status(f"Ready — Total images in gallery: {total_count}")
 
-            # Kick off lazy background ComfyUI metadata scan so badges render after grid is visible
-            comfy_task = ComfyMetadataScannerTask(self.loaded_items, scan_id, self.comfy_signals)
+            # Store scanned directory in RAM cache
+            if self.current_watched_dir:
+                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
+                if len(self.folder_scan_cache) > self._MAX_FOLDER_CACHE:
+                    self.folder_scan_cache.popitem(last=False)
+
+            comfy_task = ComfyMetadataScannerTask(
+                self.loaded_items,
+                scan_id,
+                self.comfy_signals,
+                active_scan_getter=self._get_active_scan_id
+            )
             self.thread_pool.start(comfy_task)
 
             if hasattr(self, 'initial_target_image') and self.initial_target_image:
@@ -478,31 +562,27 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 self.initial_target_image = None
                 self.open_image_viewer(target)
 
-    def on_comfy_status_ready(self, file_path, has_comfy):
-        for item in self.loaded_items:
-            if item["file_path"] == file_path:
-                item["has_comfy"] = has_comfy
-                break
-        self.workspace_grid.update()  # Refresh grid badges dynamically as they are discovered
+    def on_comfy_batch_ready(self, scan_id, file_paths):
+        if scan_id != self.scan_id:
+            return
+        for fp in file_paths:
+            item = self.items_by_path.get(fp)
+            if item is not None:
+                item["has_comfy"] = True
+        self._schedule_grid_repaint(relayout=False)
 
-    def on_thumbnail_ready(self, file_path, thumb_path, px=None):
-        for item in self.loaded_items:
-            if item["file_path"] == file_path:
-                item["thumb_path"] = thumb_path
-                break
-
-        '''Proactively inject the generated QPixmap straight into the grid's RAM cache 
-           so it NEVER has to perform a redundant disk read-back!'''
-        if px and not px.isNull() and hasattr(self.workspace_grid, 'pixmap_cache'):
-            self.workspace_grid.pixmap_cache[thumb_path] = px
-            self.workspace_grid.pixmap_cache.move_to_end(thumb_path)
-
-        self.workspace_grid.update()
+    def on_thumbnail_ready(self, scan_id, file_path, thumb_path, qimage):
+        if scan_id != self.scan_id:
+            return
+        item = self.items_by_path.get(file_path)
+        if item is not None:
+            item["thumb_path"] = thumb_path
+        self.workspace_grid.cache_thumbnail_image(file_path, qimage)
+        self._schedule_grid_repaint(relayout=False)
 
     def on_card_selected(self, file_path, display_name):
         filename = os.path.basename(file_path)
-
-        item_info = next((item for item in self.loaded_items if item["file_path"] == file_path), None)
+        item_info = self.items_by_path.get(file_path)
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
         # 1. Instant GUI feedback with zero main-thread delay
@@ -524,7 +604,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if not self.workspace_grid.selected_file_paths or file_path not in self.workspace_grid.selected_file_paths:
             return
 
-        item_info = next((item for item in self.loaded_items if item["file_path"] == file_path), None)
+        item_info = self.items_by_path.get(file_path)
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
         self.right_sidebar.inspector_label.setText(
@@ -547,7 +627,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         modifiers = QGuiApplication.keyboardModifiers()
         if modifiers & Qt.KeyboardModifier.AltModifier:
             self.set_status(f"Opening pinned viewer for: {os.path.basename(file_path)}")
-
             if not hasattr(self, 'detached_viewers'):
                 self.detached_viewers = []
 
@@ -565,11 +644,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
     def open_current_folder_in_explorer(self):
         data = load_settings(SETTINGS_FILE)
         folder = data.get("last_folder", "")
-
         if folder and os.path.isdir(folder):
             import subprocess
             import platform
-
             try:
                 if platform.system() == "Windows":
                     os.startfile(folder)
@@ -584,17 +661,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.set_status("No active folder to open.")
 
     def _get_target_file_paths(self):
-        """Returns currently selected absolute paths if any, otherwise all loaded items."""
-        paths = []
         if hasattr(self.workspace_grid, 'selected_file_paths') and self.workspace_grid.selected_file_paths:
             paths = list(self.workspace_grid.selected_file_paths)
         else:
             paths = [item["file_path"] for item in self.loaded_items]
-
-        # Filter down to absolute paths of files that physically exist
-        valid_paths = [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
-        print(f"DEBUG: Resolved target file paths batch operation -> {valid_paths}")
-        return valid_paths
+        return [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
 
     #  -----------sort menu functions--------------
     def set_sort_criteria(self, criteria):
@@ -659,7 +730,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.on_card_selected(selected_paths[0], os.path.basename(selected_paths[0]))
         else:
             total_bytes = sum(
-                item.get("size", 0) for item in self.loaded_items if item["file_path"] in selected_paths
+                self.items_by_path[p].get("size", 0) for p in selected_paths if p in self.items_by_path
             )
             size_str = format_file_size(total_bytes)
             self.right_sidebar.inspector_label.setText(
@@ -718,8 +789,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         clipboard = QGuiApplication.clipboard()
         mime_data = clipboard.mimeData()
-        has_files_in_clipboard = mime_data.hasUrls()
-        paste_action.setEnabled(has_files_in_clipboard)
+        paste_action.setEnabled(mime_data.hasUrls())
 
         action = menu.exec(self.workspace_grid.mapToGlobal(pos))
 
@@ -792,8 +862,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
                     item_data = {
                         "file_path": dest_path,
-                        "filename": file_name,
-                        "display_name": file_name,
+                        "filename": file_name.lower(),
+                        "display_name": (file_name[:16] + '..') if len(file_name) > 18 else file_name,
                         "size": file_stats.st_size,
                         "mtime": file_stats.st_mtime,
                         "thumb_path": None,
@@ -801,19 +871,29 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     }
 
                     newly_added_items.append(item_data)
-                    self.pending_thumbnail_files.append(dest_path)
+                    task = ThumbnailLoaderTask(
+                        dest_path,
+                        self.thumb_cache_dir,
+                        self.CARD_IMAGE_SIZE,
+                        self.thumbnail_signals,
+                        scan_id=self.scan_id,
+                        active_scan_getter=self._get_active_scan_id
+                    )
+                    self.thread_pool.start(task)
                     success_count += 1
                 except Exception as e:
                     print(f"Failed to paste/move {src_path}: {e}")
 
         # Clear cut source paths after operation is finished
         self._cut_source_paths = []
-
         if self.current_watched_dir:
             self.file_watcher.addPath(self.current_watched_dir)
 
         if success_count > 0:
             self.loaded_items.extend(newly_added_items)
+            self._rebuild_path_index()
+            if self.current_watched_dir in self.folder_scan_cache:
+                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
             self.apply_sorting()
             self.set_status(f"Successfully processed {success_count} file(s).")
         else:
@@ -833,7 +913,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         mime_data = QMimeData()
         urls = [QUrl.fromLocalFile(p) for p in paths if os.path.exists(p)]
         mime_data.setUrls(urls)
-
         clipboard.setMimeData(mime_data)
 
         if cut:
@@ -848,19 +927,24 @@ class MainWindow(QMainWindow, WindowDragHandler):
     def delete_selected_files(self, paths):
         """Safely sends selected image files to the Recycle Bin and updates the grid in-place without folder re-scans."""
         if not paths:
-            print("DEBUG: delete_selected_files called with empty paths list.")
             self.status_label.setText("Status: Deletion failed - No valid images selected.")
             return
 
-        reply = QMessageBox.question(
-            self, "Confirm Delete",
-            f"Are you sure you want to move {len(paths)} selected file(s) to the Recycle Bin?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
+        # --- Check setting for deletion confirmation ---
+        settings = load_settings(SETTINGS_FILE)
+        confirm_enabled = settings.get("confirm_on_delete", True)
 
-        if reply != QMessageBox.StandardButton.Yes:
-            return
+        if confirm_enabled:
+            reply = QMessageBox.question(
+                self, "Confirm Delete",
+                f"Are you sure you want to move {len(paths)} selected file(s) to the Recycle Bin?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        # ---------------------------------------------
 
         deleted_paths = set()
         try:
@@ -889,8 +973,10 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 item for item in self.loaded_items
                 if os.path.abspath(item["file_path"]) not in deleted_paths
             ]
+            self._rebuild_path_index()
+            if self.current_watched_dir in self.folder_scan_cache:
+                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
 
-            # 2. Update the workspace grid cards in-place without scrolling/focus jump
             self.workspace_grid.set_cards(self.loaded_items)
 
             deleted_count = len(deleted_paths)
@@ -934,22 +1020,18 @@ class MainWindow(QMainWindow, WindowDragHandler):
     def add_current_folder_to_favorites(self):
         settings = load_settings(SETTINGS_FILE)
         current_folder = settings.get("last_folder", "")
-
         if current_folder and os.path.isdir(current_folder):
             updated_favorites = add_folder_to_favorites(current_folder, SETTINGS_FILE)
 
             # Dynamically update the menu bar's favorites list
             self.menu_bar.favorites = updated_favorites
-            # Rebuild the menu bar actions UI to reflect the latest 6 items
             self.menu_bar.clear()
             self.menu_bar.setup_ui()
-
             folder_name = os.path.basename(os.path.normpath(current_folder))
-            self.set_status(f"Added to favorites: {folder_name} (Limit: 6)")
+            self.set_status(f"Added to favorites: {folder_name}")
         else:
             self.set_status("No active folder to add to favorites.")
 
-    #  -----------tools menu functions--------------
     def batch_convert_images(self):
         paths = self._get_target_file_paths()
         if not paths:
@@ -967,21 +1049,25 @@ class MainWindow(QMainWindow, WindowDragHandler):
         remove_original = self._active_dialog.remove_original_cb.isChecked()
 
         self.set_status("Starting background batch image conversion...")
-
         self.convert_signals = BatchConvertWorkerSignals()
         self.convert_signals.progress_update.connect(self.set_status)
         self.convert_signals.finished.connect(lambda s, f, msg: self.on_batch_convert_finished(s, f, msg, paths))
 
         worker = BatchConvertWorker(paths, target_format, quality, transfer_exif, remove_original, self.convert_signals)
         self.thread_pool.start(worker)
-        
+
     def on_batch_convert_finished(self, success_count, failed_count, msg, original_paths):
         self.set_status(msg)
         if success_count > 0 and original_paths and os.path.dirname(original_paths[0]):
-            self.load_images_from_folder(os.path.dirname(original_paths[0]))
+            folder = os.path.dirname(original_paths[0])
+            self.folder_scan_cache.pop(folder, None)
+            self.load_images_from_folder(folder)
 
-        complete_dialog = BatchCompleteDialog(self, "Batch Conversion Complete" if success_count > 0 else "Batch Conversion Failed", msg)
-        complete_dialog.exec()
+        BatchCompleteDialog(
+            self,
+            "Batch Conversion Complete" if success_count > 0 else "Batch Conversion Failed",
+            msg
+        ).exec()
 
     def batch_purge_exif(self):
         paths = self._get_target_file_paths()
@@ -1001,9 +1087,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             except Exception as e:
                 print(f"Failed to purge EXIF for {path}: {e}")
         self.set_status(f"Purged EXIF data from {success_count} images.")
-        dialog = BatchCompleteDialog(self, "EXIF Purge Complete",
-                                     f"Successfully purged EXIF data from {success_count} images.")
-        dialog.exec()
+        BatchCompleteDialog(self, "EXIF Purge Complete",
+                            f"Successfully purged EXIF data from {success_count} images.").exec()
 
     def batch_export_exif(self):
         paths = self._get_target_file_paths()
@@ -1028,7 +1113,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
                 # Use helper function to extract metadata dictionary
                 _, metadata_dict = extract_image_metadata(path)
-
                 with open(out_json, "w", encoding="utf-8") as f:
                     json.dump(metadata_dict, f, indent=4)
                 success_count += 1
@@ -1043,8 +1127,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             msg = "Failed to export EXIF reports."
 
         self.set_status(msg)
-        dialog = BatchCompleteDialog(self, "EXIF Export Complete", msg)
-        dialog.exec()
+        BatchCompleteDialog(self, "EXIF Export Complete", msg).exec()
 
     def batch_inject_exif(self):
         paths = self._get_target_file_paths()
@@ -1057,7 +1140,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         source_file, _ = QFileDialog.getOpenFileName(
             self, "Select EXIF Source (Image or JSON Report)", "", source_filter
         )
-
         if not source_file:
             return
 
@@ -1078,8 +1160,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
             # Build reverse TAGS lookup for JPEGs
             _TAGS_r = {v: k for k, v in TAGS.items()}
-
             success_count = 0
+
             for path in paths:
                 file_ext = os.path.splitext(path)[1].lower()
                 with Image.open(path) as target:
@@ -1117,8 +1199,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
             msg = f"Successfully injected metadata into {success_count} images."
             self.set_status(msg)
-            dialog = BatchCompleteDialog(self, "EXIF Injection Complete", msg)
-            dialog.exec()
+            BatchCompleteDialog(self, "EXIF Injection Complete", msg).exec()
         except Exception as e:
             self.set_status(f"EXIF injection failed: {e}")
 
@@ -1153,7 +1234,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 if workflow_content:
                     base_name = os.path.splitext(os.path.basename(path))[0]
                     out_json = os.path.join(export_dir, f"{base_name}_workflow.json")
-
                     try:
                         parsed_json = json.loads(workflow_content)
                         with open(out_json, "w", encoding="utf-8") as f:
@@ -1162,7 +1242,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
                         # Fallback to saving raw string data if JSON parsing fails
                         with open(out_json, "w", encoding="utf-8") as f:
                             f.write(workflow_content)
-
                     success_count += 1
                 else:
                     failed_count += 1
@@ -1184,22 +1263,25 @@ class MainWindow(QMainWindow, WindowDragHandler):
     #  -----------settings menu functions--------------
     def open_settings_dialog(self):
         self.set_status("Opening Settings Window...")
-        # Store as instance variable
         self._active_dialog = SettingsDialog(self)
-        self._active_dialog.exec()
+        if self._active_dialog.exec() == QDialog.DialogCode.Accepted:
+            # Refresh the grid cache limit dynamically right after settings are saved
+            if hasattr(self.workspace_grid, 'update_cache_limit_from_settings'):
+                self.workspace_grid.update_cache_limit_from_settings()
+            self.apply_concurrency_settings()
+            # Trigger cleanup immediately if disk limit was adjusted
+            self.thread_pool.start(CacheCleanupTask(self.thumb_cache_dir))
         self.set_status("Ready")
 
     #  -----------about menu functions--------------
     def show_about_dialog(self):
         self.set_status("Viewing About Dialog...")
         # Store as instance variable
-        self._active_dialog = AboutDialog(self)
-        self._active_dialog.exec()
+        AboutDialog(self).exec()
         self.set_status("Ready")
         
     #  -----------directory changes watch--------------
     def _on_directory_changed(self, path):
-        """Triggered when files are added, modified, or deleted externally in the current folder."""
         if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
             return
 
@@ -1239,35 +1321,48 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     item for item in self.loaded_items
                     if os.path.abspath(item["file_path"]) not in removed
                 ]
+                self._rebuild_path_index()
+                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
                 self.workspace_grid.set_cards(self.loaded_items)
                 return
 
-            # Only if brand new files were added externally do we run a soft background refresh
+            self.folder_scan_cache.pop(self.current_watched_dir, None)
             self.load_images_from_folder(self.current_watched_dir)
         except Exception as e:
             print(f"Error during smooth folder sync: {e}")
-    #  -----------mouse events functions--------------
-    # def mousePressEvent(self, event):
-    #     self.handle_mouse_press(self, event)
-    #
-    # def mouseMoveEvent(self, event):
-    #     self.handle_mouse_move(self, event)
+
+    def mousePressEvent(self, event):
+        self.handle_mouse_press(self, event)
+
+    def mouseMoveEvent(self, event):
+        self.handle_mouse_move(self, event)
 
     def closeEvent(self, event):
-        # Read keep_alive preference dynamically from your settings/config backend
         settings = load_settings(SETTINGS_FILE)
-        keep_alive = settings.get("keep_detached_viewers_alive", False)
 
-        # Close all active detached viewers if keep_alive is False
+        # 1. Wait for any active background thread tasks to finish cleanly
+        print("Closing the app, Wait for any active background thread tasks to finish cleanly")
+        self.thread_pool.waitForDone()
+
+        # 2. Purge thumbnail cache on exit if enabled
+        if settings.get("purge_thumb_cache_on_exit", False):
+            try:
+                if os.path.exists(self.thumb_cache_dir):
+                    shutil.rmtree(self.thumb_cache_dir)
+                    os.makedirs(self.thumb_cache_dir, exist_ok=True)
+                    print("purge_thumb_cache_on_exit: DONE")
+            except Exception as e:
+                print(f"Error purging thumbnail cache: {e}")
+
+        # 3. Keep-alive check for detached viewers
+        keep_alive = settings.get("keep_detached_viewers_alive", False)
         if hasattr(self, 'detached_viewers') and not keep_alive:
             for viewer in list(self.detached_viewers):
                 if viewer:
                     try:
-                        # Safely check if the C++ object is deleted before calling methods or closing
                         if not viewer.isHidden():
                             viewer.close()
                     except RuntimeError:
-                        # Catch shiboken deleted object error safely
                         pass
 
         event.accept()

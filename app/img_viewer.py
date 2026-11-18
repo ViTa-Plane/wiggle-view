@@ -1,17 +1,17 @@
-# version 0.3.2
-
-
 import os
 from collections import OrderedDict
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QSizePolicy
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject, QTimer, QPointF
-from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QFont, QPen, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader
+from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QFont, QPen, QWheelEvent, QMouseEvent, QKeyEvent, \
+    QImageReader
 from .widgets import WindowDragHandler, ResizeHandleWidget
+from .helpers import load_settings, save_settings
+
 
 class ImageLoaderSignals(QObject):
-    image_loaded = Signal(str, QImage, QSize)       # file_path, decoded_qimage, full_size
-    image_prefetched = Signal(str, QImage, QSize)   # file_path, decoded_qimage, full_size
-    full_res_loaded = Signal(str, QPixmap)          # file_path, loaded_full_pixmap
+    image_loaded = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
+    image_prefetched = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
+    full_res_loaded = Signal(str, QPixmap)  # file_path, loaded_full_pixmap
 
 
 def _decode_image_proxy(file_path):
@@ -77,7 +77,6 @@ class FullResLoaderTask(QRunnable):
             pixmap = QPixmap(self.file_path)
             if not pixmap.isNull():
                 self.signals.full_res_loaded.emit(self.file_path, pixmap)
-
 
 
 class ImageViewerCanvas(QWidget):
@@ -147,7 +146,17 @@ class ImageViewerCanvas(QWidget):
 
     def wheelEvent(self, event: QWheelEvent):
         angle = event.angleDelta().y()
-        zoom_multiplier = 1.15 if angle > 0 else 0.85
+
+        # Check settings for inverted zoom
+        from .helpers import load_settings
+        settings = load_settings()
+        invert = settings.get("invert_mouse_wheel_zoom", False)
+
+        # Invert step behavior if enabled
+        if invert:
+            zoom_multiplier = 0.85 if angle > 0 else 1.15
+        else:
+            zoom_multiplier = 1.15 if angle > 0 else 0.85
 
         old_zoom = self.zoom
         new_zoom = max(0.1, min(20.0, old_zoom * zoom_multiplier))
@@ -251,7 +260,14 @@ class ImageViewerCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+
+        # Check dynamic smooth scaling setting
+        settings = load_settings()
+        smooth_enabled = settings.get("smooth_scaling", True)
+
+        render_hint = QPainter.RenderHint.SmoothPixmapTransform if smooth_enabled else QPainter.RenderHint(0)
+        painter.setRenderHint(render_hint, smooth_enabled)
+
         painter.fillRect(self.rect(), QColor("#05070a"))
 
         active_pixmap = (
@@ -389,11 +405,19 @@ class ImageViewerWindow(QWidget):
         self.resize(900, 650)
         self.setMinimumSize(300, 280)
 
-        self.setWindowFlags(
-            Qt.WindowType.Window |
-            Qt.WindowType.FramelessWindowHint |
-            Qt.WindowType.WindowStaysOnTopHint #  keep the viewer above other windows
+        # Check settings for always on top, default to True
+        settings = load_settings()
+        self.is_always_on_top = settings.get("viewer_always_on_top", True)
+
+        flags = (
+                Qt.WindowType.Window |
+                Qt.WindowType.FramelessWindowHint
         )
+        if self.is_always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+
+        self.setWindowFlags(flags)
+        
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setMouseTracking(True)  # Required for edge hovering
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
@@ -409,6 +433,12 @@ class ImageViewerWindow(QWidget):
 
         self._setup_viewer_ui()
         self.setFocus()
+
+        # Only trigger startup fullscreen for main ImageViewerWindow, NOT detached pinned viewers
+        if type(self) is ImageViewerWindow:
+            settings = load_settings()
+            if settings.get("default_zoom_mode", "") == "Fill Screen":
+                QTimer.singleShot(50, self.toggle_fullscreen)
 
         # Start loading immediately (pulls instantly from shared cache if previously viewed)
         self.load_image_threaded(self.image_path)
@@ -552,6 +582,11 @@ class ImageViewerWindow(QWidget):
         self.title_label.setText(f"{file_title}{dim_info} ({zoom_pct}%)")
 
     def prefetch_neighbors(self):
+        # Respect dynamic prefetch setting
+        settings = load_settings()  # make sure load_settings is imported in img_viewer.py if not already
+        if not settings.get("prefetch_images", True):
+            return
+
         if len(self.items) <= 1:
             return
 
@@ -607,7 +642,22 @@ class ImageViewerWindow(QWidget):
         if not self.items:
             return
 
-        self.current_index = (self.current_index + direction) % len(self.items)
+        new_index = self.current_index + direction
+
+        # --- Check setting for gallery navigation looping ---
+        from .helpers import load_settings  # Ensure load_settings is imported
+        settings = load_settings()
+        loop_enabled = settings.get("loop_gallery_navigation", True)
+
+        if not loop_enabled:
+            # Clamp index at boundaries if looping is disabled
+            if new_index < 0 or new_index >= len(self.items):
+                return
+
+        # Apply wrapping if looping is enabled
+        self.current_index = new_index % len(self.items)
+        # ---------------------------------------------------
+
         next_item = self.items[self.current_index]
         self.image_path = next_item["file_path"]
 
@@ -641,12 +691,28 @@ class ImageViewerWindow(QWidget):
         title_layout = QHBoxLayout(self.title_container)
         title_layout.setContentsMargins(4, 0, 4, 0)
 
+        # Always-on-top toggle button
+        self.pin_btn = QPushButton("📍" if self.is_always_on_top else "📌")
+        self.pin_btn.setFixedSize(28, 28)
+        self.pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.pin_btn.setToolTip("Toggle Always on Top")
+        self.pin_btn.setStyleSheet("""
+                           QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-size: 13px; }
+                           QPushButton:hover { background-color: #1e293b; color: #ffffff; }
+                       """)
+        self.pin_btn.clicked.connect(self.toggle_always_on_top)
+
+        # Insert pin button before close/minimize buttons in the title layout
+        title_layout.addWidget(self.pin_btn)
+
+
         file_title = os.path.basename(self.image_path)
         self.title_label = QLabel(f"🔍 Loading: {file_title}...")
         self.title_label.setStyleSheet("color: #cbd5e1; font-size: 12px; font-weight: bold; background: transparent;")
         title_layout.addWidget(self.title_label)
 
         title_layout.addStretch()
+
 
         btn_close = QPushButton("✕")
         btn_close.setFixedSize(26, 26)
@@ -763,6 +829,33 @@ class ImageViewerWindow(QWidget):
             self.showFullScreen()
 
         self.canvas.reset_fit()
+
+    def toggle_always_on_top(self):
+        self.is_always_on_top = not self.is_always_on_top
+        self.pin_btn.setText("📍" if self.is_always_on_top else "📌")
+
+        # Preserve geometry and visibility state when changing window flags
+        pos = self.pos()
+        size = self.size()
+        was_visible = self.isVisible()
+
+        flags = (
+                Qt.WindowType.Window |
+                Qt.WindowType.FramelessWindowHint
+        )
+        if self.is_always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+
+        self.setWindowFlags(flags)
+        if was_visible:
+            self.show()
+            self.setGeometry(QRect(pos, size))
+            # Bring window back to the front and ensure it retains active focus
+            self.raise_()
+            self.activateWindow()
+
+        # Persist to settings.json properly
+        save_settings(new_values={"viewer_always_on_top": self.is_always_on_top})
 
     def _get_resize_edge(self, global_pos):
         """Determines which edge or corner the mouse is hovering over using global coordinates."""

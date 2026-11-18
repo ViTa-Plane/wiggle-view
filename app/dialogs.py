@@ -1,9 +1,7 @@
-# version 0.3.7
-
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QTextEdit, QFrame,
-    QGraphicsDropShadowEffect, QCheckBox, QComboBox, QFormLayout
+    QGraphicsDropShadowEffect, QCheckBox, QComboBox, QFormLayout, QTabWidget
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPainter, QPen, QColor
@@ -12,6 +10,8 @@ from .widgets import (
     ResizeHandleWidget
 )
 
+from .helpers import load_settings, save_settings
+from . import __version__
 
 class AboutDialog(QDialog, WindowDragHandler):
     """Standalone fixed-size About dialog class with description and clickable GitHub link."""
@@ -60,7 +60,7 @@ class AboutDialog(QDialog, WindowDragHandler):
         self.content_label.setWordWrap(True)
         self.content_label.setOpenExternalLinks(True)
         self.content_label.setText(
-            "<b>WiggleView</b> alpha 0.2.0<br><br>"
+            f"<b>WiggleView</b> alpha {__version__}<br><br>"
             "image gallery and ref image viewer with "
             "high-performance multithreaded scanning, custom window controls, "
             "smooth canvas zooming & panning.<br><br>"
@@ -359,23 +359,86 @@ class BatchConvertDialog(QDialog, WindowDragHandler):
 
 
 class SettingsDialog(QDialog, WindowDragHandler):
-    """Standalone resizable settings window featuring checkboxes and dropdown lists."""
+    """Standalone resizable settings window featuring categorized tabs and persistent JSON storage."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
         WindowDragHandler.__init__(self)
-        self.resize(480, 380)
-        self.setMinimumSize(400, 320)
+        self.resize(500, 580)
+        self.setMinimumSize(500, 580)
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         self._setup_ui()
+        self.load_current_settings()  # <--- Loads settings from settings.json upon opening
 
     def done(self, result):
         if hasattr(self, "container") and self.container is not None:
             self.container.setGraphicsEffect(None)
         super().done(result)
+
+    def load_current_settings(self):
+        """Loads latest settings from settings.json and maps them to UI controls."""
+        settings = load_settings()  # Defaults to "settings.json" via helpers.py[cite: 13]
+
+        # General Tab mappings
+        theme_map = {"Cool Blue-Slate (Default)": 0,}
+        self.theme_combo.setCurrentIndex(theme_map.get(settings.get("theme_style"), 0))
+
+        lang_map = {"English (US)": 0,}
+        self.lang_combo.setCurrentIndex(lang_map.get(settings.get("language"), 0))
+
+        # Viewer Tab mappings
+        self.keep_alive_chk.setChecked(settings.get("keep_detached_viewers_alive", False))
+        self.prefetch_chk.setChecked(settings.get("prefetch_images", True))
+        self.hw_accel_chk.setChecked(settings.get("smooth_scaling", True))
+        self.purge_thumb_chk.setChecked(settings.get("purge_thumb_cache_on_exit", False))
+        self.encrypt_thumb_chk.setChecked(settings.get("encrypt_thumbnail_cache", True))
+
+        cache_map = {"250 Thumbnails": 0, "500 Thumbnails": 1, "1,000 Thumbnails": 2, "2,000 Thumbnails (Default)": 3,
+                     "5,000 Thumbnails": 4}
+        self.max_cache_combo.setCurrentIndex(cache_map.get(settings.get("max_thumbnail_cache"), 1))
+
+        # Thumbnail Tab (Quality Slider)
+        q_val = settings.get("thumbnail_jpeg_quality", 88)
+        self.thumb_quality_slider.setValue(q_val)
+        self.thumb_quality_val_label.setText(f"{q_val}%")
+
+        # Advanced Tab Mappings
+        self.confirm_delete_chk.setChecked(settings.get("confirm_on_delete", True))
+        self.loop_nav_chk.setChecked(settings.get("loop_gallery_navigation", True))
+
+        disk_limit_map = {"500 MB": 0, "1 GB": 1, "2 GB": 2, "Unlimited": 3}
+        self.disk_limit_combo.setCurrentIndex(disk_limit_map.get(settings.get("disk_cache_limit_mb"), 1))
+
+        thread_map = {"2 Threads": 0, "4 Threads": 1, "Auto (Max Cores)": 2}
+        self.thread_combo.setCurrentIndex(thread_map.get(settings.get("thread_pool_concurrency"), 2))
+
+        zoom_mode_map = {"Fit to Window (Default)": 0, "Fill Screen": 1}
+        self.default_zoom_combo.setCurrentIndex(zoom_mode_map.get(settings.get("default_zoom_mode"), 0))
+        self.invert_zoom_chk.setChecked(settings.get("invert_mouse_wheel_zoom", False))
+
+    def save_current_settings(self):
+        """Extracts values from widgets and persists them to settings.json."""
+        new_values = {
+            "theme_style": self.theme_combo.currentText(),
+            "language": self.lang_combo.currentText(),
+            "keep_detached_viewers_alive": self.keep_alive_chk.isChecked(),
+            "prefetch_images": self.prefetch_chk.isChecked(),
+            "smooth_scaling": self.hw_accel_chk.isChecked(),
+            "purge_thumb_cache_on_exit": self.purge_thumb_chk.isChecked(),
+            "encrypt_thumbnail_cache": self.encrypt_thumb_chk.isChecked(),
+            "max_thumbnail_cache": self.max_cache_combo.currentText(),
+            "thumbnail_jpeg_quality": self.thumb_quality_slider.value(),
+            "confirm_on_delete": self.confirm_delete_chk.isChecked(),
+            "loop_gallery_navigation": self.loop_nav_chk.isChecked(),
+            "disk_cache_limit_mb": self.disk_limit_combo.currentText(),
+            "thread_pool_concurrency": self.thread_combo.currentText(),
+            "default_zoom_mode": self.default_zoom_combo.currentText(),
+            "invert_mouse_wheel_zoom": self.invert_zoom_chk.isChecked(),
+        }
+        save_settings(new_values=new_values)  # Writes to settings.json[cite: 13]
 
     def _setup_ui(self):
         main_layout = QVBoxLayout(self)
@@ -436,6 +499,28 @@ class SettingsDialog(QDialog, WindowDragHandler):
                 selection-color: #ffffff;
                 border: 1px solid #1e293b;
             }
+            QTabWidget::pane {
+                border: 1px solid #1e293b;
+                background-color: #0b0f19;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QTabBar::tab {
+                background-color: #131b2e;
+                color: #94a3b8;
+                border: 1px solid #1e293b;
+                padding: 6px 14px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                margin-right: 2px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border-bottom-color: #1e293b;
+            }
         """)
 
         shadow = QGraphicsDropShadowEffect(self)
@@ -450,34 +535,186 @@ class SettingsDialog(QDialog, WindowDragHandler):
 
         container_layout.addWidget(TitleBar("⚙️ Application Settings", self, show_min_max=False))
 
+        # --- Tab Widget Setup ---
+        self.tab_widget = QTabWidget()
+
+        # 1. General Tab
+        general_tab = QWidget()
+        general_layout = QVBoxLayout(general_tab)
+        general_layout.setContentsMargins(10, 10, 10, 10)
+        general_layout.setSpacing(14)
+
         form_layout = QFormLayout()
-        form_layout.setContentsMargins(0, 10, 0, 10)
-        form_layout.setSpacing(16)
+        form_layout.setSpacing(12)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItems(["Cool Blue-Slate (Default)", "Midnight Charcoal", "Ocean Deep"])
+        # "Cool Blue-Slate (Default)", "Midnight Charcoal", "Ocean Deep"
+        self.theme_combo.addItems(["Cool Blue-Slate (Default)",])
         form_layout.addRow("Theme Style:", self.theme_combo)
 
         self.lang_combo = QComboBox()
-        self.lang_combo.addItems(["English (US)", "Spanish", "French", "German"])
+        # "English (US)", "Spanish", "French", "German"
+        self.lang_combo.addItems(["English (US)",])
         form_layout.addRow("Language:", self.lang_combo)
 
-        container_layout.addLayout(form_layout)
+        general_layout.addLayout(form_layout)
 
-        self.notifications_chk = QCheckBox("Enable desktop status notifications")
-        self.notifications_chk.setChecked(True)
-        container_layout.addWidget(self.notifications_chk)
+        self.tab_widget.addTab(general_tab, "General")
 
-        self.startup_chk = QCheckBox("Check for updates automatically on startup")
-        self.startup_chk.setChecked(False)
-        container_layout.addWidget(self.startup_chk)
+        # 2. Viewer Tab
+        viewer_tab = QWidget()
+        viewer_layout = QVBoxLayout(viewer_tab)
+        viewer_layout.setContentsMargins(10, 10, 10, 10)
+        viewer_layout.setSpacing(14)
 
-        self.tray_chk = QCheckBox("Minimize application to system tray on close")
-        self.tray_chk.setChecked(True)
-        container_layout.addWidget(self.tray_chk)
+        self.keep_alive_chk = QCheckBox("Keep detached image viewers alive on exit")
+        self.keep_alive_chk.setChecked(False)
+        viewer_layout.addWidget(self.keep_alive_chk)
 
-        container_layout.addStretch()
+        self.invert_zoom_chk = QCheckBox("Invert mouse wheel zoom direction (Natural Zoom)")
+        self.invert_zoom_chk.setToolTip("Inverts scroll wheel direction so scrolling up zooms out and down zooms in.")
+        viewer_layout.addWidget(self.invert_zoom_chk)
 
+        self.loop_nav_chk = QCheckBox("Loop gallery navigation at folder boundaries")
+        self.loop_nav_chk.setToolTip("When reaching the last image, arrow keys loop back to the first item.")
+        viewer_layout.addWidget(self.loop_nav_chk)
+
+
+        self.default_zoom_combo = QComboBox()
+        self.default_zoom_combo.addItems(["Fit to Window (Default)", "Fill Screen"])
+        self.default_zoom_combo.setToolTip("Sets the initial zoom and scaling behavior when opening an image.")
+
+        info_lbl = QLabel("<b>Default Zoom Mode</b>")
+        info_lbl.setStyleSheet("color: #64748b; font-size: 12px;")
+        viewer_layout.addWidget(info_lbl)
+
+        viewer_layout.addWidget(self.default_zoom_combo)
+
+        viewer_layout.addStretch()
+
+        self.tab_widget.addTab(viewer_tab, "Viewer")
+
+        # 3. Thumbnail Tab
+        thumb_tab = QWidget()
+        thumb_layout = QVBoxLayout(thumb_tab)
+        thumb_layout.setContentsMargins(10, 10, 10, 10)
+        thumb_layout.setSpacing(14)
+
+        thumb_header_layout = QHBoxLayout()
+        self.thumb_quality_title_label = QLabel("Thumbnails JPEG Quality:")
+        self.thumb_quality_title_label.setStyleSheet("font-weight: bold;")
+        self.thumb_quality_val_label = QLabel("88%")
+        self.thumb_quality_val_label.setStyleSheet("color: #3b82f6; font-weight: bold;")
+        thumb_header_layout.addWidget(self.thumb_quality_title_label)
+        thumb_header_layout.addStretch()
+        thumb_header_layout.addWidget(self.thumb_quality_val_label)
+        thumb_layout.addLayout(thumb_header_layout)
+
+        self.thumb_quality_slider = QSlider(Qt.Orientation.Horizontal)
+        self.thumb_quality_slider.setRange(10, 100)
+        self.thumb_quality_slider.setValue(88)
+        self.thumb_quality_slider.setStyleSheet("""
+                    QSlider::groove:horizontal { border: 1px solid #283548; height: 6px; background: #0b0f19; border-radius: 3px; }
+                    QSlider::sub-page:horizontal { background: #3b82f6; border-radius: 3px; }
+                    QSlider::handle:horizontal { background: #f8fafc; border: 1px solid #cbd5e1; width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; }
+                """)
+        self.thumb_quality_slider.valueChanged.connect(lambda v: self.thumb_quality_val_label.setText(f"{v}%"))
+        thumb_layout.addWidget(self.thumb_quality_slider)
+
+        info_lbl = QLabel(
+            "<i>Note: Adjusting thumbnails quality affects newly generated thumbnails. "
+            "Clear or purge your thumbnail cache if you want older cached items re-encoded.</i>"
+        )
+        info_lbl.setWordWrap(True)
+        info_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        thumb_layout.addWidget(info_lbl)
+
+        self.max_cache_combo = QComboBox()
+        self.max_cache_combo.addItems(
+            ["250 Thumbnails", "500 Thumbnails", "1,000 Thumbnails", "2,000 Thumbnails (Default)", "5,000 Thumbnails"])
+        self.max_cache_combo.setCurrentIndex(1)  # Default to 500 Thumbnails
+        self.max_cache_combo.setToolTip(
+            "Sets the maximum number of thumbnails held in RAM. Requires an application restart to take full effect.")
+        thumb_layout.addWidget(self.max_cache_combo)
+
+        info_lbl = QLabel(
+            "<i>Sets the maximum number of thumbnails held in RAM. Requires an application restart to take full effect.</i>"
+        )
+        info_lbl.setWordWrap(True)
+        info_lbl.setStyleSheet("color: #64748b; font-size: 11px;")
+        thumb_layout.addWidget(info_lbl)
+
+
+        thumb_layout.addStretch()
+
+        self.tab_widget.addTab(thumb_tab, "Thumbnails")
+
+        # 4. Advanced Tab (Performance & File Operations)
+        advanced_tab = QWidget()
+        advanced_layout = QVBoxLayout(advanced_tab)
+        advanced_layout.setContentsMargins(10, 10, 10, 10)
+        advanced_layout.setSpacing(14)
+
+        # Section 1: Performance & Memory
+        perf_label = QLabel("<b>Performance & Memory Management</b>")
+        advanced_layout.addWidget(perf_label)
+
+        advanced_form = QFormLayout()
+        advanced_form.setSpacing(10)
+
+        self.disk_limit_combo = QComboBox()
+        self.disk_limit_combo.addItems(["500 MB", "1 GB", "2 GB", "Unlimited"])
+        self.disk_limit_combo.setToolTip("Sets the maximum disk footprint allowed for cached thumbnail files.")
+        advanced_form.addRow("Thumbnail Disk Cache Limit:", self.disk_limit_combo)
+
+        self.thread_combo = QComboBox()
+        self.thread_combo.addItems(["2 Threads", "4 Threads", "Auto (Max Cores)"])
+        self.thread_combo.setToolTip("Configures background worker concurrency for folder scanning and decoding.")
+        advanced_form.addRow("Background Concurrency:", self.thread_combo)
+
+
+        self.prefetch_chk = QCheckBox("Prefetch adjacent images")
+        self.prefetch_chk.setToolTip("speeds-up image browsing")
+        self.prefetch_chk.setChecked(True)
+        advanced_form.addRow(self.prefetch_chk)
+
+        self.hw_accel_chk = QCheckBox("Enable smooth pixmap scaling (High quality)")
+        self.hw_accel_chk.setToolTip("reduces the blockiness in high zoom-in")
+        self.hw_accel_chk.setChecked(True)
+        advanced_form.addRow(self.hw_accel_chk)
+
+        self.purge_thumb_chk = QCheckBox("Purge thumbnail disk cache on exit")
+        self.purge_thumb_chk.setToolTip("Removes the cached thumbnails in system temp folder")
+        self.purge_thumb_chk.setChecked(False)
+        advanced_form.addRow(self.purge_thumb_chk)
+
+        self.encrypt_thumb_chk = QCheckBox("Encrypt thumbnail disk cache")
+        self.encrypt_thumb_chk.setToolTip("Encrypts the cached thumbnails")
+        self.encrypt_thumb_chk.setChecked(True)
+        advanced_form.addRow(self.encrypt_thumb_chk)
+
+        advanced_layout.addLayout(advanced_form)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet("background-color: #1e293b; max-height: 1px;")
+        advanced_layout.addWidget(sep)
+
+        # Section 2: File Operations & Safety
+        safety_label = QLabel("<b>File Operations & Safety</b>")
+        advanced_layout.addWidget(safety_label)
+
+        self.confirm_delete_chk = QCheckBox("Confirm before moving files to Recycle Bin")
+        self.confirm_delete_chk.setToolTip("Displays a confirmation dialog when pressing Delete/Backspace.")
+        advanced_layout.addWidget(self.confirm_delete_chk)
+
+
+        advanced_layout.addStretch()
+        self.tab_widget.addTab(advanced_tab, "Advanced")
+
+        container_layout.addWidget(self.tab_widget, stretch=1)
+
+        # --- Action Buttons & Grip ---
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
 
@@ -499,7 +736,6 @@ class SettingsDialog(QDialog, WindowDragHandler):
             }
         """)
         cancel_btn.clicked.connect(self.reject)
-        btn_layout.addWidget(cancel_btn)
 
         save_btn = QPushButton("Save Settings")
         save_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -516,7 +752,10 @@ class SettingsDialog(QDialog, WindowDragHandler):
                 background-color: #2563eb;
             }
         """)
-        save_btn.clicked.connect(self.accept)
+        # Calls save and then accepts/closes the dialog safely
+        save_btn.clicked.connect(lambda: (self.save_current_settings(), self.accept()))
+
+        btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
 
         self.resize_handle = ResizeHandleWidget(self)
