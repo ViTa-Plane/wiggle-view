@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
-    QPushButton, QTreeView, QFileSystemModel, QMenuBar
+    QPushButton, QTreeView, QFileSystemModel, QMenuBar, QAbstractItemView
 )
 from PySide6.QtCore import Qt, Signal, QModelIndex, QDir
 from PySide6.QtGui import QAction
@@ -362,13 +362,19 @@ class DirectoryBrowserPanel(QFrame):
             self.folder_selected.emit(dir_path)
 
     def set_selected_folder(self, folder_path):
-        """Expands and selects a specific folder path in the tree view."""
+        """Expands parent tree hierarchy and selects/scrolls the target folder into view."""
         if folder_path and os.path.isdir(folder_path):
             index = self.fs_model.index(folder_path)
             if index.isValid():
-                self.tree_view.scrollTo(index)
-                self.tree_view.setCurrentIndex(index)
+                # Expand all parent indexes up to root so deeply nested folders are visible
+                parent = index.parent()
+                while parent.isValid():
+                    self.tree_view.expand(parent)
+                    parent = parent.parent()
+
                 self.tree_view.expand(index)
+                self.tree_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
+                self.tree_view.setCurrentIndex(index)
 
 
 class LeftToolboxPanel(QFrame):
