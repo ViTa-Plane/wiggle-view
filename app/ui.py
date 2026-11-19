@@ -557,7 +557,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
             if self.current_sort_criteria != "name" or self.sort_reverse:
                 self.apply_sorting()
             else:
-                self.apply_sorting()
+                self.loaded_items.sort(
+                    key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", ""))
+                )
                 self._schedule_grid_repaint(relayout=True)
                 self.set_status(f"Ready — Total images in gallery: {total_count}")
 
