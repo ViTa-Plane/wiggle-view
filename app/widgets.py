@@ -1,9 +1,12 @@
+import os
+
 from collections import OrderedDict
-from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint, QTimer
-from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon
-from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout
+from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint, QTimer, QMimeData, QUrl
+from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon, QDrag
+from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QApplication
 from .helpers import load_settings
 from .workers import ThumbnailLoaderTask
+
 
 class WindowDragHandler:
     def __init__(self):
@@ -173,6 +176,9 @@ class ResponsiveGridWidget(QWidget):
         self.selected_file_paths = set()
         self.last_clicked_index = None
 
+        # Initialize drag tracking state for card drag-and-drop moves
+        self._drag_start_pos = None
+
         # Keyed by file_path -> QPixmap (pre-decoded in worker threads, zero disk I/O in paintEvent)
         self.pixmap_cache = OrderedDict()
 
@@ -240,6 +246,8 @@ class ResponsiveGridWidget(QWidget):
         self.updateGeometry()
 
     def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_pos = event.position().toPoint()
         if event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
             index = self._get_index_at_pos(event.position().toPoint())
             if 0 <= index < len(self.cards):
@@ -254,6 +262,16 @@ class ResponsiveGridWidget(QWidget):
                 # preserve the selection so context actions apply to all selected items.
                 if event.button() == Qt.MouseButton.RightButton and path in self.selected_file_paths:
                     pass
+                # If left-clicking an already multi-selected item without modifiers, keep selection
+                # intact so dragging moves all selected items together.
+                elif (
+                    event.button() == Qt.MouseButton.LeftButton
+                    and not is_shift
+                    and not is_ctrl
+                    and path in self.selected_file_paths
+                    and len(self.selected_file_paths) > 1
+                ):
+                    self.last_clicked_index = index
                 elif is_shift and self.last_clicked_index is not None:
                     start = min(self.last_clicked_index, index)
                     end = max(self.last_clicked_index, index)
@@ -292,6 +310,54 @@ class ResponsiveGridWidget(QWidget):
                 self.update()
                 self.item_double_clicked.emit(path)
         super().mouseDoubleClickEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            not (event.buttons() & Qt.MouseButton.LeftButton)
+            or self._drag_start_pos is None
+        ):
+            return super().mouseMoveEvent(event)
+
+        if (event.position().toPoint() - self._drag_start_pos).manhattanLength() < QApplication.startDragDistance():
+            return super().mouseMoveEvent(event)
+
+        # Determine which file(s) to drag using _get_index_at_pos
+        clicked_idx = self._get_index_at_pos(self._drag_start_pos)
+        drag_paths = []
+        if 0 <= clicked_idx < len(self.cards):
+            clicked_path = self.cards[clicked_idx]["file_path"]
+            if clicked_path in self.selected_file_paths:
+                drag_paths = list(self.selected_file_paths)
+            else:
+                drag_paths = [clicked_path]
+        elif self.selected_file_paths:
+            drag_paths = list(self.selected_file_paths)
+
+        drag_paths = [p for p in drag_paths if p and os.path.exists(p)]
+        if not drag_paths:
+            return
+
+        self._drag_start_pos = None
+
+        mime_data = QMimeData()
+        mime_data.setUrls([QUrl.fromLocalFile(p) for p in drag_paths])
+        mime_data.setData("application/x-wiggleview-cards", b"1")
+
+        drag = QDrag(self)
+        drag.setMimeData(mime_data)
+
+        # Use cached thumbnail as drag preview pixmap if available
+        preview = self.pixmap_cache.get(drag_paths[0]) if hasattr(self, "pixmap_cache") else None
+        if isinstance(preview, QPixmap) and not preview.isNull():
+            drag.setPixmap(
+                preview.scaled(72, 72, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            )
+
+        drag.exec(Qt.DropAction.MoveAction)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_start_pos = None
+        super().mouseReleaseEvent(event)
 
     def _get_index_at_pos(self, pos: QPoint):
         width = self.width()
@@ -374,7 +440,7 @@ class ResponsiveGridWidget(QWidget):
                             self._pending_reloads = set()
 
                         if file_path not in self._pending_reloads:
-                            self._pending_reloads.add(file_path, )
+                            self._pending_reloads.add(file_path)
                             # Clear pending flag after scheduling
                             QTimer.singleShot(100, lambda fp=file_path: self._pending_reloads.discard(fp))
 
@@ -441,7 +507,6 @@ class ResponsiveGridWidget(QWidget):
             self._MAX_PIXMAP_CACHE_ITEMS = 2000
 
         print(f"MAX_PIXMAP_CACHE_ITEMS: {self._MAX_PIXMAP_CACHE_ITEMS}")
-
 
     def get_cache_memory_usage(self):
         """Calculates the total approximate RAM usage of all cached QPixmaps in bytes."""

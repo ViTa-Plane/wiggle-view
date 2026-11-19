@@ -1,6 +1,7 @@
 import os
 import shutil
 import tempfile
+import uuid
 from collections import OrderedDict
 from PIL import Image
 from PIL.ExifTags import TAGS
@@ -11,7 +12,7 @@ from PySide6.QtWidgets import (
     QMessageBox, QTextEdit
 )
 from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject, QFileSystemWatcher, QMimeData, QUrl
-from PySide6.QtGui import QColor, QImageReader, QGuiApplication, QImage
+from PySide6.QtGui import QColor, QImageReader, QGuiApplication, QImage, QShortcut, QKeySequence
 
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
 from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
@@ -116,7 +117,16 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.loaded_items = []
         self.items_by_path = {}  # O(1) lookup map: file_path -> item_dict
         self.pending_thumbnail_files = []
-        self.scan_id = 0	# Track active scan generation
+        self.scan_id = 0  # Track active scan generation
+        self._current_scan_count = 0
+        self._total_thumbs_to_generate = 0
+        self._thumbs_ready_count = 0
+
+        # Undo / Redo history stacks and reversible delete staging directory
+        self._undo_stack = []
+        self._redo_stack = []
+        self._undo_trash_dir = os.path.join(tempfile.gettempdir(), "wiggleview_undo_trash")
+        os.makedirs(self._undo_trash_dir, exist_ok=True)
 
         # Coalesced grid repaint timer (prevents thousands of redundant repaints)
         self._grid_repaint_timer = QTimer(self)
@@ -140,13 +150,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Replace comfy_status_ready with comfy_batch_ready
         self.comfy_signals = ComfyMetadataScannerSignals()
         self.comfy_signals.comfy_batch_ready.connect(self.on_comfy_batch_ready)
-        
+
         '''folder-state dictionary cache'''
         self.folder_scan_cache = OrderedDict()
-        self._MAX_FOLDER_CACHE = 10	# Remembers the last 10 scanned directories instantly
+        self._MAX_FOLDER_CACHE = 10  # Remembers the last 10 scanned directories instantly
 
         self.startup_setings_print()
-
 
         self._setup_ui()
 
@@ -292,6 +301,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # --- Left Directory Browser Panel ---
         self.left_browser = DirectoryBrowserPanel(self)
         self.left_browser.folder_selected.connect(self.load_images_from_folder)
+        self.left_browser.files_dropped_on_folder.connect(self.move_files_to_folder)
         self.left_browser.btn_browse.clicked.connect(self.open_current_folder_in_explorer)
 
         main_splitter.addWidget(self.left_browser)
@@ -347,7 +357,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         # --- Right Panel (Includes ComfyUI Metadata Tab) ---
         self.right_sidebar = SidebarPanel(self)
-       # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
+        # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
         if hasattr(self.right_sidebar, 'tab_widget') and not hasattr(self.right_sidebar, 'comfy_view'):
             self.right_sidebar.comfy_view = QTextEdit()
             self.right_sidebar.comfy_view.setReadOnly(True)
@@ -384,6 +394,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
         main_layout.addWidget(self.container)
         self.setCentralWidget(central_widget)
 
+        # Global Undo / Redo shortcuts (Ctrl+Z and Ctrl+Shift+Z)
+        self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.undo_shortcut.activated.connect(self.undo_file_operation)
+
+        self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.redo_shortcut.activated.connect(self.redo_file_operation)
+
     def apply_concurrency_settings(self):
         settings = load_settings(SETTINGS_FILE)
         concurrency = settings.get("thread_pool_concurrency", "Auto (Max Cores)")
@@ -402,8 +419,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
     def startup_setings_print(self):
         from .helpers import load_settings
         settings = load_settings()
-        print(f"thumbnail_jpeg_quality: {settings.get("thumbnail_jpeg_quality", None)}")
-        print(f"encrypt_thumbnail_cache: {settings.get("encrypt_thumbnail_cache", None)}")
+        print(f"thumbnail_jpeg_quality: {settings.get('thumbnail_jpeg_quality', None)}")
+        print(f"encrypt_thumbnail_cache: {settings.get('encrypt_thumbnail_cache', None)}")
 
     def load_last_folder(self):
         data = load_settings(SETTINGS_FILE)
@@ -447,10 +464,10 @@ class MainWindow(QMainWindow, WindowDragHandler):
             return
 
         if self.current_watched_dir and self.current_watched_dir != folder_path:
-            self.file_watcher.removePath(self.current_watched_dir)
+            self._sync_file_watcher_paths(folder_path)
         self.current_watched_dir = folder_path
         if folder_path not in self.file_watcher.directories():
-            self.file_watcher.addPath(folder_path)
+            self._sync_file_watcher_paths(folder_path)
 
         self.save_last_folder(folder_path)
         self.left_browser.set_selected_folder(folder_path)
@@ -458,6 +475,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self.scan_id += 1
         current_scan_id = self.scan_id
+        self._current_scan_count = 0
+        self._total_thumbs_to_generate = 0
+        self._thumbs_ready_count = 0
 
         # Instant RAM cache hit when switching back to a recently visited directory
         if folder_path in self.folder_scan_cache:
@@ -481,6 +501,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
             self.apply_sorting()
             self.set_status(f"Ready (Cached) — Total images: {len(self.loaded_items)}")
+            self._perform_smooth_folder_sync()
             return
 
         self.pending_thumbnail_files.clear()
@@ -533,17 +554,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     existing_thumb_path=item_data.get("thumb_path")
                 )
                 self.thread_pool.start(task)
-
-        # self._total_thumbs_to_generate += new_thumbs_needed
-        # self._current_scan_count = len(self.loaded_items)
-        #
-        # # Show live count of discovered items & active thumbnail generation
-        # if self._total_thumbs_to_generate > 0:
-        #     left_to_gen = max(0, self._total_thumbs_to_generate - self._thumbs_ready_count)
-        #     self.set_status(
-        #         f"Scanning... Discovered {self._current_scan_count} images | Thumbnails Ready: {self._thumbs_ready_count} | Left: {left_to_gen}")
-        # else:
-        #     self.set_status(f"Scanning folder... Discovered {self._current_scan_count} images (Cached)")
 
         self.workspace_grid.set_cards(self.loaded_items)
 
@@ -612,7 +622,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if not self._status_throttle_timer.isActive():
             self._status_throttle_timer.start(150)
 
-
     def _flush_thumbnail_status(self):
         """Batch-updates the status footer smoothly with live RAM cache consumption."""
         left_to_gen = max(0, self._total_thumbs_to_generate - self._thumbs_ready_count)
@@ -629,6 +638,33 @@ class MainWindow(QMainWindow, WindowDragHandler):
         else:
             self.set_status(
                 f"Ready — Total images in gallery: {len(self.loaded_items)} | RAM Cache: {cache_count} items ({cache_size_str})")
+
+    def _sync_file_watcher_paths(self, root_folder):
+        current_paths = set(self.file_watcher.directories())
+        if current_paths:
+            self.file_watcher.removePaths(list(current_paths))
+
+        if not root_folder or not os.path.isdir(root_folder):
+            return
+
+        settings = load_settings(SETTINGS_FILE)
+        include_subfolders = settings.get("include_child_folders", False)
+        max_depth = max(1, int(settings.get("child_folder_depth", 1)))
+
+        paths_to_watch = [root_folder]
+        if include_subfolders:
+            base_depth = len(os.path.normpath(root_folder).split(os.sep))
+            for dirpath, dirnames, _ in os.walk(root_folder, followlinks=False, onerror=lambda e: None):
+                current_depth = len(os.path.normpath(dirpath).split(os.sep)) - base_depth
+                if current_depth >= max_depth:
+                    dirnames[:] = []
+                    continue
+                for d in dirnames:
+                    full_dir = os.path.join(dirpath, d)
+                    if os.path.isdir(full_dir):
+                        paths_to_watch.append(full_dir)
+
+        self.file_watcher.addPaths(paths_to_watch)
 
     def on_card_selected(self, file_path, display_name):
         filename = os.path.basename(file_path)
@@ -793,6 +829,175 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 self.right_sidebar.comfy_view.setPlainText("Multiple items selected.")
             self.set_status(f"Selected {count} of {total} items ({size_str})")
 
+    #  -----------undo / redo & drag-drop move functions--------------
+    def _record_undo_action(self, action):
+        self._undo_stack.append(action)
+        # Clear redo history whenever a new action is performed
+        for discarded in self._redo_stack:
+            if discarded.get("type") == "delete":
+                for _, staged_path in discarded.get("pairs", []):
+                    if staged_path and os.path.exists(staged_path):
+                        try:
+                            os.remove(staged_path)
+                        except OSError:
+                            pass
+        self._redo_stack.clear()
+
+    def _refresh_after_history_op(self, affected_paths):
+        affected_dirs = {os.path.dirname(p) for p in affected_paths if p}
+        for d in affected_dirs:
+            self.folder_scan_cache.pop(d, None)
+        if self.current_watched_dir:
+            self.folder_scan_cache.pop(os.path.abspath(self.current_watched_dir), None)
+            self._perform_smooth_folder_sync()
+
+    def _ensure_folder_in_watch_and_cache(self, folder_path):
+        """Ensures a drop/target folder is invalidated in RAM cache and actively watched."""
+        if not folder_path or not os.path.isdir(folder_path):
+            return
+        abs_folder = os.path.abspath(folder_path)
+        self.folder_scan_cache.pop(abs_folder, None)
+        self.folder_scan_cache.pop(folder_path, None)
+        if abs_folder not in self.file_watcher.directories():
+            self.file_watcher.addPath(abs_folder)
+
+    def _refresh_target_folder_if_active(self, target_folder):
+        """If the drop target folder is the currently active folder, refresh its view immediately."""
+        if not self.current_watched_dir or not target_folder:
+            return
+        if os.path.abspath(self.current_watched_dir) == os.path.abspath(target_folder):
+            self._perform_smooth_folder_sync()
+
+    def undo_file_operation(self):
+        if not self._undo_stack:
+            self.set_status("Nothing to undo.")
+            return
+
+        action = self._undo_stack.pop()
+        op_type = action["type"]
+        affected = []
+
+        if self.current_watched_dir:
+            self.file_watcher.removePaths(self.file_watcher.directories())
+
+        if op_type == "move":
+            for orig_src, current_dst in reversed(action["pairs"]):
+                if os.path.exists(current_dst):
+                    os.makedirs(os.path.dirname(orig_src), exist_ok=True)
+                    shutil.move(current_dst, orig_src)
+                    affected.extend([orig_src, current_dst])
+            self._redo_stack.append(action)
+            self.set_status(f"Undid move of {len(action['pairs'])} file(s).")
+
+        elif op_type == "copy":
+            for orig_src, copied_dst in reversed(action["pairs"]):
+                if os.path.exists(copied_dst):
+                    os.remove(copied_dst)
+                    affected.append(copied_dst)
+            self._redo_stack.append(action)
+            self.set_status(f"Undid copy of {len(action['pairs'])} file(s).")
+
+        elif op_type == "delete":
+            for orig_path, staged_path in reversed(action["pairs"]):
+                if os.path.exists(staged_path):
+                    os.makedirs(os.path.dirname(orig_path), exist_ok=True)
+                    shutil.move(staged_path, orig_path)
+                    affected.append(orig_path)
+            self._redo_stack.append(action)
+            self.set_status(f"Restored {len(action['pairs'])} deleted file(s).")
+
+        if self.current_watched_dir:
+            self._sync_file_watcher_paths(self.current_watched_dir)
+        self._refresh_after_history_op(affected)
+
+    def redo_file_operation(self):
+        if not self._redo_stack:
+            self.set_status("Nothing to redo.")
+            return
+
+        action = self._redo_stack.pop()
+        op_type = action["type"]
+        affected = []
+
+        if self.current_watched_dir:
+            self.file_watcher.removePaths(self.file_watcher.directories())
+
+        if op_type == "move":
+            for orig_src, target_dst in action["pairs"]:
+                if os.path.exists(orig_src):
+                    os.makedirs(os.path.dirname(target_dst), exist_ok=True)
+                    shutil.move(orig_src, target_dst)
+                    affected.extend([orig_src, target_dst])
+            self._undo_stack.append(action)
+            self.set_status(f"Redid move of {len(action['pairs'])} file(s).")
+
+        elif op_type == "copy":
+            for orig_src, target_dst in action["pairs"]:
+                if os.path.exists(orig_src):
+                    os.makedirs(os.path.dirname(target_dst), exist_ok=True)
+                    shutil.copy2(orig_src, target_dst)
+                    affected.append(target_dst)
+            self._undo_stack.append(action)
+            self.set_status(f"Redid copy of {len(action['pairs'])} file(s).")
+
+        elif op_type == "delete":
+            for orig_path, staged_path in action["pairs"]:
+                if os.path.exists(orig_path):
+                    os.makedirs(os.path.dirname(staged_path), exist_ok=True)
+                    shutil.move(orig_path, staged_path)
+                    affected.append(orig_path)
+            self._undo_stack.append(action)
+            self.set_status(f"Redid delete of {len(action['pairs'])} file(s).")
+
+        if self.current_watched_dir:
+            self._sync_file_watcher_paths(self.current_watched_dir)
+        self._refresh_after_history_op(affected)
+
+    def move_files_to_folder(self, src_paths, target_folder):
+        if not src_paths or not target_folder or not os.path.isdir(target_folder):
+            return
+
+        target_abs = os.path.abspath(target_folder)
+        moved_records = []
+
+        if self.current_watched_dir:
+            self.file_watcher.removePaths(self.file_watcher.directories())
+
+        for src in src_paths:
+            src_abs = os.path.abspath(src)
+            if not os.path.exists(src_abs):
+                continue
+            # Skip if already inside the exact target folder
+            if os.path.dirname(src_abs) == target_abs:
+                continue
+
+            filename = os.path.basename(src_abs)
+            dest_abs = os.path.join(target_abs, filename)
+            base, ext = os.path.splitext(filename)
+            counter = 1
+            while os.path.exists(dest_abs):
+                dest_abs = os.path.join(target_abs, f"{base}_moved{counter}{ext}")
+                counter += 1
+
+            try:
+                shutil.move(src_abs, dest_abs)
+                moved_records.append((src_abs, dest_abs))
+            except Exception as e:
+                print(f"Failed to move {src_abs} -> {dest_abs}: {e}")
+
+        if self.current_watched_dir:
+            self._sync_file_watcher_paths(self.current_watched_dir)
+        self._ensure_folder_in_watch_and_cache(target_abs)
+
+        if moved_records:
+            self._record_undo_action({"type": "move", "pairs": moved_records})
+            self.folder_scan_cache.pop(target_abs, None)
+            if self.current_watched_dir:
+                self.folder_scan_cache.pop(os.path.abspath(self.current_watched_dir), None)
+            self._perform_smooth_folder_sync()
+            self._refresh_target_folder_if_active(target_abs)
+            self.set_status(f"Moved {len(moved_records)} file(s) to {os.path.basename(target_abs)} (Ctrl+Z to undo)")
+
     #  -----------grid context menu and file operations--------------
     def show_grid_context_menu(self, pos):
         """Displays the right-click context menu on the image grid."""
@@ -865,10 +1070,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
             return
 
         if self.current_watched_dir:
-            self.file_watcher.removePath(self.current_watched_dir)
+            self.file_watcher.removePaths(self.file_watcher.directories())
 
         valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
         newly_added_items = []
+        copied_records = []
+        moved_records = []
         success_count = 0
 
         # Capture cut source paths securely before processing URLs
@@ -893,9 +1100,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     # Check if this specific source path was marked as a cut operation
                     if cut_paths and os.path.abspath(src_path) in [os.path.abspath(p) for p in cut_paths]:
                         shutil.move(src_path, dest_path)
+                        moved_records.append((os.path.abspath(src_path), os.path.abspath(dest_path)))
                         action_performed = "Moved"
                     else:
                         shutil.copy2(src_path, dest_path)
+                        copied_records.append((os.path.abspath(src_path), os.path.abspath(dest_path)))
                         action_performed = "Copied"
 
                     file_stats = os.stat(dest_path)
@@ -905,7 +1114,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     if dest_path.lower().endswith(".png"):
                         try:
                             with Image.open(dest_path) as img:
-                                if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
+                                if hasattr(img, "text") and img.text and (
+                                        "workflow" in img.text or "prompt" in img.text):
                                     has_comfy = True
                         except Exception:
                             pass
@@ -937,9 +1147,14 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Clear cut source paths after operation is finished
         self._cut_source_paths = []
         if self.current_watched_dir:
-            self.file_watcher.addPath(self.current_watched_dir)
+            self._sync_file_watcher_paths(self.current_watched_dir)
 
         if success_count > 0:
+            if copied_records:
+                self._record_undo_action({"type": "copy", "pairs": copied_records})
+            if moved_records:
+                self._record_undo_action({"type": "move", "pairs": moved_records})
+
             self.loaded_items.extend(newly_added_items)
             self._rebuild_path_index()
             if self.current_watched_dir in self.folder_scan_cache:
@@ -951,7 +1166,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
     def copy_selected_files(self, paths, cut=False):
         """Copies or cuts selected file paths to the system clipboard. If no selection, copies the whole gallery."""
-        # If no specific paths are selected, fallback to copying the entire loaded gallery
         if not paths:
             paths = [item["file_path"] for item in self.loaded_items if os.path.exists(item["file_path"])]
 
@@ -975,7 +1189,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.set_status(f"{action_name} {len(paths)} file(s) ({target_desc}) to clipboard.")
 
     def delete_selected_files(self, paths):
-        """Safely sends selected image files to the Recycle Bin and updates the grid in-place without folder re-scans."""
+        """Safely removes selected image files with undo staging and updates the grid in-place without folder re-scans."""
         if not paths:
             self.status_label.setText("Status: Deletion failed - No valid images selected.")
             return
@@ -997,27 +1211,23 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # ---------------------------------------------
 
         deleted_paths = set()
-        try:
-            from send2trash import send2trash
-            for path in paths:
-                norm_path = os.path.abspath(path)
-                if os.path.exists(norm_path):
-                    send2trash(norm_path)
-                    deleted_paths.add(norm_path)
-        except ImportError:
-            print("DEBUG Error: 'send2trash' module is not installed! Falling back to os.remove().")
-            for path in paths:
+        deleted_records = []
+
+        for path in paths:
+            norm_path = os.path.abspath(path)
+            if os.path.exists(norm_path):
                 try:
-                    norm_path = os.path.abspath(path)
-                    if os.path.exists(norm_path):
-                        os.remove(norm_path)
-                        deleted_paths.add(norm_path)
+                    staged_name = f"{uuid.uuid4().hex}_{os.path.basename(norm_path)}"
+                    staged_path = os.path.join(self._undo_trash_dir, staged_name)
+                    shutil.move(norm_path, staged_path)
+                    deleted_paths.add(norm_path)
+                    deleted_records.append((norm_path, staged_path))
                 except Exception as e:
-                    print(f"DEBUG Error: Permanent deletion failed for {path}: {e}")
-        except Exception as e:
-            print(f"DEBUG Error encountered during delete execution: {e}")
+                    print(f"DEBUG Error staging delete for {path}: {e}")
 
         if deleted_paths:
+            self._record_undo_action({"type": "delete", "pairs": deleted_records})
+
             # 1. Instantly filter out deleted items from loaded_items memory cache
             self.loaded_items = [
                 item for item in self.loaded_items
@@ -1057,7 +1267,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_images_from_folder(folder_path)
 
             # 2. Sync the directory browser tree panel so it highlights the folder
-            if hasattr(self, 'directory_browser') and self.left_browser:
+            if hasattr(self, 'left_browser') and self.left_browser:
                 self.left_browser.set_selected_folder(folder_path)
 
             # 3. Re-apply the active sort criteria and order
@@ -1326,6 +1536,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             # Invalidate cached folder scans so child-folder / depth changes take effect
             self.folder_scan_cache.clear()
             if self.current_watched_dir and os.path.isdir(self.current_watched_dir):
+                self._sync_file_watcher_paths(self.current_watched_dir)
                 self.load_images_from_folder(self.current_watched_dir)
 
         self.set_status("Ready")
@@ -1336,11 +1547,20 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # Store as instance variable
         AboutDialog(self).exec()
         self.set_status("Ready")
-        
+
     #  -----------directory changes watch--------------
     def _on_directory_changed(self, path):
         if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
             return
+
+        # Re-add watched folder if removed/recreated on Windows/network drives
+        if path and os.path.isdir(path) and path not in self.file_watcher.directories():
+            self.file_watcher.addPath(path)
+
+        # Invalidate cached entry for whichever watched directory changed
+        if path:
+            self.folder_scan_cache.pop(path, None)
+            self.folder_scan_cache.pop(os.path.abspath(path), None)
 
         # Use a short 300ms debounce timer to batch rapid-fire filesystem triggers together
         if not hasattr(self, '_watcher_debounce_timer'):
@@ -1349,7 +1569,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self._watcher_debounce_timer.timeout.connect(self._perform_smooth_folder_sync)
 
         self._watcher_debounce_timer.start(300)
-
 
     def _collect_disk_image_paths(self):
         valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
@@ -1377,63 +1596,121 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         return disk_files
 
+    def _build_external_item(self, file_path):
+        file_name = os.path.basename(file_path)
+        try:
+            stats = os.stat(file_path)
+            size = stats.st_size
+            mtime = stats.st_mtime
+        except OSError:
+            size = 0
+            mtime = 0
+
+        has_comfy = False
+        if file_path.lower().endswith(".png"):
+            try:
+                with Image.open(file_path) as img:
+                    if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
+                        has_comfy = True
+            except Exception:
+                pass
+
+        return {
+            "file_path": file_path,
+            "filename": file_name.lower(),
+            "display_name": (file_name[:16] + '..') if len(file_name) > 18 else file_name,
+            "size": size,
+            "mtime": mtime,
+            "thumb_path": None,
+            "has_comfy": has_comfy,
+        }
+
+    def _sort_loaded_items_quietly(self):
+        criteria = self.current_sort_criteria
+        is_rev = self.sort_reverse
+        if criteria == "name":
+            self.loaded_items.sort(
+                key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", "")),
+                reverse=is_rev,
+            )
+        elif criteria == "date":
+            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=not is_rev)
+        elif criteria == "size":
+            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
+
     def _perform_smooth_folder_sync(self):
         """Smart sync that checks for new/external file changes without harsh UI resets."""
         if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
             return
 
         try:
+            self._sync_file_watcher_paths(self.current_watched_dir)
+
             current_disk_files = self._collect_disk_image_paths()
-            loaded_paths = {os.path.abspath(item["file_path"]) for item in self.loaded_items}
+            loaded_map = {os.path.abspath(item["file_path"]): item for item in self.loaded_items}
+            loaded_paths = set(loaded_map.keys())
 
             if current_disk_files == loaded_paths:
                 return
 
-            if current_disk_files.issubset(loaded_paths):
-                removed = loaded_paths - current_disk_files
+            removed_paths = loaded_paths - current_disk_files
+            added_paths = sorted(current_disk_files - loaded_paths)
+
+            v_bar = self.scroll_area.verticalScrollBar()
+            prev_scroll = v_bar.value()
+            prev_selected = set(getattr(self.workspace_grid, "selected_file_paths", set()))
+
+            if removed_paths:
                 self.loaded_items = [
                     item for item in self.loaded_items
-                    if os.path.abspath(item["file_path"]) not in removed
+                    if os.path.abspath(item["file_path"]) not in removed_paths
                 ]
-                self._rebuild_path_index()
-                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
-                self.workspace_grid.set_cards(self.loaded_items)
-                return
+                for rp in removed_paths:
+                    if hasattr(self.workspace_grid, "pixmap_cache"):
+                        self.workspace_grid.pixmap_cache.pop(rp, None)
 
-            self.folder_scan_cache.pop(self.current_watched_dir, None)
-            self.load_images_from_folder(self.current_watched_dir)
+            new_items = []
+            for ap in added_paths:
+                item = self._build_external_item(ap)
+                self.loaded_items.append(item)
+                new_items.append(item)
+
+            self._rebuild_path_index()
+            if removed_paths or added_paths:
+                self._sort_loaded_items_quietly()
+
+            if self.current_watched_dir in self.folder_scan_cache:
+                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
+
+            self.workspace_grid.set_cards(self.loaded_items)
+            if hasattr(self.workspace_grid, "selected_file_paths"):
+                self.workspace_grid.selected_file_paths = {
+                    p for p in prev_selected if os.path.abspath(p) in current_disk_files
+                }
+                self.workspace_grid.update()
+
+            QTimer.singleShot(0, lambda pos=prev_scroll: v_bar.setValue(pos))
+
+            for item in new_items:
+                if not self.workspace_grid.has_cached_pixmap(item["file_path"]):
+                    task = ThumbnailLoaderTask(
+                        item["file_path"],
+                        self.thumb_cache_dir,
+                        self.CARD_IMAGE_SIZE,
+                        self.thumbnail_signals,
+                        scan_id=self.scan_id,
+                        active_scan_getter=self._get_active_scan_id,
+                        existing_thumb_path=item.get("thumb_path"),
+                    )
+                    self.thread_pool.start(task)
         except Exception as e:
             print(f"Error during smooth folder sync: {e}")
 
-    def apply_sorting(self):
-        if not self.loaded_items:
-            return
-
-        criteria = self.current_sort_criteria
-        is_rev = self.sort_reverse
-
-        if criteria == "name":
-            self.loaded_items.sort(
-                key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", "")),
-                reverse=is_rev
-            )
-            self.set_status(f"Sorted by Name ({'Z-A' if is_rev else 'A-Z'})")
-        elif criteria == "date":
-            reverse_flag = not is_rev
-            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=reverse_flag)
-            self.set_status(f"Sorted by Date ({'Oldest first' if is_rev else 'Newest first'})")
-        elif criteria == "size":
-            reverse_flag = not is_rev
-            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=reverse_flag)
-            self.set_status(f"Sorted by Size ({'Smallest first' if is_rev else 'Largest first'})")
-
-        self.workspace_grid.set_cards(self.loaded_items)
-
-    def mousePressEvent(self, event):
-        self.handle_mouse_press(self, event)
-
-    def mouseMoveEvent(self, event):
-        self.handle_mouse_move(self, event)
+    # def mousePressEvent(self, event):
+    #     self.handle_mouse_press(self, event)
+    #
+    # def mouseMoveEvent(self, event):
+    #     self.handle_mouse_move(self, event)
 
     def closeEvent(self, event):
         settings = load_settings(SETTINGS_FILE)
@@ -1441,6 +1718,18 @@ class MainWindow(QMainWindow, WindowDragHandler):
         # 1. Wait for any active background thread tasks to finish cleanly
         print("Closing the app, Wait for any active background thread tasks to finish cleanly")
         self.thread_pool.waitForDone()
+
+        # Flush staged undo-deleted files to the system Recycle Bin on exit
+        if hasattr(self, "_undo_trash_dir") and os.path.exists(self._undo_trash_dir):
+            try:
+                from send2trash import send2trash
+                for fname in os.listdir(self._undo_trash_dir):
+                    fpath = os.path.join(self._undo_trash_dir, fname)
+                    if os.path.exists(fpath):
+                        send2trash(fpath)
+                shutil.rmtree(self._undo_trash_dir, ignore_errors=True)
+            except Exception as e:
+                print(f"Error flushing staged deletes to Recycle Bin: {e}")
 
         # 2. Purge thumbnail cache on exit if enabled
         if settings.get("purge_thumb_cache_on_exit", False):

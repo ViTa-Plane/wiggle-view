@@ -1,10 +1,11 @@
+import os
 from PySide6.QtWidgets import (
     QFrame, QVBoxLayout, QTabWidget, QWidget, QLabel, QTextEdit,
     QPushButton, QTreeView, QFileSystemModel, QMenuBar, QAbstractItemView
 )
 from PySide6.QtCore import Qt, Signal, QModelIndex, QDir
 from PySide6.QtGui import QAction
-import os
+
 
 class TopMenuBar(QMenuBar):
     """Encapsulated top menu bar emitting signals for File, Sort, Select, Favorites, and About actions."""
@@ -163,7 +164,7 @@ class TopMenuBar(QMenuBar):
         export_action = QAction("Export EXIF data...", self)
         export_action.triggered.connect(self.export_exif_requested.emit)
 
-        export_comfy_action = tools_menu.addAction("Export ComfyUI Workflows...")
+        export_comfy_action = QAction("Export ComfyUI Workflows...", self)
         export_comfy_action.triggered.connect(self.export_comfy_workflow_requested.emit)
 
         tools_menu.addAction(convert_action)
@@ -280,8 +281,9 @@ class SidebarPanel(QFrame):
 
 
 class DirectoryBrowserPanel(QFrame):
-    """Interactive directory browsing panel to replace the left toolbox."""
+    """Interactive directory browsing panel"""
     folder_selected = Signal(str)  # Emits selected directory path
+    files_dropped_on_folder = Signal(list, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -340,6 +342,15 @@ class DirectoryBrowserPanel(QFrame):
                     }
                 """)
 
+        # Enable drag-and-drop onto tree folders
+        self.tree_view.setAcceptDrops(True)
+        self.tree_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
+        self.tree_view.setDropIndicatorShown(True)
+        self.tree_view.viewport().setAcceptDrops(True)
+        self.tree_view.dragEnterEvent = self._tree_drag_enter
+        self.tree_view.dragMoveEvent = self._tree_drag_move
+        self.tree_view.dropEvent = self._tree_drop
+
         self.tree_view.clicked.connect(self.on_dir_clicked)
 
         layout.addWidget(self.tree_view)
@@ -375,6 +386,57 @@ class DirectoryBrowserPanel(QFrame):
                 self.tree_view.expand(index)
                 self.tree_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
                 self.tree_view.setCurrentIndex(index)
+
+    def _tree_drag_enter(self, event):
+        if event.mimeData().hasUrls():
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+        else:
+            event.ignore()
+
+    def _tree_drag_move(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        pos = event.position().toPoint()
+        index = self.tree_view.indexAt(pos)
+        if index.isValid():
+            target_path = self.fs_model.filePath(index)
+            if os.path.isdir(target_path):
+                self.tree_view.setCurrentIndex(index)
+                event.setDropAction(Qt.DropAction.MoveAction)
+                event.accept()
+                return
+        event.ignore()
+
+    def _tree_drop(self, event):
+        if not event.mimeData().hasUrls():
+            event.ignore()
+            return
+
+        pos = event.position().toPoint()
+        index = self.tree_view.indexAt(pos)
+        if not index.isValid():
+            event.ignore()
+            return
+
+        target_folder = self.fs_model.filePath(index)
+        if not os.path.isdir(target_folder):
+            event.ignore()
+            return
+
+        src_paths = [
+            url.toLocalFile()
+            for url in event.mimeData().urls()
+            if url.isLocalFile() and os.path.isfile(url.toLocalFile())
+        ]
+        if src_paths:
+            event.setDropAction(Qt.DropAction.MoveAction)
+            event.accept()
+            self.files_dropped_on_folder.emit(src_paths, target_folder)
+        else:
+            event.ignore()
 
 
 class LeftToolboxPanel(QFrame):
