@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import (
-    QDialog, QWidget, QVBoxLayout, QHBoxLayout,
+    QDialog, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox,
     QLabel, QPushButton, QSlider, QTextEdit, QFrame,
     QGraphicsDropShadowEffect, QCheckBox, QComboBox, QFormLayout, QTabWidget
 )
@@ -389,6 +389,9 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.purge_thumb_chk.setStyleSheet(style)
         self.encrypt_thumb_chk.setStyleSheet(style)
 
+    def _on_include_subfolders_toggled(self, checked):
+        self.folder_depth_spin.setEnabled(checked)
+
     def load_current_settings(self):
         """Loads latest settings from settings.json and maps them to UI controls."""
         settings = load_settings()  # Defaults to "settings.json" via helpers.py[cite: 13]
@@ -417,6 +420,13 @@ class SettingsDialog(QDialog, WindowDragHandler):
             "10,000 Thumbnails": 6
         }
         self.max_cache_combo.setCurrentIndex(cache_map.get(settings.get("max_thumbnail_cache"), 0))
+
+        # Browsing Tab mappings
+        include_children = settings.get("include_child_folders", False)
+        self.include_subfolders_chk.setChecked(include_children)
+        self.folder_depth_spin.setValue(settings.get("child_folder_depth", 1))
+        self._on_include_subfolders_toggled(include_children)
+
 
         # Thumbnail Tab (Quality Slider)
         q_val = settings.get("thumbnail_jpeg_quality", 88)
@@ -453,7 +463,8 @@ class SettingsDialog(QDialog, WindowDragHandler):
             "max_thumbnail_cache": self.max_cache_combo.currentText(),
             "thumbnail_jpeg_quality": self.thumb_quality_slider.value(),
             "confirm_on_delete": self.confirm_delete_chk.isChecked(),
-            "loop_gallery_navigation": self.loop_nav_chk.isChecked(),
+            "include_child_folders": self.include_subfolders_chk.isChecked(),
+            "child_folder_depth": self.folder_depth_spin.value(),
             "disk_cache_limit_mb": self.disk_limit_combo.currentText(),
             "thread_pool_concurrency": self.thread_combo.currentText(),
             "default_zoom_mode": self.default_zoom_combo.currentText(),
@@ -581,6 +592,48 @@ class SettingsDialog(QDialog, WindowDragHandler):
         general_layout.addLayout(form_layout)
 
         self.tab_widget.addTab(general_tab, "General")
+
+        # Browsing Tab
+        browsing_tab = QWidget()
+        browsing_layout = QVBoxLayout(browsing_tab)
+        browsing_layout.setContentsMargins(10, 10, 10, 10)
+        browsing_layout.setSpacing(14)
+
+        self.include_subfolders_chk = QCheckBox("Include Child Folders")
+        self.include_subfolders_chk.setToolTip("Scan subfolders inside the selected directory for images.")
+        self.include_subfolders_chk.setChecked(False)
+        self.include_subfolders_chk.toggled.connect(self._on_include_subfolders_toggled)
+        browsing_layout.addWidget(self.include_subfolders_chk)
+
+        depth_row = QHBoxLayout()
+        depth_label = QLabel("Child Folder Depth:")
+        depth_label.setToolTip(
+            "Maximum subfolder levels below the selected folder to scan (1 = direct child folders only).")
+        self.folder_depth_spin = QSpinBox()
+        self.folder_depth_spin.setRange(1, 10)
+        self.folder_depth_spin.setValue(1)
+        self.folder_depth_spin.setEnabled(False)
+        self.folder_depth_spin.setStyleSheet("""
+                    QSpinBox {
+                        background-color: #131b2e;
+                        color: #cbd5e1;
+                        border: 1px solid #1e293b;
+                        border-radius: 6px;
+                        padding: 4px 8px;
+                        font-size: 12px;
+                    }
+                    QSpinBox:disabled {
+                        color: #475569;
+                        background-color: #0b0f19;
+                    }
+                """)
+        depth_row.addWidget(depth_label)
+        depth_row.addWidget(self.folder_depth_spin)
+        depth_row.addStretch()
+        browsing_layout.addLayout(depth_row)
+
+        browsing_layout.addStretch()
+        self.tab_widget.addTab(browsing_tab, "Browsing")
 
         # 2. Viewer Tab
         viewer_tab = QWidget()

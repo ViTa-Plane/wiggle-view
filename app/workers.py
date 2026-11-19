@@ -26,69 +26,126 @@ class FolderScannerTask(QRunnable):
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
 
+    def _build_item_entry(self, file_path, filename, stat_result, thumb_cache_dir):
+        display_name = (filename[:16] + '..') if len(filename) > 18 else filename
+
+        if stat_result is not None:
+            file_size = stat_result.st_size
+            file_mtime = stat_result.st_mtime
+        else:
+            file_size = 0
+            file_mtime = 0
+
+        precomputed_thumb_path = None
+        try:
+            hash_input = f"{file_path}_{file_mtime}".encode('utf-8')
+            path_hash = hashlib.md5(hash_input).hexdigest()
+            candidate_thumb = os.path.join(thumb_cache_dir, f"thumb_{path_hash}_170.jpg")
+            if os.path.exists(candidate_thumb):
+                precomputed_thumb_path = candidate_thumb
+        except Exception:
+            pass
+
+        return {
+            "file_path": file_path,
+            "display_name": display_name,
+            "thumb_path": precomputed_thumb_path,
+            "size": file_size,
+            "mtime": file_mtime,
+            "filename": filename.lower(),
+            "has_comfy": False
+        }
+
+    def _flush_batch(self, batch, total_count):
+        if len(batch) >= 100 and not self._is_cancelled():
+            self.signals.batch_scanned.emit(self.scan_id, batch)
+            return [], total_count
+        return batch, total_count
+
+    def _scan_single_folder(self, valid_extensions, thumb_cache_dir):
+        batch = []
+        total_count = 0
+
+        with os.scandir(self.folder_path) as entries:
+            for entry in entries:
+                if self._is_cancelled():
+                    return batch, total_count
+                if not entry.is_file():
+                    continue
+
+                filename = entry.name
+                if not filename.lower().endswith(valid_extensions):
+                    continue
+
+                try:
+                    stat_result = entry.stat()
+                except Exception:
+                    stat_result = None
+
+                batch.append(self._build_item_entry(entry.path, filename, stat_result, thumb_cache_dir))
+                total_count += 1
+                batch, total_count = self._flush_batch(batch, total_count)
+
+        return batch, total_count
+
+    def _scan_with_subfolders(self, valid_extensions, thumb_cache_dir, max_depth=None):
+        batch = []
+        total_count = 0
+        base_depth = len(os.path.normpath(self.folder_path).split(os.sep))
+
+        for root, dirs, files in os.walk(self.folder_path, followlinks=False, onerror=lambda e: None):
+            if self._is_cancelled():
+                return batch, total_count
+
+            current_depth = len(os.path.normpath(root).split(os.sep)) - base_depth
+            if max_depth is not None and current_depth >= max_depth:
+                dirs[:] = []
+
+            for filename in files:
+                if self._is_cancelled():
+                    return batch, total_count
+                if not filename.lower().endswith(valid_extensions):
+                    continue
+
+                full_path = os.path.join(root, filename)
+                try:
+                    stat_result = os.stat(full_path)
+                except Exception:
+                    stat_result = None
+
+                batch.append(self._build_item_entry(full_path, filename, stat_result, thumb_cache_dir))
+                total_count += 1
+                batch, total_count = self._flush_batch(batch, total_count)
+
+        return batch, total_count
+
     def run(self):
         valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
         thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
+
+        from .helpers import load_settings
+        settings = load_settings()
+        include_subfolders = settings.get("include_child_folders", False)
+        folder_depth = max(1, int(settings.get("child_folder_depth", 1)))
 
         try:
             if not os.path.isdir(self.folder_path) or self._is_cancelled():
                 return
 
-            batch = []
-            total_count = 0
+            if include_subfolders:
+                batch, total_count = self._scan_with_subfolders(
+                    valid_extensions, thumb_cache_dir, max_depth=folder_depth
+                )
+            else:
+                batch, total_count = self._scan_single_folder(valid_extensions, thumb_cache_dir)
 
-            with os.scandir(self.folder_path) as entries:
-                for entry in entries:
-                    if self._is_cancelled():
-                        return
-                    if not entry.is_file():
-                        continue
+            if self._is_cancelled():
+                return
 
-                    f = entry.name
-                    if not f.lower().endswith(valid_extensions):
-                        continue
-
-                    file_path = entry.path
-                    display_name = (f[:16] + '..') if len(f) > 18 else f
-
-                    try:
-                        stat = entry.stat()
-                        file_size = stat.st_size
-                        file_mtime = stat.st_mtime
-                    except Exception:
-                        file_size = 0
-                        file_mtime = 0
-
-                    precomputed_thumb_path = None
-                    try:
-                        hash_input = f"{file_path}_{file_mtime}".encode('utf-8')
-                        path_hash = hashlib.md5(hash_input).hexdigest()
-                        candidate_thumb = os.path.join(thumb_cache_dir, f"thumb_{path_hash}_170.jpg")
-                        if os.path.exists(candidate_thumb):
-                            precomputed_thumb_path = candidate_thumb
-                    except Exception:
-                        pass
-
-                    batch.append({
-                        "file_path": file_path,
-                        "display_name": display_name,
-                        "thumb_path": precomputed_thumb_path,
-                        "size": file_size,
-                        "mtime": file_mtime,
-                        "filename": f.lower(),
-                        "has_comfy": False
-                    })
-                    total_count += 1
-
-                    if len(batch) >= 100:
-                        self.signals.batch_scanned.emit(self.scan_id, batch)
-                        batch = []
-
-            if batch and not self._is_cancelled():
+            if batch:
                 self.signals.batch_scanned.emit(self.scan_id, batch)
 
-            if not self._is_cancelled():
-                self.signals.scan_complete.emit(self.scan_id, total_count)
+            self.signals.scan_complete.emit(self.scan_id, total_count)
         except Exception:
             pass
 

@@ -22,6 +22,8 @@ DEFAULT_SETTINGS = {
     "thread_pool_concurrency": "Auto (Max Cores)",
     "confirm_on_delete": True,
     "loop_gallery_navigation": True,
+    "include_child_folders": False,
+    "child_folder_depth": 1,
     "default_zoom_mode": "Fit to Window (Default)",
     "invert_mouse_wheel_zoom": False,
     "viewer_always_on_top": True

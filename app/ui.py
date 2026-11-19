@@ -557,6 +557,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             if self.current_sort_criteria != "name" or self.sort_reverse:
                 self.apply_sorting()
             else:
+                self.apply_sorting()
                 self._schedule_grid_repaint(relayout=True)
                 self.set_status(f"Ready — Total images in gallery: {total_count}")
 
@@ -1316,8 +1317,15 @@ class MainWindow(QMainWindow, WindowDragHandler):
             if hasattr(self.workspace_grid, 'update_cache_limit_from_settings'):
                 self.workspace_grid.update_cache_limit_from_settings()
             self.apply_concurrency_settings()
+
             # Trigger cleanup immediately if disk limit was adjusted
             self.thread_pool.start(CacheCleanupTask(self.thumb_cache_dir))
+
+            # Invalidate cached folder scans so child-folder / depth changes take effect
+            self.folder_scan_cache.clear()
+            if self.current_watched_dir and os.path.isdir(self.current_watched_dir):
+                self.load_images_from_folder(self.current_watched_dir)
+
         self.set_status("Ready")
 
     #  -----------about menu functions--------------
@@ -1340,28 +1348,45 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self._watcher_debounce_timer.start(300)
 
+
+    def _collect_disk_image_paths(self):
+        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
+        settings = load_settings(SETTINGS_FILE)
+        include_subfolders = settings.get("include_child_folders", False)
+        max_depth = max(1, int(settings.get("child_folder_depth", 1)))
+
+        disk_files = set()
+        if not include_subfolders:
+            for f in os.listdir(self.current_watched_dir):
+                full_path = os.path.abspath(os.path.join(self.current_watched_dir, f))
+                if os.path.isfile(full_path) and os.path.splitext(f)[1].lower() in valid_exts:
+                    disk_files.add(full_path)
+            return disk_files
+
+        base_depth = len(os.path.normpath(self.current_watched_dir).split(os.sep))
+        for root, dirs, files in os.walk(self.current_watched_dir, followlinks=False, onerror=lambda e: None):
+            current_depth = len(os.path.normpath(root).split(os.sep)) - base_depth
+            if current_depth >= max_depth:
+                dirs[:] = []
+
+            for f in files:
+                if os.path.splitext(f)[1].lower() in valid_exts:
+                    disk_files.add(os.path.abspath(os.path.join(root, f)))
+
+        return disk_files
+
     def _perform_smooth_folder_sync(self):
         """Smart sync that checks for new/external file changes without harsh UI resets."""
         if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
             return
 
-        # Quick directory file scan just to check diffs
-        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
         try:
-            current_disk_files = {
-                os.path.abspath(os.path.join(self.current_watched_dir, f))
-                for f in os.listdir(self.current_watched_dir)
-                if os.path.isfile(os.path.join(self.current_watched_dir, f))
-                   and os.path.splitext(f)[1].lower() in valid_exts
-            }
-
+            current_disk_files = self._collect_disk_image_paths()
             loaded_paths = {os.path.abspath(item["file_path"]) for item in self.loaded_items}
 
-            # If disk matches memory exactly, do nothing (prevents unnecessary layout reloads)
             if current_disk_files == loaded_paths:
                 return
 
-            # If files were only removed externally, prune them locally without a full scan
             if current_disk_files.issubset(loaded_paths):
                 removed = loaded_paths - current_disk_files
                 self.loaded_items = [
@@ -1377,6 +1402,30 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_images_from_folder(self.current_watched_dir)
         except Exception as e:
             print(f"Error during smooth folder sync: {e}")
+
+    def apply_sorting(self):
+        if not self.loaded_items:
+            return
+
+        criteria = self.current_sort_criteria
+        is_rev = self.sort_reverse
+
+        if criteria == "name":
+            self.loaded_items.sort(
+                key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", "")),
+                reverse=is_rev
+            )
+            self.set_status(f"Sorted by Name ({'Z-A' if is_rev else 'A-Z'})")
+        elif criteria == "date":
+            reverse_flag = not is_rev
+            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=reverse_flag)
+            self.set_status(f"Sorted by Date ({'Oldest first' if is_rev else 'Newest first'})")
+        elif criteria == "size":
+            reverse_flag = not is_rev
+            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=reverse_flag)
+            self.set_status(f"Sorted by Size ({'Smallest first' if is_rev else 'Largest first'})")
+
+        self.workspace_grid.set_cards(self.loaded_items)
 
     def mousePressEvent(self, event):
         self.handle_mouse_press(self, event)
