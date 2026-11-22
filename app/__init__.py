@@ -1,1 +1,3 @@
-__version__ = "0.3.14"
+"""WiggleView application package."""
+
+__version__ = "1.0.1"

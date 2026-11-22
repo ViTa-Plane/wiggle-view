@@ -1,13 +1,51 @@
 import os
-import hashlib
+import struct
 import tempfile
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from PIL.ExifTags import TAGS, GPSTAGS
 
-from PySide6.QtCore import Qt, QRunnable, Signal, QObject, QBuffer, QIODevice
-from PySide6.QtGui import QImage, QPainter, QImageReader
-from .encryption import encrypt_data, decrypt_data
-from .helpers import extract_image_metadata
+from PySide6.QtCore import QRunnable, Signal, QObject
+from PySide6.QtGui import QImage
+from .helpers import extract_image_metadata, load_settings
+from .sqlite_thumb_cache import ThumbnailSQLiteCache
+
+
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_COMFY_TEXT_KEYS = (b"workflow", b"prompt")
+
+
+def _png_has_comfy_metadata(file_path):
+    """Fast PNG chunk scan for ComfyUI 'workflow'/'prompt' text chunks; stops at IDAT."""
+    try:
+        with open(file_path, "rb") as f:
+            if f.read(8) != _PNG_SIGNATURE:
+                return False
+            while True:
+                header = f.read(8)
+                if len(header) < 8:
+                    return False
+                chunk_len, chunk_type = struct.unpack(">I4s", header)
+                if chunk_type == b"IDAT" or chunk_type == b"IEND":
+                    return False
+                if chunk_type in (b"tEXt", b"iTXt", b"zTXt"):
+                    if chunk_len <= 16 * 1024 * 1024:
+                        data = f.read(chunk_len)
+                        if len(data) < chunk_len:
+                            return False
+                        nul_idx = data.find(b"\x00")
+                        key = data[:nul_idx] if nul_idx != -1 else data
+                        if key in _COMFY_TEXT_KEYS:
+                            return True
+                    else:
+                        f.seek(chunk_len + 4, os.SEEK_CUR)
+                        continue
+                else:
+                    f.seek(chunk_len, os.SEEK_CUR)
+                # Skip 4-byte CRC
+                if len(f.read(4)) < 4:
+                    return False
+    except OSError:
+        return False
 
 
 class FolderScannerSignals(QObject):
@@ -26,7 +64,7 @@ class FolderScannerTask(QRunnable):
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
 
-    def _build_item_entry(self, file_path, filename, stat_result, thumb_cache_dir):
+    def _build_item_entry(self, file_path, filename, stat_result):
         display_name = (filename[:16] + '..') if len(filename) > 18 else filename
 
         if stat_result is not None:
@@ -36,33 +74,25 @@ class FolderScannerTask(QRunnable):
             file_size = 0
             file_mtime = 0
 
-        precomputed_thumb_path = None
-        try:
-            hash_input = f"{file_path}_{file_mtime}".encode('utf-8')
-            path_hash = hashlib.md5(hash_input).hexdigest()
-            candidate_thumb = os.path.join(thumb_cache_dir, f"thumb_{path_hash}_170.jpg")
-            if os.path.exists(candidate_thumb):
-                precomputed_thumb_path = candidate_thumb
-        except Exception:
-            pass
-
         return {
             "file_path": file_path,
             "display_name": display_name,
-            "thumb_path": precomputed_thumb_path,
+            "thumb_path": None,
             "size": file_size,
             "mtime": file_mtime,
             "filename": filename.lower(),
+            "dirname_lower": os.path.dirname(file_path).lower(),
             "has_comfy": False
         }
 
     def _flush_batch(self, batch, total_count):
-        if len(batch) >= 100 and not self._is_cancelled():
+        flush_threshold = 20 if total_count <= 20 else 100
+        if len(batch) >= flush_threshold and not self._is_cancelled():
             self.signals.batch_scanned.emit(self.scan_id, batch)
             return [], total_count
         return batch, total_count
 
-    def _scan_single_folder(self, valid_extensions, thumb_cache_dir):
+    def _scan_single_folder(self, valid_extensions):
         batch = []
         total_count = 0
 
@@ -82,13 +112,13 @@ class FolderScannerTask(QRunnable):
                 except Exception:
                     stat_result = None
 
-                batch.append(self._build_item_entry(entry.path, filename, stat_result, thumb_cache_dir))
+                batch.append(self._build_item_entry(entry.path, filename, stat_result))
                 total_count += 1
                 batch, total_count = self._flush_batch(batch, total_count)
 
         return batch, total_count
 
-    def _scan_with_subfolders(self, valid_extensions, thumb_cache_dir, max_depth=None):
+    def _scan_with_subfolders(self, valid_extensions, max_depth=None):
         batch = []
         total_count = 0
         base_depth = len(os.path.normpath(self.folder_path).split(os.sep))
@@ -113,7 +143,7 @@ class FolderScannerTask(QRunnable):
                 except Exception:
                     stat_result = None
 
-                batch.append(self._build_item_entry(full_path, filename, stat_result, thumb_cache_dir))
+                batch.append(self._build_item_entry(full_path, filename, stat_result))
                 total_count += 1
                 batch, total_count = self._flush_batch(batch, total_count)
 
@@ -121,12 +151,9 @@ class FolderScannerTask(QRunnable):
 
     def run(self):
         valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
-
-        from .helpers import load_settings
         settings = load_settings()
-        include_subfolders = settings.get("include_child_folders", False)
-        folder_depth = max(1, int(settings.get("child_folder_depth", 1)))
+        include_subfolders = settings.get("include_subfolders", False)
+        folder_depth = max(1, int(settings.get("subfolder_depth", 1)))
 
         try:
             if not os.path.isdir(self.folder_path) or self._is_cancelled():
@@ -134,10 +161,10 @@ class FolderScannerTask(QRunnable):
 
             if include_subfolders:
                 batch, total_count = self._scan_with_subfolders(
-                    valid_extensions, thumb_cache_dir, max_depth=folder_depth
+                    valid_extensions, max_depth=folder_depth
                 )
             else:
-                batch, total_count = self._scan_single_folder(valid_extensions, thumb_cache_dir)
+                batch, total_count = self._scan_single_folder(valid_extensions)
 
             if self._is_cancelled():
                 return
@@ -155,10 +182,20 @@ class ThumbnailSignalEmitter(QObject):
 
 
 class ThumbnailLoaderTask(QRunnable):
-    """Generates or decrypts cached thumbnails off the GUI thread using thread-safe QImage."""
+    """Generates or loads cached thumbnails off the GUI thread using thread-safe QImage."""
 
-    def __init__(self, file_path, cache_dir, target_size, signals, scan_id=0, active_scan_getter=None,
-                 existing_thumb_path=None):
+    def __init__(
+        self,
+        file_path,
+        cache_dir,
+        target_size,
+        signals,
+        scan_id=0,
+        active_scan_getter=None,
+        existing_thumb_path=None,
+        jpeg_quality=None,
+        persist_to_db=True,
+    ):
         super().__init__()
         self.file_path = file_path
         self.cache_dir = cache_dir
@@ -167,6 +204,8 @@ class ThumbnailLoaderTask(QRunnable):
         self.scan_id = scan_id
         self.active_scan_getter = active_scan_getter
         self.existing_thumb_path = existing_thumb_path
+        self.jpeg_quality = jpeg_quality
+        self.persist_to_db = bool(persist_to_db)
 
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
@@ -176,74 +215,26 @@ class ThumbnailLoaderTask(QRunnable):
             return
 
         try:
-            # Load dynamic settings for encryption and JPEG quality
-            from .helpers import load_settings
-            settings = load_settings()
-            encrypt_enabled = settings.get("encrypt_thumbnail_cache", True)
-            jpeg_quality = settings.get("thumbnail_jpeg_quality", 88)
-
-            thumb_path = self.existing_thumb_path
-            if not thumb_path:
+            if self.jpeg_quality is None:
+                settings = load_settings()
+                raw_q = settings.get("thumbnail_jpeg_quality", 88)
                 try:
-                    mtime = os.path.getmtime(self.file_path)
-                except Exception:
-                    mtime = 0
+                    jpeg_quality = max(1, min(100, int(raw_q)))
+                except (TypeError, ValueError):
+                    jpeg_quality = 88
+            else:
+                jpeg_quality = max(1, min(100, int(self.jpeg_quality)))
 
-                hash_input = f"{self.file_path}_{mtime}".encode('utf-8')
-                path_hash = hashlib.md5(hash_input).hexdigest()
-                thumb_filename = f"thumb_{path_hash}_{self.target_size}.jpg"
-                thumb_path = os.path.join(self.cache_dir, thumb_filename)
-
-            # Fast path: Decrypt and decode already-cached thumbnail off the GUI thread
-            if os.path.exists(thumb_path):
-                with open(thumb_path, "rb") as f_in:
-                    file_bytes = f_in.read()
-
-                data_bytes = decrypt_data(file_bytes) if encrypt_enabled else file_bytes
-                img = QImage()
-                if img.loadFromData(data_bytes, "JPG") and not self._is_cancelled():
-                    self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, thumb_path, img)
-                    return
-
-            if self._is_cancelled():
-                return
-
-            # Slow path: Read source image, scale via QImageReader, compose on QImage, encrypt & save
-            reader = QImageReader(self.file_path)
-            reader.setAutoTransform(True)
-
-            orig_size = reader.size()
-            if orig_size.isValid():
-                reader.setScaledSize(
-                    orig_size.scaled(self.target_size, self.target_size, Qt.AspectRatioMode.KeepAspectRatio)
-                )
-
-            image = reader.read()
-            if not image.isNull() and not self._is_cancelled():
-                canvas = QImage(self.target_size, self.target_size, QImage.Format.Format_ARGB32_Premultiplied)
-                canvas.fill(Qt.GlobalColor.transparent)
-
-                painter = QPainter(canvas)
-                painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-                x = (self.target_size - image.width()) // 2
-                y = (self.target_size - image.height()) // 2
-                painter.drawImage(x, y, image)
-                painter.end()
-
-                buffer = QBuffer()
-                buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-                # Apply dynamic thumbnail JPEG quality from settings
-                canvas.save(buffer, "JPG", jpeg_quality)
-                raw_bytes = bytes(buffer.data())
-
-                # Only save to disk cache if disk caching is NOT disabled
-                if settings.get("disk_cache_limit_mb", "1 GB") != "Disabled":
-                    output_bytes = encrypt_data(raw_bytes) if encrypt_enabled else raw_bytes
-                    with open(thumb_path, "wb") as f_out:
-                        f_out.write(output_bytes)
-
-                if not self._is_cancelled():
-                    self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, thumb_path, canvas)
+            cache_dir = self.cache_dir or os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
+            db_cache = ThumbnailSQLiteCache.get_shared(cache_dir)
+            qimg, virtual_path = db_cache.generate_and_cache_qimage(
+                self.file_path,
+                target_size=self.target_size,
+                jpeg_quality=jpeg_quality,
+                persist_to_db=self.persist_to_db,
+            )
+            if not self._is_cancelled() and qimg is not None and not qimg.isNull():
+                self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, virtual_path or "", qimg)
         except Exception:
             pass
 
@@ -269,6 +260,7 @@ class BatchConvertWorker(QRunnable):
         target_ext = self.target_format.lower()
         if target_ext == "jpg":
             target_ext = "jpeg"
+        save_format = "JPEG" if target_ext == "jpeg" else self.target_format.upper()
 
         for path in self.paths:
             try:
@@ -291,24 +283,19 @@ class BatchConvertWorker(QRunnable):
                     else:
                         img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
 
-                    save_format = "JPEG" if target_ext == "jpeg" else self.target_format.upper()
-
+                    save_kwargs = {}
                     if target_ext in ["jpeg", "jpg", "webp"]:
-                        img_to_save.save(new_path, save_format, quality=self.quality)
-                    else:
-                        img_to_save.save(new_path, save_format)
+                        save_kwargs["quality"] = self.quality
 
-                if self.transfer_exif and exif_dict:
-                    with Image.open(new_path) as target:
-                        if target_ext in ["png"]:
-                            from PIL import PngImagePlugin
+                    if self.transfer_exif and exif_dict:
+                        if target_ext == "png":
                             meta = PngImagePlugin.PngInfo()
                             for k, v in exif_dict.items():
                                 meta.add_text(str(k), str(v))
-                            target.save(new_path, pnginfo=meta)
+                            save_kwargs["pnginfo"] = meta
                         else:
                             try:
-                                exif_obj = target.getexif()
+                                exif_obj = img_to_save.getexif()
                                 if exif_obj is None:
                                     exif_obj = Image.Exif()
                                 for k, v in exif_dict.items():
@@ -318,10 +305,15 @@ class BatchConvertWorker(QRunnable):
                                             exif_obj[tag_id] = v
                                         except Exception:
                                             pass
-                                target.save(new_path, exif=exif_obj.tobytes(),
-                                            quality=self.quality if target_ext in ["jpeg", "jpg", "webp"] else None)
+                                save_kwargs["exif"] = exif_obj.tobytes()
                             except Exception:
-                                target.save(new_path)
+                                pass
+
+                    try:
+                        img_to_save.save(new_path, save_format, **save_kwargs)
+                    except Exception:
+                        fallback_kwargs = {"quality": self.quality} if target_ext in ["jpeg", "jpg", "webp"] else {}
+                        img_to_save.save(new_path, save_format, **fallback_kwargs)
 
                 if self.remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
                     os.remove(path)
@@ -337,9 +329,9 @@ class BatchConvertWorker(QRunnable):
             msg += f" ({failed_count} failed)."
         self.signals.finished.emit(success_count, failed_count, msg)
 
-'''Create a lightweight worker that checks PNG files for ComfyUI workflows 
-in the background after the grid has already rendered:'''
+
 class ComfyMetadataScannerSignals(QObject):
+    """Lightweight worker signals for scanning PNG files for embedded ComfyUI workflows."""
     comfy_batch_ready = Signal(int, list)  # scan_id, list of file_paths with ComfyUI metadata
 
 
@@ -370,7 +362,6 @@ class ComfyMetadataScannerTask(QRunnable):
                 except Exception:
                     pass
 
-                # Batch updates in chunks of 50 to prevent signal storms on 3000+ image galleries
                 if len(batch) >= 50:
                     self.signals.comfy_batch_ready.emit(self.scan_id, batch)
                     batch = []
@@ -380,7 +371,7 @@ class ComfyMetadataScannerTask(QRunnable):
 
 
 class CacheCleanupTask(QRunnable):
-    """Background task to prune thumbnail cache files when they exceed the disk limit."""
+    """Background task to enforce SQLite thumbnail cache limits and purge legacy loose files."""
 
     def __init__(self, cache_dir):
         super().__init__()
@@ -388,32 +379,23 @@ class CacheCleanupTask(QRunnable):
 
     def run(self):
         try:
-            from .helpers import load_settings
             settings = load_settings()
             limit_str = settings.get("disk_cache_limit_mb", "1 GB")
 
             if not os.path.exists(self.cache_dir):
                 return
 
-            # --- Handle Disabled state: Purge all disk cache files ---
+            db_cache = ThumbnailSQLiteCache.get_shared(self.cache_dir)
+            db_cache.purge_loose_jpeg_files()
+
             if limit_str == "Disabled":
-                purged_count = 0
-                with os.scandir(self.cache_dir) as entries:
-                    for entry in entries:
-                        if entry.is_file():
-                            try:
-                                os.remove(entry.path)
-                                purged_count += 1
-                            except Exception:
-                                pass
-                if purged_count > 0:
-                    print(f"Disk cache disabled: Purged {purged_count} cached thumbnail file(s) from disk.")
+                db_cache.clear_all()
+                print("Disk cache disabled: Cleared SQLite thumbnail cache.")
                 return
-            # ---------------------------------------------------------
 
             if not limit_str or "Unlimited" in limit_str:
+                db_cache.flush()
                 return
-
 
             limit_bytes = 1024 * 1024 * 1024  # Default 1 GB
             parts = limit_str.strip().split()
@@ -425,38 +407,16 @@ class CacheCleanupTask(QRunnable):
                 elif "MB" in unit:
                     limit_bytes = int(val * 1024 * 1024)
 
-            if not os.path.exists(self.cache_dir):
-                return
+            db_cache.enforce_limit_bytes(limit_bytes)
 
-            file_entries = []
-            total_size = 0
-            with os.scandir(self.cache_dir) as entries:
-                for entry in entries:
-                    if entry.is_file():
-                        stat = entry.stat()
-                        file_entries.append((entry.path, stat.st_size, stat.st_mtime))
-                        total_size += stat.st_size
-
+            db_cache.flush()
+            db_cache.enforce_limit_bytes(limit_bytes)
+            total_size = db_cache.total_size_bytes()
             if total_size <= limit_bytes:
-                print(f"CacheCleanupTask (disk cache size):{limit_bytes/ (1024 * 1024):.2f} mb / {total_size / (1024 * 1024):.2f} mb")
+                print(
+                    f"CacheCleanupTask (disk cache size):{total_size / (1024 * 1024):.1f} mb / {limit_bytes / (1024 * 1024):.1f} mb "
+                )
                 return
 
-            # Sort by modification time ascending (oldest files first)
-            file_entries.sort(key=lambda x: x[2])
-
-            removed_count = 0
-            for path, size, mtime in file_entries:
-                if total_size <= limit_bytes:
-                    break
-                try:
-                    os.remove(path)
-                    total_size -= size
-                    removed_count += 1
-                except Exception:
-                    pass
-
-            # Log the cleanup results to the terminal console
-            if removed_count > 0:
-                print(f"Cache cleanup: Successfully removed {removed_count} old cached thumbnail file(s) to respect the disk limit.")
         except Exception as e:
             print(f"Cache cleanup error: {e}")

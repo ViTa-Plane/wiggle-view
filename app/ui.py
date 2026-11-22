@@ -1,61 +1,123 @@
 import os
+import platform
+import re
 import shutil
+import subprocess
 import tempfile
-import uuid
 from collections import OrderedDict
 from PIL import Image
-from PIL.ExifTags import TAGS
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter, QDialog, QMenu,
-    QMessageBox, QTextEdit
+    QLabel, QFrame, QGraphicsDropShadowEffect, QFileDialog, QScrollArea, QSplitter, QDialog,
+    QTextEdit
 )
-from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject, QFileSystemWatcher, QMimeData, QUrl
-from PySide6.QtGui import QColor, QImageReader, QGuiApplication, QImage, QShortcut, QKeySequence
+from PySide6.QtCore import Qt, QThreadPool, QTimer, QRunnable, Signal, QObject, QFileSystemWatcher
+from PySide6.QtGui import QColor, QImageReader, QGuiApplication, QShortcut, QKeySequence
 
 from .img_viewer import ImageViewerWindow, DetachedImageViewerWindow
-from .dialogs import AboutDialog, SettingsDialog, BatchCompleteDialog, BatchConvertDialog
+from .dialogs import AboutDialog, SettingsDialog
 from .workers import (
-    ThumbnailLoaderTask, ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask,
-    BatchConvertWorker, BatchConvertWorkerSignals, ComfyMetadataScannerSignals, ComfyMetadataScannerTask,
-    CacheCleanupTask
+    ThumbnailSignalEmitter, FolderScannerSignals, FolderScannerTask,
+    ComfyMetadataScannerSignals, ComfyMetadataScannerTask, CacheCleanupTask
 )
 from .widgets import WindowDragHandler, TitleBar, ResponsiveGridWidget, ResizeHandleWidget
 from .components import SidebarPanel, DirectoryBrowserPanel, TopMenuBar
 from .helpers import (
     load_settings, save_settings, format_file_size, extract_exif_metadata,
-    add_folder_to_favorites, extract_image_metadata
+    add_folder_to_favorites
 )
+from .file_ops import FileOperationsController
+from .batch_tools import BatchToolsController
+from .folder_sync import FolderSyncController
+
+try:
+    from .sqlite_thumb_cache import ThumbnailSQLiteCache
+except ImportError:
+    from sqlite_thumb_cache import ThumbnailSQLiteCache
 
 SETTINGS_FILE = "settings.json"
 
+try:
+    from .crash_reporter import install_crash_reporter
+except ImportError:
+    from crash_reporter import install_crash_reporter
+
+_CRASH_REPORTER = install_crash_reporter(app_name="WiggleView")
+
 
 class MetadataWorkerSignals(QObject):
-    metadata_ready = Signal(str, str, str, str, str)  # file_path, filename, dims_str, exif_text, comfy_text
+    metadata_ready = Signal(str, str, str, str, str)
+
+
+class _SqliteThumbnailTask(QRunnable):
+    """Generates or loads thumbnails strictly inside the SQLite BLOB database."""
+
+    def __init__(self, source_path, db_cache, target_size, jpeg_quality, signals, scan_id, active_scan_getter, is_closing_getter=None):
+        super().__init__()
+        self.source_path = source_path
+        self.db_cache = db_cache
+        self.target_size = target_size
+        self.jpeg_quality = jpeg_quality
+        self.signals = signals
+        self.scan_id = scan_id
+        self.active_scan_getter = active_scan_getter
+        self.is_closing_getter = is_closing_getter
+
+    def _is_stale(self):
+        if callable(self.is_closing_getter) and self.is_closing_getter():
+            return True
+        return callable(self.active_scan_getter) and self.scan_id != self.active_scan_getter()
+
+    def run(self):
+        if self._is_stale():
+            return
+        if self.db_cache is None or not os.path.exists(self.source_path):
+            return
+        qimg, virtual_path = self.db_cache.generate_and_cache_qimage(
+            self.source_path,
+            target_size=self.target_size,
+            jpeg_quality=self.jpeg_quality
+        )
+        if self._is_stale():
+            return
+        if qimg is not None and not qimg.isNull():
+            try:
+                self.signals.thumbnail_ready.emit(self.scan_id, self.source_path, virtual_path, qimg)
+            except RuntimeError:
+                pass
 
 
 class MetadataLoaderTask(QRunnable):
-    """Background worker task to load QImage dimensions, EXIF, and ComfyUI metadata off the main GUI thread."""
+    """Background worker task to load QImage dimensions, EXIF, and ComfyUI metadata off the GUI thread."""
 
-    def __init__(self, file_path, filename, size_str, signals):
+    def __init__(self, file_path, filename, size_str, signals, is_closing_getter=None):
         super().__init__()
         self.file_path = file_path
         self.filename = filename
         self.size_str = size_str
         self.signals = signals
+        self.is_closing_getter = is_closing_getter
+
+    def _is_closing(self):
+        return callable(self.is_closing_getter) and self.is_closing_getter()
 
     def run(self):
+        if self._is_closing():
+            return
         dims_str = "Unknown dims"
         if os.path.exists(self.file_path):
             reader = QImageReader(self.file_path)
             img_size = reader.size()
             if img_size.isValid():
-                dims_str = f"{img_size.width()} × {img_size.height()} px"
+                dims_str = f"{img_size.width()} \u00d7 {img_size.height()} px"
 
+        if self._is_closing():
+            return
         exif_text = extract_exif_metadata(self.file_path)
 
-        # Check for ComfyUI workflow/prompt in PNG metadata
+        if self._is_closing():
+            return
         comfy_text = ""
         if self.file_path.lower().endswith(".png"):
             try:
@@ -74,13 +136,19 @@ class MetadataLoaderTask(QRunnable):
             except Exception as e:
                 print(f"Error scanning ComfyUI metadata: {e}")
 
-        self.signals.metadata_ready.emit(self.file_path, self.filename, dims_str, exif_text, comfy_text)
+        if self._is_closing():
+            return
+        try:
+            self.signals.metadata_ready.emit(self.file_path, self.filename, dims_str, exif_text, comfy_text)
+        except RuntimeError:
+            pass
 
 
 class MainWindow(QMainWindow, WindowDragHandler):
     def __init__(self, initial_image_path=None):
         super().__init__(parent=None)
         WindowDragHandler.__init__(self)
+        self._is_closing = False
         self.resize(1420, 860)
         self.setMinimumSize(750, 500)
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint)
@@ -91,8 +159,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.GRID_CELL_HEIGHT = 220
 
         self.apply_concurrency_settings()
-
         self.thread_pool = QThreadPool.globalInstance()
+
+        self.file_ops = FileOperationsController(self, SETTINGS_FILE)
+        self.batch_tools = BatchToolsController(self)
+        self.folder_sync = FolderSyncController(self, SETTINGS_FILE)
 
         self.thumbnail_signals = ThumbnailSignalEmitter()
         self.thumbnail_signals.thumbnail_ready.connect(self.on_thumbnail_ready)
@@ -101,73 +172,61 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.scanner_signals.batch_scanned.connect(self.on_batch_scanned)
         self.scanner_signals.scan_complete.connect(self.on_scan_complete)
 
-        # Background metadata loading signals
         self.meta_signals = MetadataWorkerSignals()
         self.meta_signals.metadata_ready.connect(self.on_metadata_ready)
 
-        # thumbnail directory
         self.thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
         os.makedirs(self.thumb_cache_dir, exist_ok=True)
+        self.thumb_db_cache = ThumbnailSQLiteCache.get_shared(self.thumb_cache_dir)
 
-        # --- Trigger initial background cache cleanup on startup ---
-        from .workers import CacheCleanupTask
+        if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
+            self.thumb_db_cache.purge_loose_jpeg_files()
         self.thread_pool.start(CacheCleanupTask(self.thumb_cache_dir))
-        # -----------------------------------------------------------
 
         self.loaded_items = []
-        self.items_by_path = {}  # O(1) lookup map: file_path -> item_dict
-        self.pending_thumbnail_files = []
-        self.scan_id = 0  # Track active scan generation
-        self._current_scan_count = 0
-        self._total_thumbs_to_generate = 0
-        self._thumbs_ready_count = 0
+        self.items_by_path = {}
+        self.scan_id = 0
+        self.total_thumbs_to_generate = 0
+        self.thumbs_ready_count = 0
 
-        # Undo / Redo history stacks and reversible delete staging directory
-        self._undo_stack = []
-        self._redo_stack = []
-        self._undo_trash_dir = os.path.join(tempfile.gettempdir(), "wiggleview_undo_trash")
-        os.makedirs(self._undo_trash_dir, exist_ok=True)
+        self.undo_trash_dir = os.path.join(tempfile.gettempdir(), "wiggleview_undo_trash")
+        os.makedirs(self.undo_trash_dir, exist_ok=True)
 
-        # Coalesced grid repaint timer (prevents thousands of redundant repaints)
-        self._grid_repaint_timer = QTimer(self)
-        self._grid_repaint_timer.setSingleShot(True)
-        self._grid_repaint_timer.setInterval(50)
-        self._grid_repaint_timer.timeout.connect(self._flush_grid_repaint)
-        self._needs_layout_update = False
+        self.grid_repaint_timer = QTimer(self)
+        self.grid_repaint_timer.setSingleShot(True)
+        self.grid_repaint_timer.setInterval(100)
+        self.grid_repaint_timer.timeout.connect(self._flush_grid_repaint)
+        self.needs_layout_update = False
 
-        # Sorting state tracking
         self.current_sort_criteria = "name"
         self.sort_reverse = False
 
-        # Initialize the File System Watcher
         self.file_watcher = QFileSystemWatcher(self)
-        self.file_watcher.directoryChanged.connect(self._on_directory_changed)
+        self.file_watcher.directoryChanged.connect(self.folder_sync.on_directory_changed)
         self.current_watched_dir = None
 
-        '''Trigger the lazy ComfyUI scanner once the scan completes so badges 
-        fade/pop in smoothly without slowing down the initial grid population:'''
-
-        # Replace comfy_status_ready with comfy_batch_ready
         self.comfy_signals = ComfyMetadataScannerSignals()
         self.comfy_signals.comfy_batch_ready.connect(self.on_comfy_batch_ready)
 
-        '''folder-state dictionary cache'''
         self.folder_scan_cache = OrderedDict()
-        self._MAX_FOLDER_CACHE = 10  # Remembers the last 10 scanned directories instantly
+        self._persistent_child_scan_status = None
+        self._MAX_FOLDER_CACHE = 10
+        self._MAX_WATCHED_DIRS = 256
+        self._MAX_CHILD_SCAN_THUMB_TASKS = 512
 
-        self.startup_setings_print()
+        save_settings(SETTINGS_FILE, {"include_subfolders": False})
+
+        self._refresh_cached_jpeg_quality()
+        self.startup_settings_print()
 
         self._setup_ui()
 
-        # Handle direct argument launch vs normal last-folder boot
         if initial_image_path and os.path.exists(initial_image_path):
             abs_path = os.path.abspath(initial_image_path)
             if os.path.isdir(abs_path):
-                # Case 1: Argument is a folder path -> open the folder directly in gallery
                 folder_dir = abs_path
                 self.initial_target_image = None
             else:
-                # Case 2: Argument is an image file -> open its parent folder and select/view the image
                 folder_dir = os.path.dirname(abs_path)
                 self.initial_target_image = abs_path
 
@@ -181,24 +240,88 @@ class MainWindow(QMainWindow, WindowDragHandler):
         else:
             self.load_last_folder()
 
-    def _get_active_scan_id(self):
+        self.crash_log_path = getattr(_CRASH_REPORTER, "log_path", None)
+        if self.crash_log_path:
+            print(f"Crash report log: {self.crash_log_path}")
+        QTimer.singleShot(120, self.center_current_folder_in_tree)
+
+    def _is_shutting_down(self):
+        return bool(self._is_closing)
+
+    def _refresh_cached_jpeg_quality(self):
+        settings = load_settings(SETTINGS_FILE)
+        quality = settings.get("thumbnail_jpeg_quality", 90)
+        try:
+            quality = int(quality)
+        except (TypeError, ValueError):
+            quality = 90
+        self._cached_jpeg_quality = max(1, min(100, quality))
+
+    def start_thumbnail_task(self, file_path, scan_id):
+        if self._is_closing:
+            return
+        if hasattr(self, "workspace_grid") and hasattr(self.workspace_grid, "mark_thumbnail_in_flight"):
+            self.workspace_grid.mark_thumbnail_in_flight(file_path)
+        quality = getattr(self, "_cached_jpeg_quality", 90)
+        task = _SqliteThumbnailTask(
+            file_path,
+            getattr(self, "thumb_db_cache", None),
+            self.CARD_IMAGE_SIZE,
+            quality,
+            self.thumbnail_signals,
+            scan_id=scan_id,
+            active_scan_getter=self.get_active_scan_id,
+            is_closing_getter=self._is_shutting_down,
+        )
+        self.thread_pool.start(task)
+
+    def get_active_scan_id(self):
+        if self._is_closing:
+            return -1
         return self.scan_id
 
     def _schedule_grid_repaint(self, relayout=False):
+        if self._is_closing:
+            return
         if relayout:
-            self._needs_layout_update = True
-        if not self._grid_repaint_timer.isActive():
-            self._grid_repaint_timer.start()
+            self.needs_layout_update = True
+        if not self.grid_repaint_timer.isActive():
+            self.grid_repaint_timer.start()
 
     def _flush_grid_repaint(self):
-        if self._needs_layout_update:
-            self._needs_layout_update = False
+        if self._is_closing:
+            return
+        if self.needs_layout_update:
+            self.needs_layout_update = False
+            self.sort_loaded_items_quietly()
             self.workspace_grid.set_cards(self.loaded_items)
         else:
             self.workspace_grid.update()
 
-    def _rebuild_path_index(self):
+    def rebuild_path_index(self):
         self.items_by_path = {item["file_path"]: item for item in self.loaded_items}
+
+    @staticmethod
+    def _natural_name_key(name_str):
+        """Splits digits and text so 'img_2' sorts before 'img_10' consistently."""
+        s = (name_str or "").lower()
+        return tuple(int(tok) if tok.isdigit() else tok for tok in re.split(r"(\d+)", s))
+
+    def _item_name_sort_key(self, item):
+        """Deterministic name sort key independent of stale cached path fields."""
+        fp = os.path.abspath(item.get("file_path", "")) if item.get("file_path") else ""
+        parent_dir = os.path.dirname(fp).lower() if fp else ""
+        raw_name = item.get("filename") or os.path.basename(fp).lower() or item.get("display_name", "").lower()
+        return (parent_dir, self._natural_name_key(raw_name), raw_name, fp.lower())
+
+    def _sync_sort_state_from_settings(self):
+        """Ensures active sort criteria/reverse stay synchronized with persisted settings."""
+        settings_data = load_settings(SETTINGS_FILE)
+        criteria = settings_data.get("sort_criteria")
+        if isinstance(criteria, str) and criteria.strip():
+            self.current_sort_criteria = criteria.strip().lower()
+        if "sort_reverse" in settings_data:
+            self.sort_reverse = bool(settings_data["sort_reverse"])
 
     def _setup_ui(self):
         central_widget = QWidget(self)
@@ -246,20 +369,46 @@ class MainWindow(QMainWindow, WindowDragHandler):
             QScrollBar::handle:horizontal:hover { background: #334155; }
             QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0px; background: none; }
             QScrollBar::add-page:horizontal, QScrollBar::sub-page:horizontal { background: none; }
+
+            QMenu {
+                background-color: #0d1321;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+                color: #e2e8f0;
+                background-color: transparent;
+            }
+            QMenu::item:selected {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+            QMenu::item:disabled {
+                color: #64748b;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #1e293b;
+                margin: 4px 0px;
+            }
         """)
 
-        # --- Load favorites from settings ---
         settings_data = load_settings(SETTINGS_FILE)
         favorites_list = settings_data.get("favorites", [])
-        self.current_sort_criteria = settings_data.get("sort_criteria", "name")
-        self.sort_reverse = settings_data.get("sort_reverse", False)
+        max_favorites = settings_data.get("max_favorites", 15)
+        self.current_sort_criteria = str(settings_data.get("sort_criteria", "name")).lower()
+        self.sort_reverse = bool(settings_data.get("sort_reverse", False))
 
-        # --- Top Menu Panel ---
         self.menu_bar = TopMenuBar(
             self,
             favorites=favorites_list,
             sort_criteria=self.current_sort_criteria,
-            sort_reverse=self.sort_reverse
+            sort_reverse=self.sort_reverse,
+            max_favorites=max_favorites,
         )
 
         self.menu_bar.open_folder_requested.connect(self.open_folder_dialog)
@@ -272,20 +421,18 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.about_requested.connect(self.show_about_dialog)
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.add_favorite_requested.connect(self.add_current_folder_to_favorites)
-        self.menu_bar.convert_requested.connect(self.batch_convert_images)
-        self.menu_bar.purge_exif_requested.connect(self.batch_purge_exif)
-        self.menu_bar.inject_exif_requested.connect(self.batch_inject_exif)
-        self.menu_bar.export_exif_requested.connect(self.batch_export_exif)
-        self.menu_bar.export_comfy_workflow_requested.connect(self.batch_export_comfy_workflow)
+        self.menu_bar.convert_requested.connect(self.batch_tools.batch_convert_images)
+        self.menu_bar.purge_exif_requested.connect(self.batch_tools.batch_purge_exif)
+        self.menu_bar.inject_exif_requested.connect(self.batch_tools.batch_inject_exif)
+        self.menu_bar.export_exif_requested.connect(self.batch_tools.batch_export_exif)
+        self.menu_bar.export_comfy_workflow_requested.connect(self.batch_tools.batch_export_comfy_workflow)
         self.menu_bar.settings_requested.connect(self.open_settings_dialog)
 
         container_layout.addWidget(self.menu_bar)
 
-        # --- Body Layout with Splitter ---
         body_split_layout = QHBoxLayout()
         body_split_layout.setSpacing(12)
 
-        # Create a horizontal splitter for the main workspace area
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
         main_splitter.setStyleSheet("""
             QSplitter::handle {
@@ -298,22 +445,19 @@ class MainWindow(QMainWindow, WindowDragHandler):
             }
         """)
 
-        # --- Left Directory Browser Panel ---
         self.left_browser = DirectoryBrowserPanel(self)
         self.left_browser.folder_selected.connect(self.load_images_from_folder)
-        self.left_browser.files_dropped_on_folder.connect(self.move_files_to_folder)
+        self.left_browser.files_dropped_on_folder.connect(self.file_ops.move_files_to_folder)
         self.left_browser.btn_browse.clicked.connect(self.open_current_folder_in_explorer)
 
         main_splitter.addWidget(self.left_browser)
 
-        # Center Grid Workspace
         center_container = QWidget(self)
         center_container.setStyleSheet("background: transparent;")
         center_layout = QVBoxLayout(center_container)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(10)
 
-        # Replace instruction_label with path_label
         self.path_label = QLabel("...")
         self.path_label.setStyleSheet(
             "color: #f8fafc; font-family: sans-serif; font-size: 13px; background: transparent;"
@@ -322,7 +466,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.verticalScrollBar().setSingleStep(15)
+        self._apply_scroll_speed_setting()
         self.scroll_area.setStyleSheet("""
             QScrollArea {
                 background-color: #0b0f19; border: 1px solid #1e293b; border-radius: 8px;
@@ -335,9 +479,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             image_size=self.CARD_IMAGE_SIZE
         )
 
-        # Configure Grid Context Menu & Focus Policy
         self.workspace_grid.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.workspace_grid.customContextMenuRequested.connect(self.show_grid_context_menu)
+        self.workspace_grid.customContextMenuRequested.connect(self.file_ops.show_grid_context_menu)
         self.workspace_grid.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.workspace_grid.item_selected.connect(self.on_card_selected)
@@ -346,18 +489,20 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.scroll_area.setWidget(self.workspace_grid)
 
         center_layout.addWidget(self.scroll_area, stretch=1)
-
-        # Add center container to splitter
         main_splitter.addWidget(center_container)
 
-        # Set initial sizes for the splitter panels (e.g., 220px width for directories, remainder for grid)
         main_splitter.setSizes([220, 900])
+        self.main_splitter = main_splitter
+        self.main_splitter.splitterMoved.connect(lambda _pos, _idx: self._schedule_keep_selected_in_view())
+
+        self._keep_selected_timer = QTimer(self)
+        self._keep_selected_timer.setSingleShot(True)
+        self._keep_selected_timer.setInterval(100)
+        self._keep_selected_timer.timeout.connect(self._keep_selected_thumbnail_in_view)
 
         body_split_layout.addWidget(main_splitter, stretch=1)
 
-        # --- Right Panel (Includes ComfyUI Metadata Tab) ---
         self.right_sidebar = SidebarPanel(self)
-        # Check and add ComfyUI tab dynamically if sidebar supports tab widgets
         if hasattr(self.right_sidebar, 'tab_widget') and not hasattr(self.right_sidebar, 'comfy_view'):
             self.right_sidebar.comfy_view = QTextEdit()
             self.right_sidebar.comfy_view.setReadOnly(True)
@@ -376,7 +521,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         body_split_layout.addWidget(self.right_sidebar)
         container_layout.addLayout(body_split_layout)
 
-        # Footer Status bar
         footer_layout = QHBoxLayout()
         footer_layout.setContentsMargins(0, 0, 0, 0)
 
@@ -394,12 +538,37 @@ class MainWindow(QMainWindow, WindowDragHandler):
         main_layout.addWidget(self.container)
         self.setCentralWidget(central_widget)
 
-        # Global Undo / Redo shortcuts (Ctrl+Z and Ctrl+Shift+Z)
         self.undo_shortcut = QShortcut(QKeySequence("Ctrl+Z"), self)
-        self.undo_shortcut.activated.connect(self.undo_file_operation)
+        self.undo_shortcut.activated.connect(self.file_ops.undo)
 
         self.redo_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
-        self.redo_shortcut.activated.connect(self.redo_file_operation)
+        self.redo_shortcut.activated.connect(self.file_ops.redo)
+
+        self.center_folder_shortcut = QShortcut(QKeySequence("U"), self)
+        self.center_folder_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.center_folder_shortcut.activated.connect(self.center_current_folder_in_tree)
+
+        self.scroll_to_selected_shortcut = QShortcut(QKeySequence("Y"), self)
+        self.scroll_to_selected_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.scroll_to_selected_shortcut.activated.connect(self.scroll_to_selected_thumbnail_in_grid)
+
+        self.toggle_child_scan_shortcut = QShortcut(QKeySequence("F"), self)
+        self.toggle_child_scan_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self.toggle_child_scan_shortcut.activated.connect(self.folder_sync.toggle_subfolder_scan)
+
+        self.open_viewer_space_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self)
+        self.open_viewer_space_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.open_viewer_space_shortcut.activated.connect(self.open_selected_or_first_image_in_viewer)
+
+    def _apply_scroll_speed_setting(self):
+        settings = load_settings(SETTINGS_FILE)
+        try:
+            scroll_speed = int(settings.get("scroll_speed", 15))
+        except (TypeError, ValueError):
+            scroll_speed = 15
+        scroll_speed = max(1, min(29, scroll_speed))
+        if hasattr(self, "scroll_area") and self.scroll_area is not None:
+            self.scroll_area.verticalScrollBar().setSingleStep(scroll_speed)
 
     def apply_concurrency_settings(self):
         settings = load_settings(SETTINGS_FILE)
@@ -416,35 +585,64 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         QThreadPool.globalInstance().setMaxThreadCount(max_threads)
 
-    def startup_setings_print(self):
-        from .helpers import load_settings
+    def startup_settings_print(self):
         settings = load_settings()
         print(f"thumbnail_jpeg_quality: {settings.get('thumbnail_jpeg_quality', None)}")
         print(f"encrypt_thumbnail_cache: {settings.get('encrypt_thumbnail_cache', None)}")
+
+    def _center_folder_in_tree_for_path(self, folder_path):
+        if self._is_closing or not folder_path or not os.path.isdir(folder_path):
+            return
+        if hasattr(self, "left_browser") and self.left_browser and hasattr(self.left_browser, "scroll_to_selected_folder"):
+            self.left_browser.scroll_to_selected_folder(
+                folder_path=os.path.abspath(folder_path),
+                only_if_out_of_view=False,
+                center_in_view=True
+            )
 
     def load_last_folder(self):
         data = load_settings(SETTINGS_FILE)
         folder = data.get("last_folder", "")
 
-        # Default to Pictures directory if no valid saved folder exists
         if not folder or not os.path.isdir(folder):
             pictures_dir = os.path.join(os.path.expanduser("~"), "Pictures")
             folder = pictures_dir if os.path.isdir(pictures_dir) else os.path.expanduser("~")
 
         if folder and os.path.isdir(folder):
-            self.left_browser.set_selected_folder(folder)
-            self.load_images_from_folder(folder)
+            abs_folder = os.path.abspath(folder)
+            self.left_browser.set_selected_folder(abs_folder)
+            self.load_images_from_folder(abs_folder)
+            self._center_folder_in_tree_for_path(abs_folder)
+            for delay_ms in (60, 220, 500):
+                QTimer.singleShot(delay_ms, lambda fp=abs_folder: self._center_folder_in_tree_for_path(fp))
 
     def save_last_folder(self, folder_path):
         save_settings(SETTINGS_FILE, {"last_folder": folder_path})
 
-    def set_status(self, message):
+    def set_footer_status(self, message):
+        if self._is_closing:
+            return
         self.status_label.setText(f"Status: {message}")
-        if hasattr(self.right_sidebar, 'log_text'):
-            current_text = self.right_sidebar.log_text.toPlainText()
-            self.right_sidebar.log_text.setPlainText(f"{current_text}\n• {message}")
-            self.right_sidebar.log_text.verticalScrollBar().setValue(
-                self.right_sidebar.log_text.verticalScrollBar().maximum()
+
+    def set_status(self, message, log=True):
+        if self._is_closing:
+            return
+        child_prefix = getattr(self, "_persistent_child_scan_status", None)
+        if child_prefix and not message.startswith("Subfolder scan:"):
+            footer_msg = f"{child_prefix} | {message}"
+        else:
+            footer_msg = message
+        self.status_label.setText(f"Status: {footer_msg}")
+        if log and hasattr(self.right_sidebar, 'log_text'):
+            log_widget = self.right_sidebar.log_text
+            if hasattr(log_widget, "appendPlainText"):
+                log_widget.appendPlainText(f"\u2022 {message}")
+            else:
+                current_text = log_widget.toPlainText()
+                prefix = f"{current_text}\n" if current_text else ""
+                log_widget.setPlainText(f"{prefix}\u2022 {message}")
+            log_widget.verticalScrollBar().setValue(
+                log_widget.verticalScrollBar().maximum()
             )
 
     def open_folder_dialog(self):
@@ -460,120 +658,107 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_images_from_folder(folder_path)
 
     def load_images_from_folder(self, folder_path):
-        if not folder_path or not os.path.exists(folder_path):
+        if self._is_closing or not folder_path or not os.path.exists(folder_path):
             return
 
-        if self.current_watched_dir and self.current_watched_dir != folder_path:
-            self._sync_file_watcher_paths(folder_path)
+        self._sync_sort_state_from_settings()
         self.current_watched_dir = folder_path
-        if folder_path not in self.file_watcher.directories():
-            self._sync_file_watcher_paths(folder_path)
-
-        self.save_last_folder(folder_path)
+        self._persistent_child_scan_status = None
         self.left_browser.set_selected_folder(folder_path)
         self.path_label.setText(f"{folder_path}")
+        QTimer.singleShot(0, lambda fp=folder_path: self.save_last_folder(fp))
+        if folder_path not in self.file_watcher.directories():
+            QTimer.singleShot(15, lambda fp=folder_path: self.folder_sync.sync_file_watcher_paths(fp))
 
         self.scan_id += 1
         current_scan_id = self.scan_id
-        self._current_scan_count = 0
-        self._total_thumbs_to_generate = 0
-        self._thumbs_ready_count = 0
+        self.total_thumbs_to_generate = 0
+        self.thumbs_ready_count = 0
+        if hasattr(self.workspace_grid, "clear_in_flight_thumbnails"):
+            self.workspace_grid.clear_in_flight_thumbnails()
 
-        # Instant RAM cache hit when switching back to a recently visited directory
         if folder_path in self.folder_scan_cache:
             self.folder_scan_cache.move_to_end(folder_path)
             self.loaded_items = list(self.folder_scan_cache[folder_path])
-            self._rebuild_path_index()
+            self.rebuild_path_index()
+            self.sort_loaded_items_quietly()
+            self.workspace_grid.set_cards(self.loaded_items)
 
-            # Ensure any uncached pixmaps are decoded in background
             for item in self.loaded_items:
-                if not self.workspace_grid.has_cached_pixmap(item["file_path"]):
-                    task = ThumbnailLoaderTask(
-                        item["file_path"],
-                        self.thumb_cache_dir,
-                        self.CARD_IMAGE_SIZE,
-                        self.thumbnail_signals,
-                        scan_id=current_scan_id,
-                        active_scan_getter=self._get_active_scan_id,
-                        existing_thumb_path=item.get("thumb_path")
-                    )
-                    self.thread_pool.start(task)
+                fp = item["file_path"]
+                already_pending = (
+                    self.workspace_grid.is_thumbnail_pending(fp)
+                    if hasattr(self.workspace_grid, "is_thumbnail_pending")
+                    else self.workspace_grid.has_cached_pixmap(fp)
+                )
+                if not already_pending:
+                    self.total_thumbs_to_generate += 1
+                    self.start_thumbnail_task(fp, current_scan_id)
 
-            self.apply_sorting()
-            self.set_status(f"Ready (Cached) — Total images: {len(self.loaded_items)}")
-            self._perform_smooth_folder_sync()
+            self.set_status(f"Ready (Cached) \u2014 Total images: {len(self.loaded_items)}")
+            QTimer.singleShot(30, self.folder_sync.perform_smooth_folder_sync)
             return
 
-        self.pending_thumbnail_files.clear()
         self.loaded_items.clear()
         self.items_by_path.clear()
         self.workspace_grid.set_cards(self.loaded_items)
-        # Track total items processed during the active scan
-        self._current_scan_count = 0
-        # Track thumbnail generation progress
-        self._total_thumbs_to_generate = 0
-        self._thumbs_ready_count = 0
 
-        # Trim pixmap cache to free RAM when switching folders
         if hasattr(self.workspace_grid, 'clear_cache_if_needed'):
             self.workspace_grid.clear_cache_if_needed(max_allowed=3000)
 
         self.set_status(f"Scanning folder: {os.path.basename(folder_path)}")
         self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n• Folder: {os.path.basename(folder_path)}\n• Scanning..."
+            f"Inspector Properties:\n\n\u2022 Folder: {os.path.basename(folder_path)}\n\u2022 Scanning..."
         )
 
         scanner_task = FolderScannerTask(
             folder_path,
             current_scan_id,
             self.scanner_signals,
-            active_scan_getter=self._get_active_scan_id
+            active_scan_getter=self.get_active_scan_id
         )
         self.thread_pool.start(scanner_task)
 
     def on_batch_scanned(self, scan_id, batch):
-        if scan_id != self.scan_id:
+        if self._is_closing or scan_id != self.scan_id:
             return
 
-        new_thumbs_needed = 0
+        self._sync_sort_state_from_settings()
         for item_data in batch:
             file_path = item_data["file_path"]
             self.loaded_items.append(item_data)
             self.items_by_path[file_path] = item_data
 
-            # Only spawn worker if QPixmap isn't already in RAM cache
-            if not self.workspace_grid.has_cached_pixmap(file_path):
-                new_thumbs_needed += 1
-                task = ThumbnailLoaderTask(
-                    file_path,
-                    self.thumb_cache_dir,
-                    self.CARD_IMAGE_SIZE,
-                    self.thumbnail_signals,
-                    scan_id=scan_id,
-                    active_scan_getter=self._get_active_scan_id,
-                    existing_thumb_path=item_data.get("thumb_path")
-                )
-                self.thread_pool.start(task)
+            already_pending = (
+                self.workspace_grid.is_thumbnail_pending(file_path)
+                if hasattr(self.workspace_grid, "is_thumbnail_pending")
+                else self.workspace_grid.has_cached_pixmap(file_path)
+            )
+            if not already_pending:
+                self.total_thumbs_to_generate += 1
+                self.start_thumbnail_task(file_path, scan_id)
 
-        self.workspace_grid.set_cards(self.loaded_items)
+        self.sort_loaded_items_quietly()
+        if len(self.loaded_items) == len(batch):
+            self.needs_layout_update = False
+            self.workspace_grid.set_cards(self.loaded_items)
+        else:
+            self._schedule_grid_repaint(relayout=True)
 
     def on_scan_complete(self, scan_id, total_count):
-        if scan_id != self.scan_id:
+        if self._is_closing or scan_id != self.scan_id:
             return
 
+        self._sync_sort_state_from_settings()
         if total_count == 0:
+            self.workspace_grid.set_cards(self.loaded_items)
             self.set_status("No images found in folder")
         else:
-            if self.current_sort_criteria != "name" or self.sort_reverse:
-                self.apply_sorting()
-            else:
-                self.loaded_items.sort(
-                    key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", ""))
-                )
-                self._schedule_grid_repaint(relayout=True)
-                self.set_status(f"Ready — Total images in gallery: {total_count}")
+            self.sort_loaded_items_quietly()
+            self.needs_layout_update = False
+            self.workspace_grid.set_cards(self.loaded_items)
+            self.set_status(f"Ready \u2014 Total images in gallery: {total_count}")
 
-            # Store scanned directory in RAM cache
             if self.current_watched_dir:
                 self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
                 if len(self.folder_scan_cache) > self._MAX_FOLDER_CACHE:
@@ -583,9 +768,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 self.loaded_items,
                 scan_id,
                 self.comfy_signals,
-                active_scan_getter=self._get_active_scan_id
+                active_scan_getter=self.get_active_scan_id
             )
             self.thread_pool.start(comfy_task)
+
+            if hasattr(self, 'thumb_db_cache') and self.thumb_db_cache is not None:
+                self.thumb_db_cache.flush()
 
             if hasattr(self, 'initial_target_image') and self.initial_target_image:
                 target = self.initial_target_image
@@ -593,7 +781,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 self.open_image_viewer(target)
 
     def on_comfy_batch_ready(self, scan_id, file_paths):
-        if scan_id != self.scan_id:
+        if self._is_closing or scan_id != self.scan_id:
             return
         for fp in file_paths:
             item = self.items_by_path.get(fp)
@@ -602,7 +790,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self._schedule_grid_repaint(relayout=False)
 
     def on_thumbnail_ready(self, scan_id, file_path, thumb_path, qimage):
-        if scan_id != self.scan_id:
+        if hasattr(self, "workspace_grid") and hasattr(self.workspace_grid, "unmark_thumbnail_in_flight"):
+            self.workspace_grid.unmark_thumbnail_in_flight(file_path)
+        if self._is_closing or scan_id != self.scan_id:
             return
         item = self.items_by_path.get(file_path)
         if item is not None:
@@ -610,83 +800,87 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.workspace_grid.cache_thumbnail_image(file_path, qimage)
         self._schedule_grid_repaint(relayout=False)
 
-        # Track completed count quietly without hammering set_status()
-        self._thumbs_ready_count += 1
+        if self.thumbs_ready_count < self.total_thumbs_to_generate:
+            self.thumbs_ready_count += 1
 
-        # Throttle status bar updates using a single-shot timer (e.g., every 150ms)
-        if not hasattr(self, '_status_throttle_timer'):
-            self._status_throttle_timer = QTimer(self)
-            self._status_throttle_timer.setSingleShot(True)
-            self._status_throttle_timer.timeout.connect(self._flush_thumbnail_status)
+            if not hasattr(self, '_status_throttle_timer'):
+                self._status_throttle_timer = QTimer(self)
+                self._status_throttle_timer.setSingleShot(True)
+                self._status_throttle_timer.timeout.connect(self._flush_thumbnail_status)
 
-        if not self._status_throttle_timer.isActive():
-            self._status_throttle_timer.start(150)
+            if not self._status_throttle_timer.isActive():
+                self._status_throttle_timer.start(150)
 
-    def _flush_thumbnail_status(self):
-        """Batch-updates the status footer smoothly with live RAM cache consumption."""
-        left_to_gen = max(0, self._total_thumbs_to_generate - self._thumbs_ready_count)
+    def build_full_gallery_status(self):
+        processed_count = min(self.thumbs_ready_count, self.total_thumbs_to_generate)
+        left_to_gen = max(0, self.total_thumbs_to_generate - processed_count)
 
-        # Get live RAM usage from the grid cache
         cache_bytes = self.workspace_grid.get_cache_memory_usage()
         cache_size_str = format_file_size(cache_bytes)
         cache_count = len(self.workspace_grid.pixmap_cache)
         max_cache = self.workspace_grid._MAX_PIXMAP_CACHE_ITEMS
 
+        disk_suffix = ""
+        if not self._is_closing and self.folder_sync.is_disk_cache_enabled():
+            settings = load_settings(SETTINGS_FILE)
+            limit_str = self.folder_sync.get_disk_cache_limit_str(settings)
+            disk_size_str = self.folder_sync.get_disk_cache_size_str()
+            size_display = f"{disk_size_str} / {limit_str}" if limit_str else disk_size_str
+            disk_suffix = (
+                f" | Disk Cache: Processed: {processed_count} | Left: {left_to_gen} "
+                f"| Disk Cache Size: {size_display}"
+            )
+
         if left_to_gen > 0:
-            self.set_status(
-                f"Generating thumbnails... Ready: {self._thumbs_ready_count} | Left: {left_to_gen} | RAM Cache: {cache_count}/{max_cache} items ({cache_size_str})")
+            base_msg = (
+                f"Generating thumbnails... Ready: {processed_count} | Left: {left_to_gen} "
+                f"| RAM Cache: {cache_count}/{max_cache} items ({cache_size_str}){disk_suffix}"
+            )
         else:
-            self.set_status(
-                f"Ready — Total images in gallery: {len(self.loaded_items)} | RAM Cache: {cache_count} items ({cache_size_str})")
+            base_msg = (
+                f"Ready — Total images in gallery: {len(self.loaded_items)} "
+                f"| RAM Cache: {cache_count} items ({cache_size_str}){disk_suffix}"
+            )
 
-    def _sync_file_watcher_paths(self, root_folder):
-        current_paths = set(self.file_watcher.directories())
-        if current_paths:
-            self.file_watcher.removePaths(list(current_paths))
+        child_prefix = getattr(self, "_persistent_child_scan_status", None)
+        if child_prefix:
+            return f"{child_prefix} | {base_msg}"
+        return base_msg
 
-        if not root_folder or not os.path.isdir(root_folder):
+    def _flush_thumbnail_status(self):
+        if self._is_closing:
             return
-
-        settings = load_settings(SETTINGS_FILE)
-        include_subfolders = settings.get("include_child_folders", False)
-        max_depth = max(1, int(settings.get("child_folder_depth", 1)))
-
-        paths_to_watch = [root_folder]
-        if include_subfolders:
-            base_depth = len(os.path.normpath(root_folder).split(os.sep))
-            for dirpath, dirnames, _ in os.walk(root_folder, followlinks=False, onerror=lambda e: None):
-                current_depth = len(os.path.normpath(dirpath).split(os.sep)) - base_depth
-                if current_depth >= max_depth:
-                    dirnames[:] = []
-                    continue
-                for d in dirnames:
-                    full_dir = os.path.join(dirpath, d)
-                    if os.path.isdir(full_dir):
-                        paths_to_watch.append(full_dir)
-
-        self.file_watcher.addPaths(paths_to_watch)
+        self.set_footer_status(self.build_full_gallery_status())
 
     def on_card_selected(self, file_path, display_name):
+        if self._is_closing:
+            return
         filename = os.path.basename(file_path)
         item_info = self.items_by_path.get(file_path)
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
-        # 1. Instant GUI feedback with zero main-thread delay
         detailed_status = f"Selected: {filename}  |  Size: {size_str}"
         self.status_label.setText(f"Status: {detailed_status}")
 
         self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n• File: {filename}\n• Size: {size_str}\n• Resolution: Loading (BG)...\n• Path: {file_path}"
+            f"Inspector Properties:\n\n\u2022 File: {filename}\n\u2022 Size: {size_str}\n\u2022 Resolution: Loading (BG)...\n\u2022 Path: {file_path}"
         )
         self.right_sidebar.exif_view.setHtml("<i>Loading metadata in background thread...</i>")
         if hasattr(self.right_sidebar, 'comfy_view'):
             self.right_sidebar.comfy_view.setPlainText("Loading ComfyUI workflow...")
 
-        # 2. Offload heavy metadata & EXIF disk reads to background thread pool
-        task = MetadataLoaderTask(file_path, filename, size_str, self.meta_signals)
+        task = MetadataLoaderTask(
+            file_path,
+            filename,
+            size_str,
+            self.meta_signals,
+            is_closing_getter=self._is_shutting_down,
+        )
         self.thread_pool.start(task)
 
     def on_metadata_ready(self, file_path, filename, dims_str, exif_text, comfy_text):
+        if self._is_closing:
+            return
         if not self.workspace_grid.selected_file_paths or file_path not in self.workspace_grid.selected_file_paths:
             return
 
@@ -694,7 +888,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
         self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n• File: {filename}\n• Size: {size_str}\n• Resolution: {dims_str}\n• Path: {file_path}"
+            f"Inspector Properties:\n\n\u2022 File: {filename}\n\u2022 Size: {size_str}\n\u2022 Resolution: {dims_str}\n\u2022 Path: {file_path}"
         )
         self.right_sidebar.exif_view.setHtml(exif_text)
 
@@ -709,7 +903,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.status_label.setText(f"Status: Selected: {filename}  |  Size: {size_str}  |  Dimensions: {dims_str}")
 
     def open_image_viewer(self, file_path):
-        # Check if Alt key is held down during the action
         modifiers = QGuiApplication.keyboardModifiers()
         if modifiers & Qt.KeyboardModifier.AltModifier:
             self.set_status(f"Opening pinned viewer for: {os.path.basename(file_path)}")
@@ -721,7 +914,6 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.detached_viewers.append(detached_viewer)
             return
 
-        # Standard behavior[cite: 1]
         self.set_status(f"Opening viewer for: {os.path.basename(file_path)}")
         self.hide()
         self.viewer_window = ImageViewerWindow(file_path, self)
@@ -731,12 +923,11 @@ class MainWindow(QMainWindow, WindowDragHandler):
         data = load_settings(SETTINGS_FILE)
         folder = data.get("last_folder", "")
         if folder and os.path.isdir(folder):
-            import subprocess
-            import platform
             try:
-                if platform.system() == "Windows":
+                system_name = platform.system()
+                if system_name == "Windows":
                     os.startfile(folder)
-                elif platform.system() == "Darwin":
+                elif system_name == "Darwin":
                     subprocess.run(["open", folder])
                 else:
                     subprocess.run(["xdg-open", folder])
@@ -746,46 +937,57 @@ class MainWindow(QMainWindow, WindowDragHandler):
         else:
             self.set_status("No active folder to open.")
 
-    def _get_target_file_paths(self):
+    def get_target_file_paths(self):
         if hasattr(self.workspace_grid, 'selected_file_paths') and self.workspace_grid.selected_file_paths:
             paths = list(self.workspace_grid.selected_file_paths)
         else:
             paths = [item["file_path"] for item in self.loaded_items]
         return [os.path.abspath(p) for p in paths if p and os.path.exists(p)]
 
-    #  -----------sort menu functions--------------
     def set_sort_criteria(self, criteria):
-        self.current_sort_criteria = criteria
-        save_settings(SETTINGS_FILE, {"sort_criteria": criteria})
+        self.current_sort_criteria = str(criteria or "name").lower()
+        save_settings(SETTINGS_FILE, {"sort_criteria": self.current_sort_criteria})
         self.apply_sorting()
 
     def toggle_sort_reverse(self, is_reversed):
-        self.sort_reverse = is_reversed
-        save_settings(SETTINGS_FILE, {"sort_reverse": is_reversed})
+        self.sort_reverse = bool(is_reversed)
+        save_settings(SETTINGS_FILE, {"sort_reverse": self.sort_reverse})
         self.apply_sorting()
+
+    def sort_loaded_items_quietly(self):
+        self._sync_sort_state_from_settings()
+        criteria = self.current_sort_criteria
+        is_rev = bool(self.sort_reverse)
+        if criteria == "name":
+            self.loaded_items.sort(key=self._item_name_sort_key, reverse=is_rev)
+        elif criteria == "date":
+            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=not is_rev)
+        elif criteria == "size":
+            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
 
     def apply_sorting(self):
         if not self.loaded_items:
             return
 
+        self._sync_sort_state_from_settings()
         criteria = self.current_sort_criteria
-        is_rev = self.sort_reverse
+        is_rev = bool(self.sort_reverse)
 
         if criteria == "name":
-            self.loaded_items.sort(key=lambda x: x.get("filename", ""), reverse=is_rev)
+            self.loaded_items.sort(key=self._item_name_sort_key, reverse=is_rev)
             self.set_status(f"Sorted by Name ({'Z-A' if is_rev else 'A-Z'})")
         elif criteria == "date":
-            reverse_flag = not is_rev
-            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=reverse_flag)
+            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=not is_rev)
             self.set_status(f"Sorted by Date ({'Oldest first' if is_rev else 'Newest first'})")
         elif criteria == "size":
-            reverse_flag = not is_rev
-            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=reverse_flag)
+            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
             self.set_status(f"Sorted by Size ({'Smallest first' if is_rev else 'Largest first'})")
+
+        if self.current_watched_dir and self.current_watched_dir in self.folder_scan_cache:
+            self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
 
         self.workspace_grid.set_cards(self.loaded_items)
 
-    #  -----------select menu functions--------------
     def select_all_items(self):
         if self.loaded_items:
             self.workspace_grid.select_all()
@@ -798,20 +1000,21 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.workspace_grid.invert_selection()
 
     def on_selection_changed(self, selected_paths):
+        if self._is_closing:
+            return
         count = len(selected_paths)
         total = len(self.loaded_items)
 
         if count == 0:
             self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n• Folder Selected\n• Total Images: {total}\n• Selected: None"
+                f"Inspector Properties:\n\n\u2022 Folder Selected\n\u2022 Total Images: {total}\n\u2022 Selected: None"
             )
             self.right_sidebar.exif_view.setHtml(
                 "<i>No EXIF metadata available.<br>Select an image to inspect camera details.</i>"
             )
             if hasattr(self.right_sidebar, 'comfy_view'):
                 self.right_sidebar.comfy_view.setPlainText("Select a PNG with ComfyUI workflow to view data.")
-            # Display total image count when selection is cleared / none selected
-            self.set_status(f"Ready — Total images in gallery: {total}")
+            self.set_status(self.build_full_gallery_status())
         elif count == 1:
             self.on_card_selected(selected_paths[0], os.path.basename(selected_paths[0]))
         else:
@@ -820,7 +1023,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             )
             size_str = format_file_size(total_bytes)
             self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n• Multiple Items Selected\n• Selected: {count} of {total}\n• Combined Size: {size_str}"
+                f"Inspector Properties:\n\n\u2022 Multiple Items Selected\n\u2022 Selected: {count} of {total}\n\u2022 Combined Size: {size_str}"
             )
             self.right_sidebar.exif_view.setHtml(
                 f"<i>{count} images selected.<br>Select a single image to inspect EXIF metadata.</i>"
@@ -829,451 +1032,92 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 self.right_sidebar.comfy_view.setPlainText("Multiple items selected.")
             self.set_status(f"Selected {count} of {total} items ({size_str})")
 
-    #  -----------undo / redo & drag-drop move functions--------------
-    def _record_undo_action(self, action):
-        self._undo_stack.append(action)
-        # Clear redo history whenever a new action is performed
-        for discarded in self._redo_stack:
-            if discarded.get("type") == "delete":
-                for _, staged_path in discarded.get("pairs", []):
-                    if staged_path and os.path.exists(staged_path):
-                        try:
-                            os.remove(staged_path)
-                        except OSError:
-                            pass
-        self._redo_stack.clear()
-
-    def _refresh_after_history_op(self, affected_paths):
-        affected_dirs = {os.path.dirname(p) for p in affected_paths if p}
-        for d in affected_dirs:
-            self.folder_scan_cache.pop(d, None)
-        if self.current_watched_dir:
-            self.folder_scan_cache.pop(os.path.abspath(self.current_watched_dir), None)
-            self._perform_smooth_folder_sync()
-
-    def _ensure_folder_in_watch_and_cache(self, folder_path):
-        """Ensures a drop/target folder is invalidated in RAM cache and actively watched."""
-        if not folder_path or not os.path.isdir(folder_path):
+    def _schedule_keep_selected_in_view(self):
+        if self._is_closing:
             return
-        abs_folder = os.path.abspath(folder_path)
-        self.folder_scan_cache.pop(abs_folder, None)
-        self.folder_scan_cache.pop(folder_path, None)
-        if abs_folder not in self.file_watcher.directories():
-            self.file_watcher.addPath(abs_folder)
+        if hasattr(self, "_keep_selected_timer") and self._keep_selected_timer is not None:
+            self._keep_selected_timer.start(100)
 
-    def _refresh_target_folder_if_active(self, target_folder):
-        """If the drop target folder is the currently active folder, refresh its view immediately."""
-        if not self.current_watched_dir or not target_folder:
+    def _keep_selected_thumbnail_in_view(self):
+        if self._is_closing or not hasattr(self, "workspace_grid") or self.workspace_grid is None:
             return
-        if os.path.abspath(self.current_watched_dir) == os.path.abspath(target_folder):
-            self._perform_smooth_folder_sync()
-
-    def undo_file_operation(self):
-        if not self._undo_stack:
-            self.set_status("Nothing to undo.")
+        if not getattr(self.workspace_grid, "selected_file_paths", None):
             return
+        self.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
 
-        action = self._undo_stack.pop()
-        op_type = action["type"]
-        affected = []
-
-        if self.current_watched_dir:
-            self.file_watcher.removePaths(self.file_watcher.directories())
-
-        if op_type == "move":
-            for orig_src, current_dst in reversed(action["pairs"]):
-                if os.path.exists(current_dst):
-                    os.makedirs(os.path.dirname(orig_src), exist_ok=True)
-                    shutil.move(current_dst, orig_src)
-                    affected.extend([orig_src, current_dst])
-            self._redo_stack.append(action)
-            self.set_status(f"Undid move of {len(action['pairs'])} file(s).")
-
-        elif op_type == "copy":
-            for orig_src, copied_dst in reversed(action["pairs"]):
-                if os.path.exists(copied_dst):
-                    os.remove(copied_dst)
-                    affected.append(copied_dst)
-            self._redo_stack.append(action)
-            self.set_status(f"Undid copy of {len(action['pairs'])} file(s).")
-
-        elif op_type == "delete":
-            for orig_path, staged_path in reversed(action["pairs"]):
-                if os.path.exists(staged_path):
-                    os.makedirs(os.path.dirname(orig_path), exist_ok=True)
-                    shutil.move(staged_path, orig_path)
-                    affected.append(orig_path)
-            self._redo_stack.append(action)
-            self.set_status(f"Restored {len(action['pairs'])} deleted file(s).")
-
-        if self.current_watched_dir:
-            self._sync_file_watcher_paths(self.current_watched_dir)
-        self._refresh_after_history_op(affected)
-
-    def redo_file_operation(self):
-        if not self._redo_stack:
-            self.set_status("Nothing to redo.")
-            return
-
-        action = self._redo_stack.pop()
-        op_type = action["type"]
-        affected = []
-
-        if self.current_watched_dir:
-            self.file_watcher.removePaths(self.file_watcher.directories())
-
-        if op_type == "move":
-            for orig_src, target_dst in action["pairs"]:
-                if os.path.exists(orig_src):
-                    os.makedirs(os.path.dirname(target_dst), exist_ok=True)
-                    shutil.move(orig_src, target_dst)
-                    affected.extend([orig_src, target_dst])
-            self._undo_stack.append(action)
-            self.set_status(f"Redid move of {len(action['pairs'])} file(s).")
-
-        elif op_type == "copy":
-            for orig_src, target_dst in action["pairs"]:
-                if os.path.exists(orig_src):
-                    os.makedirs(os.path.dirname(target_dst), exist_ok=True)
-                    shutil.copy2(orig_src, target_dst)
-                    affected.append(target_dst)
-            self._undo_stack.append(action)
-            self.set_status(f"Redid copy of {len(action['pairs'])} file(s).")
-
-        elif op_type == "delete":
-            for orig_path, staged_path in action["pairs"]:
-                if os.path.exists(orig_path):
-                    os.makedirs(os.path.dirname(staged_path), exist_ok=True)
-                    shutil.move(orig_path, staged_path)
-                    affected.append(orig_path)
-            self._undo_stack.append(action)
-            self.set_status(f"Redid delete of {len(action['pairs'])} file(s).")
-
-        if self.current_watched_dir:
-            self._sync_file_watcher_paths(self.current_watched_dir)
-        self._refresh_after_history_op(affected)
-
-    def move_files_to_folder(self, src_paths, target_folder):
-        if not src_paths or not target_folder or not os.path.isdir(target_folder):
-            return
-
-        target_abs = os.path.abspath(target_folder)
-        moved_records = []
-
-        if self.current_watched_dir:
-            self.file_watcher.removePaths(self.file_watcher.directories())
-
-        for src in src_paths:
-            src_abs = os.path.abspath(src)
-            if not os.path.exists(src_abs):
-                continue
-            # Skip if already inside the exact target folder
-            if os.path.dirname(src_abs) == target_abs:
-                continue
-
-            filename = os.path.basename(src_abs)
-            dest_abs = os.path.join(target_abs, filename)
-            base, ext = os.path.splitext(filename)
-            counter = 1
-            while os.path.exists(dest_abs):
-                dest_abs = os.path.join(target_abs, f"{base}_moved{counter}{ext}")
-                counter += 1
-
-            try:
-                shutil.move(src_abs, dest_abs)
-                moved_records.append((src_abs, dest_abs))
-            except Exception as e:
-                print(f"Failed to move {src_abs} -> {dest_abs}: {e}")
-
-        if self.current_watched_dir:
-            self._sync_file_watcher_paths(self.current_watched_dir)
-        self._ensure_folder_in_watch_and_cache(target_abs)
-
-        if moved_records:
-            self._record_undo_action({"type": "move", "pairs": moved_records})
-            self.folder_scan_cache.pop(target_abs, None)
-            if self.current_watched_dir:
-                self.folder_scan_cache.pop(os.path.abspath(self.current_watched_dir), None)
-            self._perform_smooth_folder_sync()
-            self._refresh_target_folder_if_active(target_abs)
-            self.set_status(f"Moved {len(moved_records)} file(s) to {os.path.basename(target_abs)} (Ctrl+Z to undo)")
-
-    #  -----------grid context menu and file operations--------------
-    def show_grid_context_menu(self, pos):
-        """Displays the right-click context menu on the image grid."""
-        selected_paths = self._get_target_file_paths()
-
-        menu = QMenu(self)
-        menu.setStyleSheet("""
-            QMenu {
-                background-color: #0d1321;
-                color: #e2e8f0;
-                border: 1px solid #1e293b;
-                border-radius: 6px;
-                padding: 4px;
-            }
-            QMenu::item {
-                padding: 6px 20px;
-                border-radius: 4px;
-            }
-            QMenu::item:selected {
-                background-color: #3b82f6;
-                color: white;
-            }
-            QMenu::separator {
-                height: 1px;
-                background: #1e293b;
-                margin: 4px 0px;
-            }
-        """)
-
-        copy_action = menu.addAction("Copy")
-        cut_action = menu.addAction("Cut")
-        paste_action = menu.addAction("Paste")
-        menu.addSeparator()
-        delete_action = menu.addAction("Delete")
-
-        # Check if any cards are explicitly selected in the grid
-        has_selection = hasattr(self.workspace_grid, 'selected_file_paths') and len(
-            self.workspace_grid.selected_file_paths) > 0
-
-        # Disable Copy, Cut, and Delete if no image cards are selected
-        copy_action.setEnabled(has_selection)
-        cut_action.setEnabled(has_selection)
-        delete_action.setEnabled(has_selection)
-
-        clipboard = QGuiApplication.clipboard()
-        mime_data = clipboard.mimeData()
-        paste_action.setEnabled(mime_data.hasUrls())
-
-        action = menu.exec(self.workspace_grid.mapToGlobal(pos))
-
-        if action == copy_action:
-            self.copy_selected_files(selected_paths, cut=False)
-        elif action == cut_action:
-            self.copy_selected_files(selected_paths, cut=True)
-        elif action == paste_action:
-            self.paste_files_from_clipboard()
-        elif action == delete_action:
-            self.delete_selected_files(selected_paths)
-
-    def paste_files_from_clipboard(self):
-        if not hasattr(self, 'current_watched_dir') or not self.current_watched_dir:
-            self.set_status("No active folder destination for pasting.")
-            return
-
-        clipboard = QGuiApplication.clipboard()
-        mime_data = clipboard.mimeData()
-
-        if not mime_data.hasUrls():
-            self.set_status("No files found in clipboard to paste.")
-            return
-
-        if self.current_watched_dir:
-            self.file_watcher.removePaths(self.file_watcher.directories())
-
-        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
-        newly_added_items = []
-        copied_records = []
-        moved_records = []
-        success_count = 0
-
-        # Capture cut source paths securely before processing URLs
-        cut_paths = getattr(self, '_cut_source_paths', [])
-
-        for url in mime_data.urls():
-            src_path = url.toLocalFile()
-            if src_path and os.path.exists(src_path):
-                ext = os.path.splitext(src_path)[1].lower()
-                if ext not in valid_exts:
-                    continue
-                try:
-                    filename = os.path.basename(src_path)
-                    dest_path = os.path.join(self.current_watched_dir, filename)
-
-                    base, file_ext = os.path.splitext(filename)
-                    counter = 1
-                    while os.path.exists(dest_path):
-                        dest_path = os.path.join(self.current_watched_dir, f"{base}_copy{counter}{file_ext}")
-                        counter += 1
-
-                    # Check if this specific source path was marked as a cut operation
-                    if cut_paths and os.path.abspath(src_path) in [os.path.abspath(p) for p in cut_paths]:
-                        shutil.move(src_path, dest_path)
-                        moved_records.append((os.path.abspath(src_path), os.path.abspath(dest_path)))
-                        action_performed = "Moved"
-                    else:
-                        shutil.copy2(src_path, dest_path)
-                        copied_records.append((os.path.abspath(src_path), os.path.abspath(dest_path)))
-                        action_performed = "Copied"
-
-                    file_stats = os.stat(dest_path)
-                    file_name = os.path.basename(dest_path)
-
-                    has_comfy = False
-                    if dest_path.lower().endswith(".png"):
-                        try:
-                            with Image.open(dest_path) as img:
-                                if hasattr(img, "text") and img.text and (
-                                        "workflow" in img.text or "prompt" in img.text):
-                                    has_comfy = True
-                        except Exception:
-                            pass
-
-                    item_data = {
-                        "file_path": dest_path,
-                        "filename": file_name.lower(),
-                        "display_name": (file_name[:16] + '..') if len(file_name) > 18 else file_name,
-                        "size": file_stats.st_size,
-                        "mtime": file_stats.st_mtime,
-                        "thumb_path": None,
-                        "has_comfy": has_comfy
-                    }
-
-                    newly_added_items.append(item_data)
-                    task = ThumbnailLoaderTask(
-                        dest_path,
-                        self.thumb_cache_dir,
-                        self.CARD_IMAGE_SIZE,
-                        self.thumbnail_signals,
-                        scan_id=self.scan_id,
-                        active_scan_getter=self._get_active_scan_id
-                    )
-                    self.thread_pool.start(task)
-                    success_count += 1
-                except Exception as e:
-                    print(f"Failed to paste/move {src_path}: {e}")
-
-        # Clear cut source paths after operation is finished
-        self._cut_source_paths = []
-        if self.current_watched_dir:
-            self._sync_file_watcher_paths(self.current_watched_dir)
-
-        if success_count > 0:
-            if copied_records:
-                self._record_undo_action({"type": "copy", "pairs": copied_records})
-            if moved_records:
-                self._record_undo_action({"type": "move", "pairs": moved_records})
-
-            self.loaded_items.extend(newly_added_items)
-            self._rebuild_path_index()
-            if self.current_watched_dir in self.folder_scan_cache:
-                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
-            self.apply_sorting()
-            self.set_status(f"Successfully processed {success_count} file(s).")
-        else:
-            self.set_status("No valid image files pasted.")
-
-    def copy_selected_files(self, paths, cut=False):
-        """Copies or cuts selected file paths to the system clipboard. If no selection, copies the whole gallery."""
-        if not paths:
-            paths = [item["file_path"] for item in self.loaded_items if os.path.exists(item["file_path"])]
-
-        if not paths:
-            self.set_status("No images available to copy.")
-            return
-
-        clipboard = QGuiApplication.clipboard()
-        mime_data = QMimeData()
-        urls = [QUrl.fromLocalFile(p) for p in paths if os.path.exists(p)]
-        mime_data.setUrls(urls)
-        clipboard.setMimeData(mime_data)
-
-        if cut:
-            self._cut_source_paths = paths
-        else:
-            self._cut_source_paths = []
-
-        action_name = "Cut" if cut else "Copied"
-        target_desc = "selected file(s)" if self.workspace_grid.selected_file_paths else "entire gallery"
-        self.set_status(f"{action_name} {len(paths)} file(s) ({target_desc}) to clipboard.")
-
-    def delete_selected_files(self, paths):
-        """Safely removes selected image files with undo staging and updates the grid in-place without folder re-scans."""
-        if not paths:
-            self.status_label.setText("Status: Deletion failed - No valid images selected.")
-            return
-
-        # --- Check setting for deletion confirmation ---
-        settings = load_settings(SETTINGS_FILE)
-        confirm_enabled = settings.get("confirm_on_delete", True)
-
-        if confirm_enabled:
-            reply = QMessageBox.question(
-                self, "Confirm Delete",
-                f"Are you sure you want to move {len(paths)} selected file(s) to the Recycle Bin?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-        # ---------------------------------------------
-
-        deleted_paths = set()
-        deleted_records = []
-
-        for path in paths:
-            norm_path = os.path.abspath(path)
-            if os.path.exists(norm_path):
-                try:
-                    staged_name = f"{uuid.uuid4().hex}_{os.path.basename(norm_path)}"
-                    staged_path = os.path.join(self._undo_trash_dir, staged_name)
-                    shutil.move(norm_path, staged_path)
-                    deleted_paths.add(norm_path)
-                    deleted_records.append((norm_path, staged_path))
-                except Exception as e:
-                    print(f"DEBUG Error staging delete for {path}: {e}")
-
-        if deleted_paths:
-            self._record_undo_action({"type": "delete", "pairs": deleted_records})
-
-            # 1. Instantly filter out deleted items from loaded_items memory cache
-            self.loaded_items = [
-                item for item in self.loaded_items
-                if os.path.abspath(item["file_path"]) not in deleted_paths
-            ]
-            self._rebuild_path_index()
-            if self.current_watched_dir in self.folder_scan_cache:
-                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
-
-            self.workspace_grid.set_cards(self.loaded_items)
-
-            deleted_count = len(deleted_paths)
-            total_remaining = len(self.loaded_items)
-            self.set_status(f"Moved {deleted_count} file(s) to Recycle Bin. Total remaining: {total_remaining}")
-
-            # Update sidebar summary label without full scan
-            self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n• Folder Selected\n• Total Images: {total_remaining}\n• Selected: None"
-            )
-        else:
-            self.set_status("Deletion failed: No files were removed.")
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_keep_selected_in_view()
 
     def keyPressEvent(self, event):
-        """Handles keyboard shortcuts like Delete/Backspace for removing selected images."""
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
-            selected_paths = self._get_target_file_paths()
+            selected_paths = self.get_target_file_paths()
             if selected_paths:
-                self.delete_selected_files(selected_paths)
+                self.file_ops.delete_selected_files(selected_paths)
                 event.accept()
                 return
+
         super().keyPressEvent(event)
 
-    #  -----------favorites  menu functions--------------
+    def scroll_to_selected_thumbnail_in_grid(self):
+        if hasattr(self, "workspace_grid") and self.workspace_grid:
+            moved = self.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
+            if moved:
+                self.set_status("Scrolled to selected image.")
+
+    def center_current_folder_in_tree(self):
+        if hasattr(self, "left_browser") and self.left_browser and hasattr(self.left_browser, "scroll_to_selected_folder"):
+            active_folder = getattr(self, "current_watched_dir", None)
+            moved_tree = self.left_browser.scroll_to_selected_folder(
+                folder_path=active_folder,
+                only_if_out_of_view=False,
+                center_in_view=True
+            )
+            if moved_tree:
+                self.set_status("Centered current folder in tree.")
+
+    def open_selected_or_first_image_in_viewer(self):
+        if not self.isActiveWindow() or self.isHidden():
+            return
+
+        target_path = None
+        selected = getattr(self.workspace_grid, "selected_file_paths", None)
+        if selected:
+            selected_set = {os.path.abspath(p) for p in selected if p}
+            for item in self.loaded_items:
+                fp = item.get("file_path")
+                if fp and os.path.abspath(fp) in selected_set and os.path.exists(fp):
+                    target_path = fp
+                    break
+            if not target_path:
+                for p in selected:
+                    if p and os.path.exists(p):
+                        target_path = p
+                        break
+
+        if not target_path:
+            for item in self.loaded_items:
+                fp = item.get("file_path")
+                if fp and os.path.exists(fp):
+                    target_path = fp
+                    break
+
+        if target_path:
+            self.open_image_viewer(target_path)
+
     def jump_to_favorite_folder(self, folder_path):
         if folder_path and os.path.isdir(folder_path):
-            # 1. Load the images and start the thumbnail batch pipeline
-            self.load_images_from_folder(folder_path)
+            abs_folder = os.path.abspath(folder_path)
+            self.load_images_from_folder(abs_folder)
 
-            # 2. Sync the directory browser tree panel so it highlights the folder
             if hasattr(self, 'left_browser') and self.left_browser:
-                self.left_browser.set_selected_folder(folder_path)
+                self.left_browser.set_selected_folder(abs_folder)
+            self._center_folder_in_tree_for_path(abs_folder)
+            for delay_ms in (60, 220, 500):
+                QTimer.singleShot(delay_ms, lambda fp=abs_folder: self._center_folder_in_tree_for_path(fp))
 
-            # 3. Re-apply the active sort criteria and order
             self.apply_sorting()
-
-            self.set_status(f"Opened favorite: {os.path.basename(folder_path)}")
+            self.set_status(f"Opened favorite: {os.path.basename(abs_folder)}")
         else:
             self.set_status(f"Favorite folder no longer exists: {folder_path}")
 
@@ -1283,465 +1127,101 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if current_folder and os.path.isdir(current_folder):
             updated_favorites = add_folder_to_favorites(current_folder, SETTINGS_FILE)
 
-            # Dynamically update the menu bar's favorites list
-            self.menu_bar.favorites = updated_favorites
-            self.menu_bar.clear()
-            self.menu_bar.setup_ui()
+            if hasattr(self.menu_bar, "update_favorites"):
+                self.menu_bar.update_favorites(updated_favorites)
+            else:
+                self.menu_bar.favorites = updated_favorites
+                self.menu_bar._populate_favorites_actions()
             folder_name = os.path.basename(os.path.normpath(current_folder))
             self.set_status(f"Added to favorites: {folder_name}")
         else:
             self.set_status("No active folder to add to favorites.")
 
-    def batch_convert_images(self):
-        paths = self._get_target_file_paths()
-        if not paths:
-            self.set_status("No images available for conversion.")
-            return
-
-        # Store as instance variable to prevent premature GC crash
-        self._active_dialog = BatchConvertDialog(self)
-        if self._active_dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-
-        target_format = self._active_dialog.format_combo.currentText()
-        quality = self._active_dialog.quality_slider.value()
-        transfer_exif = self._active_dialog.transfer_exif_cb.isChecked()
-        remove_original = self._active_dialog.remove_original_cb.isChecked()
-
-        self.set_status("Starting background batch image conversion...")
-        self.convert_signals = BatchConvertWorkerSignals()
-        self.convert_signals.progress_update.connect(self.set_status)
-        self.convert_signals.finished.connect(lambda s, f, msg: self.on_batch_convert_finished(s, f, msg, paths))
-
-        worker = BatchConvertWorker(paths, target_format, quality, transfer_exif, remove_original, self.convert_signals)
-        self.thread_pool.start(worker)
-
-    def on_batch_convert_finished(self, success_count, failed_count, msg, original_paths):
-        self.set_status(msg)
-        if success_count > 0 and original_paths and os.path.dirname(original_paths[0]):
-            folder = os.path.dirname(original_paths[0])
-            self.folder_scan_cache.pop(folder, None)
-            self.load_images_from_folder(folder)
-
-        BatchCompleteDialog(
-            self,
-            "Batch Conversion Complete" if success_count > 0 else "Batch Conversion Failed",
-            msg
-        ).exec()
-
-    def batch_purge_exif(self):
-        paths = self._get_target_file_paths()
-        if not paths:
-            self.set_status("No images selected for EXIF purge.")
-            return
-
-        success_count = 0
-        for path in paths:
-            try:
-                with Image.open(path) as img:
-                    data = list(img.getdata())
-                    clean_img = Image.new(img.mode, img.size)
-                    clean_img.putdata(data)
-                    clean_img.save(path)  # Overwrites original or saves clean copy
-                success_count += 1
-            except Exception as e:
-                print(f"Failed to purge EXIF for {path}: {e}")
-        self.set_status(f"Purged EXIF data from {success_count} images.")
-        BatchCompleteDialog(self, "EXIF Purge Complete",
-                            f"Successfully purged EXIF data from {success_count} images.").exec()
-
-    def batch_export_exif(self):
-        paths = self._get_target_file_paths()
-        if not paths:
-            self.set_status("No images selected for EXIF export.")
-            return
-
-        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory for EXIF JSON")
-        if not export_dir:
-            return
-
-        import json
-        success_count = 0
-        last_json_filename = ""
-
-        for path in paths:
-            try:
-                base_name = os.path.splitext(os.path.basename(path))[0]
-                json_filename = f"{base_name}_EXIF.json"
-                out_json = os.path.join(export_dir, json_filename)
-                last_json_filename = json_filename
-
-                # Use helper function to extract metadata dictionary
-                _, metadata_dict = extract_image_metadata(path)
-                with open(out_json, "w", encoding="utf-8") as f:
-                    json.dump(metadata_dict, f, indent=4)
-                success_count += 1
-            except Exception as e:
-                print(f"Failed to export EXIF for {path}: {e}")
-
-        if success_count == 1:
-            msg = f"Exported EXIF report as {last_json_filename}"
-        elif success_count > 1:
-            msg = f"Exported {success_count} EXIF reports (e.g., {last_json_filename})"
-        else:
-            msg = "Failed to export EXIF reports."
-
-        self.set_status(msg)
-        BatchCompleteDialog(self, "EXIF Export Complete", msg).exec()
-
-    def batch_inject_exif(self):
-        paths = self._get_target_file_paths()
-        if not paths:
-            self.set_status("No images selected for EXIF injection.")
-            return
-
-        import json
-        source_filter = "Source Files (*.jpg *.jpeg *.png *.json)"
-        source_file, _ = QFileDialog.getOpenFileName(
-            self, "Select EXIF Source (Image or JSON Report)", "", source_filter
-        )
-        if not source_file:
-            return
-
-        try:
-            exif_data_bytes = None
-            exif_dict = {}
-
-            # Case 1: Source is a JSON report (*_EXIF.json)
-            if source_file.endswith(".json"):
-                with open(source_file, "r", encoding="utf-8") as f:
-                    content = json.load(f)
-                    if isinstance(content, dict):
-                        exif_dict = content
-
-            # Case 2: Source is a reference image file (JPG, PNG, WebP, etc.)
-            else:
-                exif_data_bytes, exif_dict = extract_image_metadata(source_file)
-
-            # Build reverse TAGS lookup for JPEGs
-            _TAGS_r = {v: k for k, v in TAGS.items()}
-            success_count = 0
-
-            for path in paths:
-                file_ext = os.path.splitext(path)[1].lower()
-                with Image.open(path) as target:
-                    if file_ext == '.png':
-                        from PIL import PngImagePlugin
-                        meta = PngImagePlugin.PngInfo()
-                        if hasattr(target, 'text') and target.text:
-                            for k, v in target.text.items():
-                                if not k.lower().startswith("jfif"):
-                                    meta.add_text(k, str(v))
-                        for k, v in exif_dict.items():
-                            meta.add_text(str(k), str(v))
-                        target.save(path, pnginfo=meta)
-                    else:
-                        if exif_data_bytes:
-                            target.save(path, exif=exif_data_bytes)
-                        elif exif_dict:
-                            try:
-                                exif_obj = target.getexif()
-                                if exif_obj is None:
-                                    exif_obj = Image.Exif()
-                                for k, v in exif_dict.items():
-                                    if k in _TAGS_r:
-                                        tag_id = _TAGS_r[k]
-                                        try:
-                                            exif_obj[tag_id] = v
-                                        except Exception:
-                                            pass
-                                target.save(path, exif=exif_obj.tobytes())
-                            except Exception:
-                                target.save(path)
-                        else:
-                            target.save(path)
-                success_count += 1
-
-            msg = f"Successfully injected metadata into {success_count} images."
-            self.set_status(msg)
-            BatchCompleteDialog(self, "EXIF Injection Complete", msg).exec()
-        except Exception as e:
-            self.set_status(f"EXIF injection failed: {e}")
-
-    def batch_export_comfy_workflow(self):
-        """Exports ComfyUI workflows or prompts from selected PNG images to JSON reports named imageName_workflow.json."""
-        paths = self._get_target_file_paths()
-        if not paths:
-            self.set_status("No images selected for ComfyUI workflow export.")
-            return
-
-        export_dir = QFileDialog.getExistingDirectory(self, "Select Export Directory for ComfyUI Workflows")
-        if not export_dir:
-            return
-
-        import json
-        success_count = 0
-        failed_count = 0
-
-        for path in paths:
-            if not path.lower().endswith(".png"):
-                continue  # ComfyUI workflows are stored exclusively in PNG metadata
-
-            try:
-                workflow_content = None
-                with Image.open(path) as img:
-                    if hasattr(img, "text") and img.text:
-                        for key in ["workflow", "prompt"]:
-                            if key in img.text:
-                                workflow_content = img.text[key]
-                                break
-
-                if workflow_content:
-                    base_name = os.path.splitext(os.path.basename(path))[0]
-                    out_json = os.path.join(export_dir, f"{base_name}_workflow.json")
-                    try:
-                        parsed_json = json.loads(workflow_content)
-                        with open(out_json, "w", encoding="utf-8") as f:
-                            json.dump(parsed_json, f, indent=4)
-                    except Exception:
-                        # Fallback to saving raw string data if JSON parsing fails
-                        with open(out_json, "w", encoding="utf-8") as f:
-                            f.write(workflow_content)
-                    success_count += 1
-                else:
-                    failed_count += 1
-            except Exception as e:
-                failed_count += 1
-                print(f"Failed to export workflow for {path}: {e}")
-
-        if success_count > 0:
-            msg = f"Successfully exported {success_count} ComfyUI workflow(s)."
-            if failed_count > 0:
-                msg += f" ({failed_count} skipped/failed)."
-            self.set_status(msg)
-            BatchCompleteDialog(self, "ComfyUI Workflow Export Complete", msg).exec()
-        else:
-            self.set_status("No valid ComfyUI workflows found in the selected images.")
-            BatchCompleteDialog(self, "Export Failed",
-                                "No valid ComfyUI workflows found in the selected images.").exec()
-
-    #  -----------settings menu functions--------------
     def open_settings_dialog(self):
         self.set_status("Opening Settings Window...")
         self._active_dialog = SettingsDialog(self)
         if self._active_dialog.exec() == QDialog.DialogCode.Accepted:
-            # Refresh the grid cache limit dynamically right after settings are saved
+            updated_settings = load_settings(SETTINGS_FILE)
+            if hasattr(self, "menu_bar") and self.menu_bar is not None:
+                self.menu_bar.update_favorites(
+                    updated_settings.get("favorites", []),
+                    max_favorites=updated_settings.get("max_favorites", 15),
+                )
+            self._refresh_cached_jpeg_quality()
+            self._apply_scroll_speed_setting()
             if hasattr(self.workspace_grid, 'update_cache_limit_from_settings'):
                 self.workspace_grid.update_cache_limit_from_settings()
             self.apply_concurrency_settings()
 
-            # Trigger cleanup immediately if disk limit was adjusted
+            if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
+                self.thumb_db_cache.purge_loose_jpeg_files()
             self.thread_pool.start(CacheCleanupTask(self.thumb_cache_dir))
 
-            # Invalidate cached folder scans so child-folder / depth changes take effect
             self.folder_scan_cache.clear()
             if self.current_watched_dir and os.path.isdir(self.current_watched_dir):
-                self._sync_file_watcher_paths(self.current_watched_dir)
-                self.load_images_from_folder(self.current_watched_dir)
+                self.folder_sync.sync_file_watcher_paths(self.current_watched_dir)
+                self.folder_sync.perform_smooth_folder_sync()
+            elif not getattr(self.workspace_grid, "selected_file_paths", None):
+                self.set_footer_status(self.build_full_gallery_status())
 
         self.set_status("Ready")
 
-    #  -----------about menu functions--------------
     def show_about_dialog(self):
         self.set_status("Viewing About Dialog...")
-        # Store as instance variable
         AboutDialog(self).exec()
         self.set_status("Ready")
 
-    #  -----------directory changes watch--------------
-    def _on_directory_changed(self, path):
-        if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
-            return
+    def closeEvent(self, event):
+        self._is_closing = True
+        self.scan_id += 1
 
-        # Re-add watched folder if removed/recreated on Windows/network drives
-        if path and os.path.isdir(path) and path not in self.file_watcher.directories():
-            self.file_watcher.addPath(path)
+        if hasattr(self, "folder_sync") and self.folder_sync is not None:
+            self.folder_sync.prepare_for_close()
 
-        # Invalidate cached entry for whichever watched directory changed
-        if path:
-            self.folder_scan_cache.pop(path, None)
-            self.folder_scan_cache.pop(os.path.abspath(path), None)
-
-        # Use a short 300ms debounce timer to batch rapid-fire filesystem triggers together
-        if not hasattr(self, '_watcher_debounce_timer'):
-            self._watcher_debounce_timer = QTimer(self)
-            self._watcher_debounce_timer.setSingleShot(True)
-            self._watcher_debounce_timer.timeout.connect(self._perform_smooth_folder_sync)
-
-        self._watcher_debounce_timer.start(300)
-
-    def _collect_disk_image_paths(self):
-        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
-        settings = load_settings(SETTINGS_FILE)
-        include_subfolders = settings.get("include_child_folders", False)
-        max_depth = max(1, int(settings.get("child_folder_depth", 1)))
-
-        disk_files = set()
-        if not include_subfolders:
-            for f in os.listdir(self.current_watched_dir):
-                full_path = os.path.abspath(os.path.join(self.current_watched_dir, f))
-                if os.path.isfile(full_path) and os.path.splitext(f)[1].lower() in valid_exts:
-                    disk_files.add(full_path)
-            return disk_files
-
-        base_depth = len(os.path.normpath(self.current_watched_dir).split(os.sep))
-        for root, dirs, files in os.walk(self.current_watched_dir, followlinks=False, onerror=lambda e: None):
-            current_depth = len(os.path.normpath(root).split(os.sep)) - base_depth
-            if current_depth >= max_depth:
-                dirs[:] = []
-
-            for f in files:
-                if os.path.splitext(f)[1].lower() in valid_exts:
-                    disk_files.add(os.path.abspath(os.path.join(root, f)))
-
-        return disk_files
-
-    def _build_external_item(self, file_path):
-        file_name = os.path.basename(file_path)
-        try:
-            stats = os.stat(file_path)
-            size = stats.st_size
-            mtime = stats.st_mtime
-        except OSError:
-            size = 0
-            mtime = 0
-
-        has_comfy = False
-        if file_path.lower().endswith(".png"):
+        if hasattr(self, "file_watcher") and self.file_watcher is not None:
             try:
-                with Image.open(file_path) as img:
-                    if hasattr(img, "text") and img.text and ("workflow" in img.text or "prompt" in img.text):
-                        has_comfy = True
+                dirs = self.file_watcher.directories()
+                if dirs:
+                    self.file_watcher.removePaths(dirs)
             except Exception:
                 pass
 
-        return {
-            "file_path": file_path,
-            "filename": file_name.lower(),
-            "display_name": (file_name[:16] + '..') if len(file_name) > 18 else file_name,
-            "size": size,
-            "mtime": mtime,
-            "thumb_path": None,
-            "has_comfy": has_comfy,
-        }
+        for timer_attr in ("grid_repaint_timer", "_keep_selected_timer", "_status_throttle_timer"):
+            timer = getattr(self, timer_attr, None)
+            if timer is not None:
+                try:
+                    timer.stop()
+                except Exception:
+                    pass
 
-    def _sort_loaded_items_quietly(self):
-        criteria = self.current_sort_criteria
-        is_rev = self.sort_reverse
-        if criteria == "name":
-            self.loaded_items.sort(
-                key=lambda x: (os.path.dirname(x.get("file_path", "")).lower(), x.get("filename", "")),
-                reverse=is_rev,
-            )
-        elif criteria == "date":
-            self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=not is_rev)
-        elif criteria == "size":
-            self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
-
-    def _perform_smooth_folder_sync(self):
-        """Smart sync that checks for new/external file changes without harsh UI resets."""
-        if not self.current_watched_dir or not os.path.exists(self.current_watched_dir):
-            return
-
-        try:
-            self._sync_file_watcher_paths(self.current_watched_dir)
-
-            current_disk_files = self._collect_disk_image_paths()
-            loaded_map = {os.path.abspath(item["file_path"]): item for item in self.loaded_items}
-            loaded_paths = set(loaded_map.keys())
-
-            if current_disk_files == loaded_paths:
-                return
-
-            removed_paths = loaded_paths - current_disk_files
-            added_paths = sorted(current_disk_files - loaded_paths)
-
-            v_bar = self.scroll_area.verticalScrollBar()
-            prev_scroll = v_bar.value()
-            prev_selected = set(getattr(self.workspace_grid, "selected_file_paths", set()))
-
-            if removed_paths:
-                self.loaded_items = [
-                    item for item in self.loaded_items
-                    if os.path.abspath(item["file_path"]) not in removed_paths
-                ]
-                for rp in removed_paths:
-                    if hasattr(self.workspace_grid, "pixmap_cache"):
-                        self.workspace_grid.pixmap_cache.pop(rp, None)
-
-            new_items = []
-            for ap in added_paths:
-                item = self._build_external_item(ap)
-                self.loaded_items.append(item)
-                new_items.append(item)
-
-            self._rebuild_path_index()
-            if removed_paths or added_paths:
-                self._sort_loaded_items_quietly()
-
-            if self.current_watched_dir in self.folder_scan_cache:
-                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
-
-            self.workspace_grid.set_cards(self.loaded_items)
-            if hasattr(self.workspace_grid, "selected_file_paths"):
-                self.workspace_grid.selected_file_paths = {
-                    p for p in prev_selected if os.path.abspath(p) in current_disk_files
-                }
-                self.workspace_grid.update()
-
-            QTimer.singleShot(0, lambda pos=prev_scroll: v_bar.setValue(pos))
-
-            for item in new_items:
-                if not self.workspace_grid.has_cached_pixmap(item["file_path"]):
-                    task = ThumbnailLoaderTask(
-                        item["file_path"],
-                        self.thumb_cache_dir,
-                        self.CARD_IMAGE_SIZE,
-                        self.thumbnail_signals,
-                        scan_id=self.scan_id,
-                        active_scan_getter=self._get_active_scan_id,
-                        existing_thumb_path=item.get("thumb_path"),
-                    )
-                    self.thread_pool.start(task)
-        except Exception as e:
-            print(f"Error during smooth folder sync: {e}")
-
-    # def mousePressEvent(self, event):
-    #     self.handle_mouse_press(self, event)
-    #
-    # def mouseMoveEvent(self, event):
-    #     self.handle_mouse_move(self, event)
-
-    def closeEvent(self, event):
         settings = load_settings(SETTINGS_FILE)
 
-        # 1. Wait for any active background thread tasks to finish cleanly
         print("Closing the app, Wait for any active background thread tasks to finish cleanly")
         self.thread_pool.waitForDone()
+        if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None and not settings.get("purge_thumb_cache_on_exit", False):
+            self.thumb_db_cache.flush()
 
-        # Flush staged undo-deleted files to the system Recycle Bin on exit
-        if hasattr(self, "_undo_trash_dir") and os.path.exists(self._undo_trash_dir):
-            try:
-                from send2trash import send2trash
-                for fname in os.listdir(self._undo_trash_dir):
-                    fpath = os.path.join(self._undo_trash_dir, fname)
-                    if os.path.exists(fpath):
-                        send2trash(fpath)
-                shutil.rmtree(self._undo_trash_dir, ignore_errors=True)
-            except Exception as e:
-                print(f"Error flushing staged deletes to Recycle Bin: {e}")
+        self.file_ops.flush_staged_trash_to_recycle_bin()
 
-        # 2. Purge thumbnail cache on exit if enabled
         if settings.get("purge_thumb_cache_on_exit", False):
             try:
+                if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
+                    self.thumb_db_cache.clear_all()
+                    self.thumb_db_cache.close()
                 if os.path.exists(self.thumb_cache_dir):
-                    shutil.rmtree(self.thumb_cache_dir)
-                    os.makedirs(self.thumb_cache_dir, exist_ok=True)
+                    for fname in os.listdir(self.thumb_cache_dir):
+                        fpath = os.path.join(self.thumb_cache_dir, fname)
+                        try:
+                            if os.path.isfile(fpath) or os.path.islink(fpath):
+                                os.remove(fpath)
+                            elif os.path.isdir(fpath):
+                                shutil.rmtree(fpath)
+                        except OSError:
+                            pass
                     print("purge_thumb_cache_on_exit: DONE")
             except Exception as e:
                 print(f"Error purging thumbnail cache: {e}")
 
-        # 3. Keep-alive check for detached viewers
         keep_alive = settings.get("keep_detached_viewers_alive", False)
         if hasattr(self, 'detached_viewers') and not keep_alive:
             for viewer in list(self.detached_viewers):
@@ -1752,4 +1232,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     except RuntimeError:
                         pass
 
+        if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
+            self.thumb_db_cache.close()
         event.accept()
+
+        if hasattr(self, "resize_handle") and self.resize_handle is not None:
+            try:
+                self.resize_handle.hide()
+                self.resize_handle.setUpdatesEnabled(False)
+            except Exception:
+                pass

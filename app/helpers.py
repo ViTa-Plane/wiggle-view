@@ -1,5 +1,6 @@
 import os
 import json
+import tempfile
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
 
@@ -8,6 +9,7 @@ DEFAULT_SETTINGS = {
     "last_folder": "",
     "keep_detached_viewers_alive": False,
     "favorites": [],
+    "max_favorites": 15,
     "sort_criteria": "name",
     "sort_reverse": False,
     "theme_style": "Cool Blue-Slate (Default)",
@@ -16,18 +18,21 @@ DEFAULT_SETTINGS = {
     "smooth_scaling": True,
     "purge_thumb_cache_on_exit": False,
     "encrypt_thumbnail_cache": True,
-    "max_thumbnail_cache": "Auto (System RAM)",  # Default to a tighter memory footprint
+    "max_thumbnail_cache": "Auto (System RAM)",
     "thumbnail_jpeg_quality": 88,
     "disk_cache_limit_mb": "Disabled",
     "thread_pool_concurrency": "Auto (Max Cores)",
     "confirm_on_delete": True,
     "loop_gallery_navigation": True,
-    "include_child_folders": False,
-    "child_folder_depth": 1,
+    "include_subfolders": False,
+    "subfolder_depth": 1,
+    "scroll_speed": 15,
     "default_zoom_mode": "Fit to Window (Default)",
     "invert_mouse_wheel_zoom": False,
+    "mouse_zoom": True,
     "viewer_always_on_top": True
 }
+
 
 def load_settings(settings_file="settings.json"):
     """Loads settings from JSON, merging with defaults so new keys are always present."""
@@ -42,19 +47,33 @@ def load_settings(settings_file="settings.json"):
             print(f"Error loading settings: {e}")
     return settings
 
+
 def save_settings(settings_file="settings.json", new_values=None):
-    """Safely updates and persists settings to JSON without losing other keys."""
-    # Load current settings first to preserve existing values
+    """Safely updates and persists settings to JSON atomically without losing other keys."""
     current_settings = load_settings(settings_file)
 
     if new_values and isinstance(new_values, dict):
         current_settings.update(new_values)
 
     try:
-        with open(settings_file, "w", encoding="utf-8") as f:
-            json.dump(current_settings, f, indent=4)
+        abs_settings = os.path.abspath(settings_file)
+        target_dir = os.path.dirname(abs_settings) or "."
+        os.makedirs(target_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".settings_", suffix=".tmp", dir=target_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(current_settings, f, indent=4)
+            os.replace(tmp_path, abs_settings)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
     except Exception as e:
         print(f"Error saving settings: {e}")
+
 
 def format_file_size(b_size):
     """Converts raw byte size into a clean human-readable KB or MB string."""
@@ -63,13 +82,24 @@ def format_file_size(b_size):
     else:
         return f"{b_size / 1024:.1f} KB"
 
+
 def extract_exif_metadata(file_path):
     """Extracts and formats comprehensive EXIF metadata and image info headers."""
     exif_text = "<b>EXIF Camera Data:</b><br><br>"
     found_exif = False
     try:
         with Image.open(file_path) as img:
-            raw_exif = img._getexif()
+            raw_exif = None
+            try:
+                raw_exif = img.getexif()
+            except Exception:
+                pass
+            if not raw_exif and hasattr(img, "_getexif"):
+                try:
+                    raw_exif = img._getexif()
+                except Exception:
+                    pass
+
             exif_dict = {}
 
             if raw_exif:
@@ -117,6 +147,7 @@ def extract_exif_metadata(file_path):
 
     return exif_text
 
+
 def extract_image_metadata(path):
     """
     Extracts raw binary EXIF bytes and a complete human-readable metadata dictionary
@@ -132,10 +163,8 @@ def extract_image_metadata(path):
 
     try:
         with Image.open(path) as src:
-            # 1. Grab raw binary EXIF bytes block
             exif_data_bytes = src.info.get('exif')
 
-            # 2. If it's a WebP or format with hidden EXIF bytes, load via Image.Exif() directly from bytes
             loaded_exif = None
             if exif_data_bytes:
                 try:
@@ -157,12 +186,10 @@ def extract_image_metadata(path):
                     except Exception:
                         pass
 
-                # Parse root tags (IFD0)
                 for tag_id, val in loaded_exif.items():
                     tag_name = TAGS.get(tag_id, tag_id)
                     exif_dict[str(tag_name)] = _clean_metadata_value(val)
 
-                # Parse sub-IFDs (Exif, GPS, Interop)
                 for ifd_tag, tag_lookup in [(EXIF_IFD_TAG, TAGS), (GPS_IFD_TAG, GPSTAGS), (INTEROP_IFD_TAG, TAGS)]:
                     try:
                         sub_ifd = loaded_exif.get_ifd(ifd_tag)
@@ -172,17 +199,16 @@ def extract_image_metadata(path):
                     except Exception:
                         pass
 
-            # 3. Fallback to _getexif()
-            try:
-                raw_exif = src._getexif()
-                if raw_exif:
-                    for k, v in raw_exif.items():
-                        tag_name = TAGS.get(k, k)
-                        exif_dict[str(tag_name)] = _clean_metadata_value(v)
-            except Exception:
-                pass
+            if hasattr(src, "_getexif"):
+                try:
+                    raw_exif = src._getexif()
+                    if raw_exif:
+                        for k, v in raw_exif.items():
+                            tag_name = TAGS.get(k, k)
+                            exif_dict[str(tag_name)] = _clean_metadata_value(v)
+                except Exception:
+                    pass
 
-            # 4. Extract standard info chunks (PNG text, etc.)
             if hasattr(src, 'info') and src.info:
                 for k, v in src.info.items():
                     if k not in ['exif', 'icc_profile', 'jfif'] and isinstance(v, (str, int, float, bytes)):
@@ -191,13 +217,13 @@ def extract_image_metadata(path):
     except Exception as e:
         print(f"Error extracting metadata from {path}: {e}")
 
-    # Strictly filter out JFIF technical header noise, empty keys, and raw digits
     filtered_exif_dict = {
         k: v for k, v in exif_dict.items()
         if k and not k.lower().startswith("jfif") and not k.isdigit() and str(v).strip()
     }
 
     return exif_data_bytes, filtered_exif_dict
+
 
 def _clean_metadata_value(val):
     if isinstance(val, bytes):
@@ -209,26 +235,25 @@ def _clean_metadata_value(val):
         return ", ".join(str(item) for item in val)
     return str(val)
 
+
 def add_folder_to_favorites(folder_path, settings_file="settings.json"):
-    """Adds a folder to favorites, moving it to the front if it exists, and limits the list to the last 6 added."""
+    """Adds a folder to favorites, moving it to the front if it exists, and caps by max_favorites."""
     settings = load_settings(settings_file)
     favorites = settings.get("favorites", [])
+    try:
+        max_favs = int(settings.get("max_favorites", 15))
+    except (TypeError, ValueError):
+        max_favs = 15
+    max_favs = max(1, max_favs)
 
-    # Normalize path for consistency
     norm_path = os.path.normpath(folder_path)
-
-    # Remove if already present so it gets pushed to the most recent position
     favorites = [p for p in favorites if os.path.normpath(p) != norm_path]
-
-    # Insert at the beginning (most recent)
     favorites.insert(0, folder_path)
+    favorites = favorites[:max_favs]
 
-    # Limit list to maximum 15 items
-    favorites = favorites[:15]
-
-    # Save back to settings
     save_settings(settings_file, {"favorites": favorites})
     return favorites
+
 
 def extract_comfyui_workflow(path):
     """Extracts raw ComfyUI workflow or prompt metadata from PNG info chunks if present."""
@@ -237,9 +262,7 @@ def extract_comfyui_workflow(path):
             if img.format == "PNG" and hasattr(img, "text") and img.text:
                 for key in ["workflow", "prompt"]:
                     if key in img.text:
-                        import json
                         try:
-                            # Pretty-print JSON for readable display
                             parsed = json.loads(img.text[key])
                             return json.dumps(parsed, indent=4)
                         except Exception:
@@ -248,16 +271,15 @@ def extract_comfyui_workflow(path):
         print(f"Error reading ComfyUI metadata: {e}")
     return None
 
+
 def get_optimal_thumbnail_cache_limit():
     """Calculates optimal RAM cache item count based on total system memory."""
     try:
         import psutil
         total_ram_gb = psutil.virtual_memory().total / (1024 ** 3)
     except ImportError:
-        # Fallback estimation if psutil is not installed (assume 16 GB standard)
         total_ram_gb = 16.0
 
-    # Allocate ~3% to 5% of total system RAM to thumbnail caching, capped reasonably
     if total_ram_gb <= 8.0:
         return 2000    # ~225 MB for 8GB RAM systems
     elif total_ram_gb <= 16.0:

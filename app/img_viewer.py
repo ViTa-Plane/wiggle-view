@@ -1,21 +1,20 @@
 import os
 from collections import OrderedDict
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame, QSizePolicy
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject, QTimer, QPointF
-from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QFont, QPen, QWheelEvent, QMouseEvent, QKeyEvent, \
-    QImageReader
-from .widgets import WindowDragHandler, ResizeHandleWidget
+from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader
+from .widgets import ResizeHandleWidget
 from .helpers import load_settings, save_settings
 
 
 class ImageLoaderSignals(QObject):
-    image_loaded = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
-    image_prefetched = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
-    full_res_loaded = Signal(str, QPixmap)  # file_path, loaded_full_pixmap
+    image_loaded = Signal(str, QImage, QSize)       # file_path, decoded_qimage, full_size
+    image_prefetched = Signal(str, QImage, QSize)   # file_path, decoded_qimage, full_size
+    full_res_loaded = Signal(str, QPixmap)          # file_path, loaded_full_pixmap
 
 
 def _decode_image_proxy(file_path):
-    """Helper to read and downsample (>2MP) images off the GUI thread using thread-safe QImage."""
+    """Read and downsample (>2MP) images off the GUI thread using thread-safe QImage."""
     reader = QImageReader(file_path)
     reader.setAutoTransform(True)
     orig_size = reader.size()
@@ -39,44 +38,70 @@ def _decode_image_proxy(file_path):
 class ImagePreloadTask(QRunnable):
     """Background task to prefetch adjacent images into a thread-safe QImage for RAM caching."""
 
-    def __init__(self, file_path, signals):
+    def __init__(self, file_path, signals, is_closing_getter=None):
         super().__init__()
         self.file_path = file_path
         self.signals = signals
+        self.is_closing_getter = is_closing_getter
+
+    def _is_closing(self):
+        return callable(self.is_closing_getter) and self.is_closing_getter()
 
     def run(self):
-        if self.file_path and os.path.exists(self.file_path):
-            image, orig_size = _decode_image_proxy(self.file_path)
-            if not image.isNull():
+        if self._is_closing() or not self.file_path or not os.path.exists(self.file_path):
+            return
+        image, orig_size = _decode_image_proxy(self.file_path)
+        if not self._is_closing() and not image.isNull():
+            try:
                 self.signals.image_prefetched.emit(self.file_path, image, orig_size)
+            except RuntimeError:
+                pass
 
 
 class ImageLoaderTask(QRunnable):
     """Background worker task to load and decode huge images off the main GUI thread."""
 
-    def __init__(self, file_path, signals):
+    def __init__(self, file_path, signals, is_closing_getter=None):
         super().__init__()
         self.file_path = file_path
         self.signals = signals
+        self.is_closing_getter = is_closing_getter
+
+    def _is_closing(self):
+        return callable(self.is_closing_getter) and self.is_closing_getter()
 
     def run(self):
+        if self._is_closing():
+            return
         image, orig_size = _decode_image_proxy(self.file_path)
-        self.signals.image_loaded.emit(self.file_path, image, orig_size)
+        if not self._is_closing():
+            try:
+                self.signals.image_loaded.emit(self.file_path, image, orig_size)
+            except RuntimeError:
+                pass
 
 
 class FullResLoaderTask(QRunnable):
     """Background worker task to load full-resolution pixmaps asynchronously without freezing the UI."""
 
-    def __init__(self, file_path, signals):
+    def __init__(self, file_path, signals, is_closing_getter=None):
         super().__init__()
         self.file_path = file_path
         self.signals = signals
+        self.is_closing_getter = is_closing_getter
+
+    def _is_closing(self):
+        return callable(self.is_closing_getter) and self.is_closing_getter()
 
     def run(self):
-        if self.file_path and os.path.exists(self.file_path):
-            pixmap = QPixmap(self.file_path)
-            if not pixmap.isNull():
+        if self._is_closing() or not self.file_path or not os.path.exists(self.file_path):
+            return
+        pixmap = QPixmap(self.file_path)
+        if not self._is_closing() and not pixmap.isNull():
+            try:
                 self.signals.full_res_loaded.emit(self.file_path, pixmap)
+            except RuntimeError:
+                pass
 
 
 class ImageViewerCanvas(QWidget):
@@ -87,7 +112,7 @@ class ImageViewerCanvas(QWidget):
     close_requested = Signal()
     zoom_changed = Signal(float)
     focus_mode_toggled = Signal()
-    request_full_res = Signal(str)  # Signal to trigger async full-res loading
+    request_full_res = Signal(str)
 
     def __init__(self, pixmap, image_path, parent=None):
         super().__init__(parent)
@@ -102,6 +127,12 @@ class ImageViewerCanvas(QWidget):
         self.setMouseTracking(True)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent, True)
         self._initial_fit_calculated = False
+        self._full_res_requested_for = None
+
+        # Cached viewer preferences (updated by parent window without per-frame disk I/O)
+        self.smooth_scaling = True
+        self.invert_mouse_wheel_zoom = False
+        self.mouse_zoom = True
 
         # Dragging state for right-click window movement
         self._is_right_dragging = False
@@ -111,6 +142,7 @@ class ImageViewerCanvas(QWidget):
         self.display_pixmap = pixmap
         self.image_path = image_path
         self.full_res_pixmap = None
+        self._full_res_requested_for = None
         self.reset_fit()
 
     def reset_fit(self):
@@ -130,7 +162,6 @@ class ImageViewerCanvas(QWidget):
         center_pos = QPointF(self.width() / 2.0, self.height() / 2.0)
         scale_ratio = self.zoom / old_zoom
 
-        # Use QPointF to safely multiply by float scale_ratio
         offset_f = QPointF(self.offset)
         self.offset = (center_pos - (center_pos - offset_f) * scale_ratio).toPoint()
 
@@ -140,20 +171,24 @@ class ImageViewerCanvas(QWidget):
 
     def check_full_res_load(self):
         if self.zoom > 1.2 and self.full_res_pixmap is None:
-            if self.image_path and os.path.exists(self.image_path):
-                # Trigger asynchronous background loading instead of synchronous blocking
+            if self.image_path and self._full_res_requested_for != self.image_path and os.path.exists(self.image_path):
+                self._full_res_requested_for = self.image_path
                 self.request_full_res.emit(self.image_path)
 
     def wheelEvent(self, event: QWheelEvent):
         angle = event.angleDelta().y()
+        if angle == 0:
+            return
 
-        # Check settings for inverted zoom
-        from .helpers import load_settings
-        settings = load_settings()
-        invert = settings.get("invert_mouse_wheel_zoom", False)
+        if not self.mouse_zoom:
+            if angle < 0:
+                self.navigate_requested.emit(1)
+            elif angle > 0:
+                self.navigate_requested.emit(-1)
+            event.accept()
+            return
 
-        # Invert step behavior if enabled
-        if invert:
+        if self.invert_mouse_wheel_zoom:
             zoom_multiplier = 0.85 if angle > 0 else 1.15
         else:
             zoom_multiplier = 1.15 if angle > 0 else 0.85
@@ -164,10 +199,9 @@ class ImageViewerCanvas(QWidget):
             return
 
         self.zoom = new_zoom
-        mouse_pos = event.position()  # QPointF
+        mouse_pos = event.position()
         scale_ratio = self.zoom / old_zoom
 
-        # Use QPointF for float scaling math
         offset_f = QPointF(self.offset)
         self.offset = (mouse_pos - (mouse_pos - offset_f) * scale_ratio).toPoint()
 
@@ -181,7 +215,6 @@ class ImageViewerCanvas(QWidget):
     def mousePressEvent(self, event: QMouseEvent):
         window = self.window()
 
-        # 1. Handle Right Button (Window Dragging / Fullscreen guard)
         if event.button() == Qt.MouseButton.RightButton:
             if window and window.isFullScreen():
                 event.ignore()
@@ -193,13 +226,11 @@ class ImageViewerCanvas(QWidget):
             event.accept()
             return
 
-        # 2. Handle Middle Button (Toggle Focus Mode)
         if event.button() == Qt.MouseButton.MiddleButton:
             self.focus_mode_toggled.emit()
             event.accept()
             return
 
-        # 3. Handle Mouse Side Buttons (Back / Forward navigation)
         if event.button() == Qt.MouseButton.BackButton:
             self.navigate_requested.emit(-1)
             event.accept()
@@ -209,7 +240,6 @@ class ImageViewerCanvas(QWidget):
             event.accept()
             return
 
-        # 4. Handle Left Button (Image Panning / Dragging)
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = True
             self.drag_start = event.position().toPoint() - self.offset
@@ -220,17 +250,15 @@ class ImageViewerCanvas(QWidget):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent):
-        # Handle Left-button panning/dragging movement
         if self.dragging:
             self.offset = event.position().toPoint() - self.drag_start
             self.update()
             event.accept()
             return
 
-        # Handle Right-button window dragging (ignored if full-screen)
         window = self.window()
         if self._is_right_dragging and (event.buttons() & Qt.MouseButton.RightButton):
-            if window and not window.isFullScreen() and self._drag_start_pos:
+            if window and not window.isFullScreen() and self._drag_start_pos is not None:
                 window.move(event.globalPosition().toPoint() - self._drag_start_pos)
                 event.accept()
                 return
@@ -238,13 +266,11 @@ class ImageViewerCanvas(QWidget):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent):
-        # Handle Left-button release
         if event.button() == Qt.MouseButton.LeftButton:
             self.dragging = False
             self.setCursor(Qt.CursorShape.OpenHandCursor)
             event.accept()
 
-        # Handle Right-button release
         if event.button() == Qt.MouseButton.RightButton and self._is_right_dragging:
             self._is_right_dragging = False
             self._drag_start_pos = None
@@ -260,14 +286,7 @@ class ImageViewerCanvas(QWidget):
 
     def paintEvent(self, event):
         painter = QPainter(self)
-
-        # Check dynamic smooth scaling setting
-        settings = load_settings()
-        smooth_enabled = settings.get("smooth_scaling", True)
-
-        render_hint = QPainter.RenderHint.SmoothPixmapTransform if smooth_enabled else QPainter.RenderHint(0)
-        painter.setRenderHint(render_hint, smooth_enabled)
-
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, self.smooth_scaling)
         painter.fillRect(self.rect(), QColor("#05070a"))
 
         active_pixmap = (
@@ -281,6 +300,8 @@ class ImageViewerCanvas(QWidget):
 
         widget_size = self.size()
         pixmap_size = active_pixmap.size()
+        if pixmap_size.width() <= 0 or pixmap_size.height() <= 0:
+            return
 
         fit_scale = min(
             widget_size.width() / pixmap_size.width(),
@@ -291,7 +312,6 @@ class ImageViewerCanvas(QWidget):
         scaled_w = int(pixmap_size.width() * current_scale)
         scaled_h = int(pixmap_size.height() * current_scale)
 
-        # Recalculate true dead-center offset if fit hasn't been calculated or window resized
         if not self._initial_fit_calculated:
             x = (widget_size.width() - scaled_w) // 2
             y = (widget_size.height() - scaled_h) // 2
@@ -313,7 +333,6 @@ class ImageViewerCanvas(QWidget):
             return 1.0
 
         widget_size = self.size()
-        # Fall back to parent or default dimensions if layout hasn't settled yet
         if widget_size.width() <= 1 or widget_size.height() <= 1:
             if self.parent() and hasattr(self.parent(), 'size') and self.parent().width() > 1:
                 widget_size = self.parent().size()
@@ -324,20 +343,16 @@ class ImageViewerCanvas(QWidget):
         if pixmap_size.width() == 0 or pixmap_size.height() == 0:
             return self.zoom
 
-        # Calculate the true fit-to-window scale factor
         fit_scale = min(
             widget_size.width() / pixmap_size.width(),
             widget_size.height() / pixmap_size.height()
         )
-
-        # When zoom is at baseline 1.0, the effective zoom IS the fit scale
         return fit_scale * self.zoom
 
     def resizeEvent(self, event):
         old_size = event.oldSize()
         new_size = event.size()
 
-        # If toggling focus mode, anchor the pan offset using center delta
         if getattr(self, '_is_toggling_focus', False):
             if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0:
                 old_center = QPointF(old_size.width() / 2.0, old_size.height() / 2.0)
@@ -347,7 +362,6 @@ class ImageViewerCanvas(QWidget):
             super().resizeEvent(event)
             return
 
-        # Keep the visual center anchored during window resize using QPointF
         if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0 and not self.display_pixmap.isNull():
             active_pixmap = (
                 self.full_res_pixmap
@@ -378,7 +392,6 @@ class ImageViewerWindow(QWidget):
     instant proxy loading for huge images (>2MP), background neighbor prefetching,
     cursor-centered zooming, click-and-drag panning, and navigation.
     """
-    # Persistent shared cache across viewer instances so closed/prefetched images stay cached
     _SHARED_PIXMAP_CACHE = OrderedDict()
     _MAX_CACHE_ITEMS = 30
 
@@ -387,13 +400,14 @@ class ImageViewerWindow(QWidget):
             parent = items_list
             items_list = getattr(parent, "loaded_items", [])
 
-        QWidget.__init__(self, parent)
-        WindowDragHandler.__init__(self)  # Initialize the drag handler mixin
+        super().__init__(parent)
 
+        self._closing = False
         self.image_path = image_path
-        self.items = items_list or []
+        self.items = list(items_list) if items_list else []
         self.main_parent = parent
-        self._is_focus_mode = False  # Track middle-click focus mode state
+        self._is_focus_mode = False
+        self._resize_edge = None
 
         self.current_index = 0
         for i, item in enumerate(self.items):
@@ -405,21 +419,21 @@ class ImageViewerWindow(QWidget):
         self.resize(900, 650)
         self.setMinimumSize(300, 280)
 
-        # Check settings for always on top, default to True
         settings = load_settings()
         self.is_always_on_top = settings.get("viewer_always_on_top", True)
+        self._prefetch_enabled = settings.get("prefetch_images", True)
+        self._loop_navigation = settings.get("loop_gallery_navigation", True)
+        self._smooth_scaling = settings.get("smooth_scaling", True)
+        self._invert_wheel_zoom = settings.get("invert_mouse_wheel_zoom", False)
+        self._mouse_zoom = bool(settings.get("mouse_zoom", True))
 
-        flags = (
-                Qt.WindowType.Window |
-                Qt.WindowType.FramelessWindowHint
-        )
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         if self.is_always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
 
         self.setWindowFlags(flags)
-        
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
-        self.setMouseTracking(True)  # Required for edge hovering
+        self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
         self.thread_pool = QThreadPool.globalInstance()
@@ -432,21 +446,20 @@ class ImageViewerWindow(QWidget):
         self.full_pixmap_size = QSize(0, 0)
 
         self._setup_viewer_ui()
+        self.canvas.smooth_scaling = self._smooth_scaling
+        self.canvas.invert_mouse_wheel_zoom = self._invert_wheel_zoom
+        self.canvas.mouse_zoom = self._mouse_zoom
         self.setFocus()
 
-        # Only trigger startup fullscreen for main ImageViewerWindow, NOT detached pinned viewers
         if type(self) is ImageViewerWindow:
-            settings = load_settings()
             if settings.get("default_zoom_mode", "") == "Fill Screen":
                 QTimer.singleShot(50, self.toggle_fullscreen)
 
-        # Start loading immediately (pulls instantly from shared cache if previously viewed)
         self.load_image_threaded(self.image_path)
-
-        # Guarantee initial zoom reads correctly right after layout settles
         QTimer.singleShot(30, self.update_title_zoom)
 
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    def _is_closing(self):
+        return self._closing
 
     def enterEvent(self, event):
         """Automatically activate window and grant keyboard focus when the mouse hovers over."""
@@ -467,6 +480,9 @@ class ImageViewerWindow(QWidget):
             cache.popitem(last=False)
 
     def load_image_threaded(self, path):
+        if self._closing:
+            return
+
         cache = ImageViewerWindow._SHARED_PIXMAP_CACHE
         if path in cache:
             pixmap, full_size = cache[path]
@@ -478,10 +494,13 @@ class ImageViewerWindow(QWidget):
         file_title = os.path.basename(path)
         self.title_label.setText(f"🔍 Loading: {file_title}...")
 
-        task = ImageLoaderTask(path, self.loader_signals)
+        task = ImageLoaderTask(path, self.loader_signals, is_closing_getter=self._is_closing)
         self.thread_pool.start(task)
 
     def on_image_loaded(self, file_path, image, full_size):
+        if self._closing or image.isNull():
+            return
+
         pixmap = QPixmap.fromImage(image)
         self._store_in_cache(file_path, pixmap, full_size)
 
@@ -493,12 +512,17 @@ class ImageViewerWindow(QWidget):
 
     def on_image_prefetched(self, file_path, image, full_size):
         self.in_flight_prefetches.discard(file_path)
+        if self._closing or image.isNull():
+            return
+
         cache = ImageViewerWindow._SHARED_PIXMAP_CACHE
         if file_path not in cache:
             pixmap = QPixmap.fromImage(image)
             self._store_in_cache(file_path, pixmap, full_size)
 
     def on_full_res_loaded(self, file_path, pixmap):
+        if self._closing:
+            return
         if file_path == self.image_path:
             self.canvas.full_res_pixmap = pixmap
             self.canvas.update()
@@ -506,24 +530,23 @@ class ImageViewerWindow(QWidget):
 
     def request_async_full_res(self, file_path):
         """Starts background task to load full resolution image."""
-        if file_path and os.path.exists(file_path):
-            task = FullResLoaderTask(file_path, self.loader_signals)
+        if not self._closing and file_path and os.path.exists(file_path):
+            task = FullResLoaderTask(file_path, self.loader_signals, is_closing_getter=self._is_closing)
             self.thread_pool.start(task)
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
+        if self._closing:
+            return
+
         self.full_pixmap_size = full_size
 
-        # Update window dimensions to snugly fit the image aspect ratio with dynamic padding
         if full_size.isValid() and not self.isFullScreen():
-            # Dynamically measure actual widget and layout overheads instead of hardcoding
-            # 1. Horizontal padding: container layout left/right margins + frame borders
             h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
             main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
-            padding_w = h_margins + main_margins + 4  # 4px safety buffer for splitter/borders
+            padding_w = h_margins + main_margins + 4
 
-            # 2. Vertical padding: title container height + bottom layout + all margins & spacing
             title_h = self.title_container.sizeHint().height() if hasattr(self, 'title_container') else 30
-            bottom_h = 30  # Height allocated for the resize handle / bottom row
+            bottom_h = 30
             v_spacing = self.container_layout.spacing() * 2
             v_margins = self.container_layout.contentsMargins().top() + self.container_layout.contentsMargins().bottom()
             main_v_margins = self.main_layout.contentsMargins().top() + self.main_layout.contentsMargins().bottom()
@@ -535,12 +558,9 @@ class ImageViewerWindow(QWidget):
             img_aspect = img_w / img_h if img_h > 0 else 1.0
 
             screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
-
-            # Max allowed screen bounds
             max_w = screen_geom.width() - 100
             max_h = screen_geom.height() - 100
 
-            # Scale down proportionally if image exceeds screen dimensions
             target_w = img_w
             target_h = img_h
 
@@ -562,32 +582,30 @@ class ImageViewerWindow(QWidget):
             window_geom.moveCenter(center_point)
             self.move(window_geom.topLeft())
 
-        # Assign pixmap to canvas
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
         self.canvas.full_res_pixmap = None
+        self.canvas._full_res_requested_for = None
 
-        # Reset fit immediately, and schedule a safety re-center to guarantee layout is settled
         self.canvas.reset_fit()
         QTimer.singleShot(10, self.canvas.reset_fit)
-
         self.update_title_zoom()
 
     def update_title_zoom(self):
+        if self._closing:
+            return
         file_title = os.path.basename(self.image_path)
-        dim_info = f" ({self.full_pixmap_size.width()}x{self.full_pixmap_size.height()})" if self.full_pixmap_size.isValid() else ""
+        dim_info = (
+            f" ({self.full_pixmap_size.width()}x{self.full_pixmap_size.height()})"
+            if self.full_pixmap_size.isValid() else ""
+        )
 
         effective_scale = self.canvas.get_effective_zoom()
         zoom_pct = int(effective_scale * 100)
         self.title_label.setText(f"{file_title}{dim_info} ({zoom_pct}%)")
 
     def prefetch_neighbors(self):
-        # Respect dynamic prefetch setting
-        settings = load_settings()  # make sure load_settings is imported in img_viewer.py if not already
-        if not settings.get("prefetch_images", True):
-            return
-
-        if len(self.items) <= 1:
+        if self._closing or not self._prefetch_enabled or len(self.items) <= 1:
             return
 
         cache = ImageViewerWindow._SHARED_PIXMAP_CACHE
@@ -605,29 +623,41 @@ class ImageViewerWindow(QWidget):
             path = self.items[idx].get("file_path")
             if path and path != self.image_path and path not in cache and path not in self.in_flight_prefetches:
                 self.in_flight_prefetches.add(path)
-                self.thread_pool.start(ImagePreloadTask(path, self.loader_signals))
+                self.thread_pool.start(
+                    ImagePreloadTask(path, self.loader_signals, is_closing_getter=self._is_closing)
+                )
 
     def closeEvent(self, event):
+        self._closing = True
         if self.main_parent and hasattr(self.main_parent, 'workspace_grid'):
             self.main_parent.workspace_grid.selected_file_paths = {self.image_path}
             self.main_parent.workspace_grid.update()
             self.main_parent.on_card_selected(self.image_path, os.path.basename(self.image_path))
             self.main_parent.show()
+            if hasattr(self.main_parent, 'scroll_to_selected_thumbnail_in_grid'):
+                QTimer.singleShot(0, self.main_parent.scroll_to_selected_thumbnail_in_grid)
+            elif hasattr(self.main_parent.workspace_grid, 'scroll_to_selected'):
+                QTimer.singleShot(
+                    0, lambda: self.main_parent.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
+                )
         event.accept()
 
     def keyPressEvent(self, event: QKeyEvent):
         key = event.key()
         if key == Qt.Key.Key_Escape:
             if self._is_focus_mode:
-                self.toggle_focus_mode()  # Exit focus mode first on Esc if active
+                self.toggle_focus_mode()
             else:
                 self.close()
             event.accept()
-        elif key == Qt.Key.Key_Up:
+        elif key in (Qt.Key.Key_Up, Qt.Key.Key_Plus):
             self.canvas.zoom_by_step(1.15)
             event.accept()
-        elif key == Qt.Key.Key_Down:
+        elif key in (Qt.Key.Key_Down, Qt.Key.Key_Minus):
             self.canvas.zoom_by_step(0.85)
+            event.accept()
+        elif key == Qt.Key.Key_Space:
+            self.toggle_fullscreen()
             event.accept()
         elif key == Qt.Key.Key_Right:
             self.navigate(1)
@@ -639,25 +669,16 @@ class ImageViewerWindow(QWidget):
             super().keyPressEvent(event)
 
     def navigate(self, direction):
-        if not self.items:
+        if not self.items or self._closing:
             return
 
         new_index = self.current_index + direction
 
-        # --- Check setting for gallery navigation looping ---
-        from .helpers import load_settings  # Ensure load_settings is imported
-        settings = load_settings()
-        loop_enabled = settings.get("loop_gallery_navigation", True)
-
-        if not loop_enabled:
-            # Clamp index at boundaries if looping is disabled
+        if not self._loop_navigation:
             if new_index < 0 or new_index >= len(self.items):
                 return
 
-        # Apply wrapping if looping is enabled
         self.current_index = new_index % len(self.items)
-        # ---------------------------------------------------
-
         next_item = self.items[self.current_index]
         self.image_path = next_item["file_path"]
 
@@ -691,20 +712,16 @@ class ImageViewerWindow(QWidget):
         title_layout = QHBoxLayout(self.title_container)
         title_layout.setContentsMargins(4, 0, 4, 0)
 
-        # Always-on-top toggle button
-        self.pin_btn = QPushButton("📍" if self.is_always_on_top else "📌")
+        self.pin_btn = QPushButton("📌" if self.is_always_on_top else "📍")
         self.pin_btn.setFixedSize(28, 28)
         self.pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.pin_btn.setToolTip("Toggle Always on Top")
         self.pin_btn.setStyleSheet("""
-                           QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-size: 13px; }
-                           QPushButton:hover { background-color: #1e293b; color: #ffffff; }
-                       """)
+            QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-size: 13px; }
+            QPushButton:hover { background-color: #1e293b; color: #ffffff; }
+        """)
         self.pin_btn.clicked.connect(self.toggle_always_on_top)
-
-        # Insert pin button before close/minimize buttons in the title layout
         title_layout.addWidget(self.pin_btn)
-
 
         file_title = os.path.basename(self.image_path)
         self.title_label = QLabel(f"🔍 Loading: {file_title}...")
@@ -712,7 +729,6 @@ class ImageViewerWindow(QWidget):
         title_layout.addWidget(self.title_label)
 
         title_layout.addStretch()
-
 
         btn_close = QPushButton("✕")
         btn_close.setFixedSize(26, 26)
@@ -741,17 +757,15 @@ class ImageViewerWindow(QWidget):
         self.canvas.double_clicked.connect(self.toggle_fullscreen)
         self.canvas.navigate_requested.connect(self.navigate)
         self.canvas.close_requested.connect(self.close)
-        self.canvas.zoom_changed.connect(lambda z: self.update_title_zoom())
+        self.canvas.zoom_changed.connect(lambda _z: self.update_title_zoom())
         self.canvas.focus_mode_toggled.connect(self.toggle_focus_mode)
         self.canvas.request_full_res.connect(self.request_async_full_res)
         self.container_layout.addWidget(self.canvas, stretch=1)
 
-        # --- Add Resize Handle at the bottom right corner ---
         bottom_layout = QHBoxLayout()
         bottom_layout.setContentsMargins(0, 0, 0, 0)
         bottom_layout.addStretch()
 
-        # Instantiate your custom ResizeHandleWidget from widgets.py
         self.resize_grip = ResizeHandleWidget(self)
         bottom_layout.addWidget(self.resize_grip)
 
@@ -761,7 +775,7 @@ class ImageViewerWindow(QWidget):
     def toggle_focus_mode(self):
         """Toggles visibility of window canvas elements for a clean borderless image view."""
         if self.isFullScreen():
-            return  # Focus mode is designed for windowed mode
+            return
 
         self._is_focus_mode = not self._is_focus_mode
 
@@ -832,17 +846,13 @@ class ImageViewerWindow(QWidget):
 
     def toggle_always_on_top(self):
         self.is_always_on_top = not self.is_always_on_top
-        self.pin_btn.setText("📍" if self.is_always_on_top else "📌")
+        self.pin_btn.setText("📌" if self.is_always_on_top else "📍")
 
-        # Preserve geometry and visibility state when changing window flags
         pos = self.pos()
         size = self.size()
         was_visible = self.isVisible()
 
-        flags = (
-                Qt.WindowType.Window |
-                Qt.WindowType.FramelessWindowHint
-        )
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
         if self.is_always_on_top:
             flags |= Qt.WindowType.WindowStaysOnTopHint
 
@@ -850,11 +860,9 @@ class ImageViewerWindow(QWidget):
         if was_visible:
             self.show()
             self.setGeometry(QRect(pos, size))
-            # Bring window back to the front and ensure it retains active focus
             self.raise_()
             self.activateWindow()
 
-        # Persist to settings.json properly
         save_settings(new_values={"viewer_always_on_top": self.is_always_on_top})
 
     def _get_resize_edge(self, global_pos):
@@ -862,7 +870,6 @@ class ImageViewerWindow(QWidget):
         if self._is_focus_mode or self.isFullScreen():
             return None
 
-        # Map global position to local window coordinates safely
         local_pos = self.mapFromGlobal(global_pos.toPoint())
         margin = 8
         w = self.width()
@@ -875,14 +882,22 @@ class ImageViewerWindow(QWidget):
         top = y < margin
         bottom = y >= h - margin
 
-        if top and left: return "top_left"
-        if top and right: return "top_right"
-        if bottom and left: return "bottom_left"
-        if bottom and right: return "bottom_right"
-        if left: return "left"
-        if right: return "right"
-        if top: return "top"
-        if bottom: return "bottom"
+        if top and left:
+            return "top_left"
+        if top and right:
+            return "top_right"
+        if bottom and left:
+            return "bottom_left"
+        if bottom and right:
+            return "bottom_right"
+        if left:
+            return "left"
+        if right:
+            return "right"
+        if top:
+            return "top"
+        if bottom:
+            return "bottom"
         return None
 
     def mousePressEvent(self, event):
@@ -896,7 +911,6 @@ class ImageViewerWindow(QWidget):
                 event.accept()
                 return
 
-            # Check title bar local position for moving window (disabled in focus mode)
             if not self._is_focus_mode:
                 local_pos = self.mapFromGlobal(global_pos.toPoint())
                 if local_pos.y() < 40:
@@ -910,8 +924,7 @@ class ImageViewerWindow(QWidget):
 
         global_pos = event.globalPosition()
 
-        # Update cursor shape based on hover position when not actively resizing
-        if not hasattr(self, '_resize_edge') or not self._resize_edge:
+        if not self._resize_edge:
             edge = self._get_resize_edge(global_pos)
             if edge in ("top_left", "bottom_right"):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
@@ -924,8 +937,7 @@ class ImageViewerWindow(QWidget):
             else:
                 self.setCursor(Qt.CursorShape.ArrowCursor)
 
-        # Handle active resizing
-        if hasattr(self, '_resize_edge') and self._resize_edge:
+        if self._resize_edge:
             diff = global_pos.toPoint() - self._drag_pos
             geom = QRect(self._start_geometry)
 
@@ -943,7 +955,6 @@ class ImageViewerWindow(QWidget):
             event.accept()
             return
 
-        # Handle active window dragging from title bar
         if hasattr(self, '_drag_pos') and self.mapFromGlobal(global_pos.toPoint()).y() < 40:
             self.move(global_pos.toPoint() - self._drag_pos)
             event.accept()
@@ -970,8 +981,9 @@ class DetachedImageViewerWindow(ImageViewerWindow):
     """
 
     def __init__(self, image_path, items_list=None, parent=None):
-        self._is_first_open = True  # Initialize before super().__init__() because loading starts immediately
+        self._is_first_open = True
         super().__init__(image_path, items_list, parent=None)
+        self.main_parent = parent
 
         file_title = os.path.basename(image_path)
         self.setWindowTitle(f"Pinned Viewer: {file_title}")
@@ -984,9 +996,11 @@ class DetachedImageViewerWindow(ImageViewerWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
+        if self._closing:
+            return
+
         self.full_pixmap_size = full_size
 
-        # Center and resize using half screen bounds ONLY on first opening
         if self._is_first_open and full_size.isValid() and not self.isFullScreen():
             self._is_first_open = False
             h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
@@ -1006,8 +1020,6 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             img_aspect = img_w / img_h if img_h > 0 else 1.0
 
             screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
-
-            # Max allowed screen bounds (half screen)
             max_w = screen_geom.width() / 2
             max_h = screen_geom.height() / 2
 
@@ -1032,18 +1044,28 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             window_geom.moveCenter(center_point)
             self.move(window_geom.topLeft())
 
-        # Assign pixmap to canvas without changing position/size on subsequent image navigations
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
         self.canvas.full_res_pixmap = None
+        self.canvas._full_res_requested_for = None
 
         self.canvas.reset_fit()
         QTimer.singleShot(10, self.canvas.reset_fit)
-
         self.update_title_zoom()
 
     def closeEvent(self, event):
+        self._closing = True
         if self.main_parent and hasattr(self.main_parent, 'detached_viewers'):
             if self in self.main_parent.detached_viewers:
                 self.main_parent.detached_viewers.remove(self)
+            if (
+                hasattr(self.main_parent, 'workspace_grid')
+                and getattr(self.main_parent.workspace_grid, 'selected_file_paths', None)
+            ):
+                if hasattr(self.main_parent, 'scroll_to_selected_thumbnail_in_grid'):
+                    QTimer.singleShot(0, self.main_parent.scroll_to_selected_thumbnail_in_grid)
+                elif hasattr(self.main_parent.workspace_grid, 'scroll_to_selected'):
+                    QTimer.singleShot(
+                        0, lambda: self.main_parent.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
+                    )
         event.accept()

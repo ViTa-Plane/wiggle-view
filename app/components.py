@@ -27,21 +27,26 @@ class TopMenuBar(QMenuBar):
     export_comfy_workflow_requested = Signal()
     settings_requested = Signal()
 
-    def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False):
+    def __init__(self, parent=None, favorites=None, sort_criteria="name", sort_reverse=False, max_favorites=15):
         super().__init__(parent)
         self.sort_date_action = None
         self.sort_name_action = None
         self.sort_size_action = None
         self.sort_reverse_action = None
         self.favorites = favorites or []
+        self.max_favorites = max(1, int(max_favorites)) if max_favorites is not None else 15
         self.initial_sort_criteria = sort_criteria
         self.initial_sort_reverse = sort_reverse
         self.setup_ui()
 
-    def update_favorites(self, favorites_list):
+    def update_favorites(self, favorites_list, max_favorites=None):
         """Allows updating the favorites menu dynamically if settings change."""
-        self.favorites = favorites_list
-        # Rebuild or update favorites menu items here if needed
+        self.favorites = favorites_list or []
+        if max_favorites is not None:
+            try:
+                self.max_favorites = max(1, int(max_favorites))
+            except (TypeError, ValueError):
+                pass
         if hasattr(self, 'favorites_menu'):
             self.favorites_menu.clear()
             add_fav_action = QAction("⭐ Add to Favorites", self)
@@ -51,15 +56,14 @@ class TopMenuBar(QMenuBar):
             self._populate_favorites_actions()
 
     def _populate_favorites_actions(self):
-        """Helper method to populate favorite folder actions."""
-        if self.favorites:
-            for path in self.favorites:
-                if path and os.path.isdir(path):
-                    folder_name = os.path.basename(os.path.normpath(path))
-                    fav_action = QAction(folder_name, self)
-                    # Bind path securely using default argument in lambda
-                    fav_action.triggered.connect(lambda checked=False, p=path: self.favorite_selected.emit(p))
-                    self.favorites_menu.addAction(fav_action)
+        """Helper method to populate favorite folder actions up to max_favorites."""
+        valid_paths = [p for p in (self.favorites or []) if p and os.path.isdir(p)][:self.max_favorites]
+        if valid_paths:
+            for path in valid_paths:
+                folder_name = os.path.basename(os.path.normpath(path))
+                fav_action = QAction(folder_name, self)
+                fav_action.triggered.connect(lambda checked=False, p=path: self.favorite_selected.emit(p))
+                self.favorites_menu.addAction(fav_action)
         else:
             empty_action = QAction("(No favorites configured)", self)
             empty_action.setEnabled(False)
@@ -81,29 +85,22 @@ class TopMenuBar(QMenuBar):
             QMenu::item:selected { background-color: #1e293b; color: #ffffff; }
         """)
 
-        # --- File Menu ---
         file_menu = self.addMenu("File")
         open_action = QAction("Open...", self)
         open_action.triggered.connect(self.open_folder_requested.emit)
-
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.exit_requested.emit)
-
         file_menu.addAction(open_action)
         file_menu.addSeparator()
         file_menu.addAction(exit_action)
 
-        # --- Favorites Menu ---
         self.favorites_menu = self.addMenu("Favorites")
-        # Add "Add to Favorites" command at the top
         add_fav_action = QAction("⭐ Add to Favorites", self)
         add_fav_action.triggered.connect(self.add_favorite_requested.emit)
         self.favorites_menu.addAction(add_fav_action)
         self.favorites_menu.addSeparator()
-
         self._populate_favorites_actions()
 
-        # --- Sort Menu ---
         sort_menu = self.addMenu("Sort")
         self.sort_name_action = QAction("By Name", self, checkable=True)
         self.sort_name_action.setChecked(self.initial_sort_criteria == "name")
@@ -127,9 +124,7 @@ class TopMenuBar(QMenuBar):
         self.sort_reverse_action.triggered.connect(lambda checked: self.sort_reverse_toggled.emit(checked))
         sort_menu.addAction(self.sort_reverse_action)
 
-        # --- Select Menu ---
         select_menu = self.addMenu("Select")
-
         select_all_action = QAction("Select All", self)
         select_all_action.setShortcut("Ctrl+A")
         select_all_action.triggered.connect(self.select_all_requested.emit)
@@ -146,24 +141,17 @@ class TopMenuBar(QMenuBar):
         select_menu.addAction(deselect_action)
         select_menu.addAction(inverse_action)
 
-        # --- Tools Menu ---
         tools_menu = self.addMenu("Tools")
-
         convert_action = QAction("Convert...", self)
         convert_action.triggered.connect(self.convert_requested.emit)
-
         settings_action = QAction("Settings...", self)
         settings_action.triggered.connect(self.settings_requested.emit)
-
         purge_action = QAction("Purge EXIF data", self)
         purge_action.triggered.connect(self.purge_exif_requested.emit)
-
         inject_action = QAction("Inject EXIF data...", self)
         inject_action.triggered.connect(self.inject_exif_requested.emit)
-
         export_action = QAction("Export EXIF data...", self)
         export_action.triggered.connect(self.export_exif_requested.emit)
-
         export_comfy_action = QAction("Export ComfyUI Workflows...", self)
         export_comfy_action.triggered.connect(self.export_comfy_workflow_requested.emit)
 
@@ -176,7 +164,6 @@ class TopMenuBar(QMenuBar):
         tools_menu.addSeparator()
         tools_menu.addAction(settings_action)
 
-        # --- About Menu ---
         about_action = QAction("About", self)
         about_action.triggered.connect(self.about_requested.emit)
         self.addAction(about_action)
@@ -199,7 +186,6 @@ class SidebarPanel(QFrame):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        # Tab Widget container
         self.tab_widget = QTabWidget(self)
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane {
@@ -225,7 +211,6 @@ class SidebarPanel(QFrame):
             }
         """)
 
-        # 1. Inspector Tab
         inspector_tab = QWidget()
         inspector_layout = QVBoxLayout(inspector_tab)
         inspector_layout.setContentsMargins(10, 10, 10, 10)
@@ -236,7 +221,6 @@ class SidebarPanel(QFrame):
         inspector_layout.addStretch()
         self.tab_widget.addTab(inspector_tab, "Inspector")
 
-        # 2. EXIF Tab
         exif_tab = QWidget()
         exif_layout = QVBoxLayout(exif_tab)
         exif_layout.setContentsMargins(6, 6, 6, 6)
@@ -257,7 +241,6 @@ class SidebarPanel(QFrame):
         exif_layout.addWidget(self.exif_view)
         self.tab_widget.addTab(exif_tab, "EXIF")
 
-        # 3. Activity/Log Tab
         log_tab = QWidget()
         log_layout = QVBoxLayout(log_tab)
         log_layout.setContentsMargins(10, 10, 10, 10)
@@ -282,7 +265,7 @@ class SidebarPanel(QFrame):
 
 class DirectoryBrowserPanel(QFrame):
     """Interactive directory browsing panel"""
-    folder_selected = Signal(str)  # Emits selected directory path
+    folder_selected = Signal(str)
     files_dropped_on_folder = Signal(list, str)
 
     def __init__(self, parent=None):
@@ -298,6 +281,31 @@ class DirectoryBrowserPanel(QFrame):
                 border: 1px solid #1e293b;
                 border-radius: 8px;
             }
+            QMenu {
+                background-color: #0d1321;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 4px;
+            }
+            QMenu::item {
+                padding: 6px 20px;
+                border-radius: 4px;
+                color: #e2e8f0;
+                background-color: transparent;
+            }
+            QMenu::item:selected {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+            QMenu::item:disabled {
+                color: #64748b;
+            }
+            QMenu::separator {
+                height: 1px;
+                background: #1e293b;
+                margin: 4px 0px;
+            }
         """)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(8, 12, 8, 12)
@@ -309,14 +317,12 @@ class DirectoryBrowserPanel(QFrame):
         )
         layout.addWidget(title_label)
 
-        # File system model setup for directory browsing (using QDir filters)
         self.fs_model = QFileSystemModel()
         self.fs_model.setFilter(QDir.Filter.AllDirs | QDir.Filter.NoDotAndDotDot)
-        self.fs_model.setRootPath("")  # Root system path
+        self.fs_model.setRootPath("")
 
         self.tree_view = QTreeView()
         self.tree_view.setModel(self.fs_model)
-        # Hide extra columns (Size, Type, Date Modified) so only folder names show cleanly
         self.tree_view.setColumnHidden(1, True)
         self.tree_view.setColumnHidden(2, True)
         self.tree_view.setColumnHidden(3, True)
@@ -342,7 +348,6 @@ class DirectoryBrowserPanel(QFrame):
                     }
                 """)
 
-        # Enable drag-and-drop onto tree folders
         self.tree_view.setAcceptDrops(True)
         self.tree_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
         self.tree_view.setDropIndicatorShown(True)
@@ -352,10 +357,8 @@ class DirectoryBrowserPanel(QFrame):
         self.tree_view.dropEvent = self._tree_drop
 
         self.tree_view.clicked.connect(self.on_dir_clicked)
-
         layout.addWidget(self.tree_view)
 
-        # Quick action button at the bottom
         self.btn_browse = QPushButton("📂 Open in Explorer")
         self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_browse.setStyleSheet("""
@@ -373,11 +376,10 @@ class DirectoryBrowserPanel(QFrame):
             self.folder_selected.emit(dir_path)
 
     def set_selected_folder(self, folder_path):
-        """Expands parent tree hierarchy and selects/scrolls the target folder into view."""
         if folder_path and os.path.isdir(folder_path):
+            self.selected_folder_path = os.path.abspath(folder_path)
             index = self.fs_model.index(folder_path)
             if index.isValid():
-                # Expand all parent indexes up to root so deeply nested folders are visible
                 parent = index.parent()
                 while parent.isValid():
                     self.tree_view.expand(parent)
@@ -387,9 +389,48 @@ class DirectoryBrowserPanel(QFrame):
                 self.tree_view.scrollTo(index, QAbstractItemView.ScrollHint.PositionAtCenter)
                 self.tree_view.setCurrentIndex(index)
 
+    def scroll_to_selected_folder(self, folder_path=None, only_if_out_of_view=False, center_in_view=False):
+        target_path = folder_path or getattr(self, "selected_folder_path", None)
+        if not target_path or not os.path.isdir(target_path):
+            current_idx = self.tree_view.currentIndex()
+            if current_idx.isValid():
+                target_path = self.fs_model.filePath(current_idx)
+        if not target_path or not os.path.isdir(target_path):
+            return False
+
+        index = self.fs_model.index(os.path.abspath(target_path))
+        if not index.isValid():
+            return False
+
+        parent = index.parent()
+        while parent.isValid():
+            self.tree_view.expand(parent)
+            parent = parent.parent()
+
+        self.tree_view.setCurrentIndex(index)
+
+        if only_if_out_of_view and not center_in_view:
+            item_rect = self.tree_view.visualRect(index)
+            vp_rect = self.tree_view.viewport().rect()
+            if not item_rect.isEmpty() and vp_rect.contains(item_rect, proper=True):
+                return False
+
+        hint = (
+            QAbstractItemView.ScrollHint.PositionAtCenter
+            if center_in_view
+            else QAbstractItemView.ScrollHint.EnsureVisible
+        )
+        self.tree_view.scrollTo(index, hint)
+        return True
+
+    def _desired_drop_action(self, event):
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            return Qt.DropAction.CopyAction
+        return Qt.DropAction.MoveAction
+
     def _tree_drag_enter(self, event):
         if event.mimeData().hasUrls():
-            event.setDropAction(Qt.DropAction.MoveAction)
+            event.setDropAction(self._desired_drop_action(event))
             event.accept()
         else:
             event.ignore()
@@ -405,7 +446,7 @@ class DirectoryBrowserPanel(QFrame):
             target_path = self.fs_model.filePath(index)
             if os.path.isdir(target_path):
                 self.tree_view.setCurrentIndex(index)
-                event.setDropAction(Qt.DropAction.MoveAction)
+                event.setDropAction(self._desired_drop_action(event))
                 event.accept()
                 return
         event.ignore()
@@ -432,7 +473,8 @@ class DirectoryBrowserPanel(QFrame):
             if url.isLocalFile() and os.path.isfile(url.toLocalFile())
         ]
         if src_paths:
-            event.setDropAction(Qt.DropAction.MoveAction)
+            action = self._desired_drop_action(event)
+            event.setDropAction(action)
             event.accept()
             self.files_dropped_on_folder.emit(src_paths, target_folder)
         else:

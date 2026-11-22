@@ -184,6 +184,7 @@ cython_debug/
 /.idea
 /backup
 /assets
+
 run python embeded.bat
 start_backup_script.py
 update_version.py
@@ -191,5 +192,6 @@ settings.json
 
 /tmp
 /backup
+/exif
 update_version.py
 *.json
