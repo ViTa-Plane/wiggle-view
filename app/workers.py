@@ -1,3 +1,4 @@
+import io
 import os
 import struct
 import tempfile
@@ -260,6 +261,56 @@ class BatchConvertWorkerSignals(QObject):
     finished = Signal(int, int, str)
 
 
+def _prepare_image_for_target(img, target_ext):
+    """Materializes a standalone PIL Image with a mode supported by the target encoder."""
+    img.load()
+    has_palette_transparency = (
+        img.mode == "P" and "transparency" in getattr(img, "info", {})
+    )
+
+    if target_ext in ("jpg", "jpeg"):
+        if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
+            rgba = img.convert("RGBA")
+            try:
+                background = Image.new("RGB", rgba.size, (255, 255, 255))
+                background.paste(rgba, mask=rgba.split()[-1])
+                return background
+            finally:
+                rgba.close()
+        if img.mode != "RGB":
+            return img.convert("RGB")
+        return img.copy()
+
+    if target_ext == "webp":
+        # WebP encoder (libwebp) expects RGB or RGBA; materialize cleanly without fp ties
+        if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
+            converted = img.convert("RGBA")
+        elif img.mode in ("RGB", "RGBA"):
+            converted = img.copy()
+        else:
+            converted = img.convert("RGB")
+        # Ensure contiguous pixel buffer in RGB/RGBA
+        if converted.mode not in ("RGB", "RGBA"):
+            fixed = converted.convert("RGBA")
+            converted.close()
+            converted = fixed
+        return converted
+
+    if target_ext == "png":
+        if has_palette_transparency or img.mode in ("LA", "PA"):
+            return img.convert("RGBA")
+        return img.copy()
+
+    return img.copy()
+
+
+def _encode_image_bytes(img, save_format, save_kwargs):
+    """Encodes a PIL Image into memory via BytesIO to avoid direct path-open issues on worker threads."""
+    buf = io.BytesIO()
+    img.save(buf, format=save_format, **save_kwargs)
+    return buf.getvalue()
+
+
 class BatchConvertWorker(QRunnable):
     def __init__(self, paths, target_format, quality, transfer_exif, remove_original, signals):
         super().__init__()
@@ -277,8 +328,10 @@ class BatchConvertWorker(QRunnable):
         if target_ext == "jpg":
             target_ext = "jpeg"
         save_format = "JPEG" if target_ext == "jpeg" else self.target_format.upper()
+        clamped_quality = max(1, min(100, int(self.quality)))
 
         for path in self.paths:
+            img_to_save = None
             try:
                 base, _ = os.path.splitext(path)
                 new_path = f"{base}.{target_ext}"
@@ -289,50 +342,49 @@ class BatchConvertWorker(QRunnable):
                     _, exif_dict = extract_image_metadata(path)
 
                 with Image.open(path) as img:
-                    has_palette_transparency = (
-                        img.mode == "P" and "transparency" in getattr(img, "info", {})
-                    )
-                    if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
-                        img = img.convert("RGBA")
+                    img_to_save = _prepare_image_for_target(img, target_ext)
 
-                    if target_ext in ["jpg", "jpeg"] and img.mode in ("RGBA", "LA"):
-                        background = Image.new("RGB", img.size, (255, 255, 255))
-                        background.paste(img, mask=img.split()[-1])
-                        img_to_save = background
+                save_kwargs = {}
+                if target_ext in ("jpeg", "jpg", "webp"):
+                    save_kwargs["quality"] = clamped_quality
+                    if target_ext == "webp":
+                        save_kwargs["method"] = 4
+
+                if self.transfer_exif and exif_dict and target_ext != "webp":
+                    if target_ext == "png":
+                        meta = PngImagePlugin.PngInfo()
+                        for k, v in exif_dict.items():
+                            meta.add_text(str(k), str(v))
+                        save_kwargs["pnginfo"] = meta
                     else:
-                        img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
-
-                    save_kwargs = {}
-                    if target_ext in ["jpeg", "jpg", "webp"]:
-                        save_kwargs["quality"] = self.quality
-
-                    if self.transfer_exif and exif_dict:
-                        if target_ext == "png":
-                            meta = PngImagePlugin.PngInfo()
+                        try:
+                            exif_obj = img_to_save.getexif()
+                            if exif_obj is None:
+                                exif_obj = Image.Exif()
                             for k, v in exif_dict.items():
-                                meta.add_text(str(k), str(v))
-                            save_kwargs["pnginfo"] = meta
-                        else:
-                            try:
-                                exif_obj = img_to_save.getexif()
-                                if exif_obj is None:
-                                    exif_obj = Image.Exif()
-                                for k, v in exif_dict.items():
-                                    tag_id = TAGS.get(k) or GPSTAGS.get(k)
-                                    if tag_id is not None:
-                                        try:
-                                            exif_obj[tag_id] = v
-                                        except Exception:
-                                            pass
-                                save_kwargs["exif"] = exif_obj.tobytes()
-                            except Exception:
-                                pass
+                                tag_id = TAGS.get(k) or GPSTAGS.get(k)
+                                if tag_id is not None:
+                                    try:
+                                        exif_obj[tag_id] = v
+                                    except Exception:
+                                        pass
+                            exif_bytes = exif_obj.tobytes()
+                            if exif_bytes:
+                                save_kwargs["exif"] = exif_bytes
+                        except Exception:
+                            pass
 
-                    try:
-                        img_to_save.save(new_path, save_format, **save_kwargs)
-                    except Exception:
-                        fallback_kwargs = {"quality": self.quality} if target_ext in ["jpeg", "jpg", "webp"] else {}
-                        img_to_save.save(new_path, save_format, **fallback_kwargs)
+                try:
+                    encoded_bytes = _encode_image_bytes(img_to_save, save_format, save_kwargs)
+                except Exception:
+                    fallback_kwargs = {"quality": clamped_quality} if target_ext in ("jpeg", "jpg", "webp") else {}
+                    encoded_bytes = _encode_image_bytes(img_to_save, save_format, fallback_kwargs)
+
+                out_dir = os.path.dirname(os.path.abspath(new_path))
+                if out_dir:
+                    os.makedirs(out_dir, exist_ok=True)
+                with open(new_path, "wb") as out_f:
+                    out_f.write(encoded_bytes)
 
                 if self.remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
                     os.remove(path)
@@ -341,6 +393,12 @@ class BatchConvertWorker(QRunnable):
             except Exception as e:
                 failed_count += 1
                 print(f"Failed to convert {path}: {e}")
+            finally:
+                if img_to_save is not None:
+                    try:
+                        img_to_save.close()
+                    except Exception:
+                        pass
 
         qual_str = f" (Quality: {self.quality})" if self.target_format != "PNG" else ""
         msg = f"Successfully converted {success_count} images to {self.target_format}{qual_str}."
@@ -376,9 +434,9 @@ class ComfyMetadataScannerTask(QRunnable):
                 if _png_has_comfy_metadata(file_path):
                     batch.append(file_path)
 
-                if len(batch) >= 50:
-                    self.signals.comfy_batch_ready.emit(self.scan_id, batch)
-                    batch = []
+            if len(batch) >= 50:
+                self.signals.comfy_batch_ready.emit(self.scan_id, batch)
+                batch = []
 
         if batch and not self._is_cancelled():
             self.signals.comfy_batch_ready.emit(self.scan_id, batch)
