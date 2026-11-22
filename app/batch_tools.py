@@ -8,11 +8,63 @@ import time
 from PIL import Image, PngImagePlugin
 from PIL.ExifTags import TAGS
 from PySide6.QtCore import QObject, QRunnable, Signal
-from PySide6.QtWidgets import QApplication, QDialog, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from .dialogs import BatchCompleteDialog, BatchConvertDialog
 from .helpers import extract_image_metadata
 from .workers import BatchConvertWorker, BatchConvertWorkerSignals, ComfyMetadataScannerTask
+
+
+_CLEAR_DIALOG_SCROLLBAR_QSS = """
+QScrollBar,
+QScrollBar:vertical,
+QScrollBar:horizontal,
+QScrollBar::handle:vertical,
+QScrollBar::handle:horizontal,
+QScrollBar::add-line:vertical,
+QScrollBar::sub-line:vertical,
+QScrollBar::add-line:horizontal,
+QScrollBar::sub-line:horizontal,
+QScrollBar::add-page:vertical,
+QScrollBar::sub-page:vertical,
+QScrollBar::add-page:horizontal,
+QScrollBar::sub-page:horizontal {
+    background: palette(base);
+    color: palette(text);
+    border: none;
+    margin: 0px;
+    padding: 0px;
+    min-width: 0px;
+    min-height: 0px;
+}
+"""
+
+
+def _configure_non_native_file_dialog(
+    parent,
+    title,
+    start_dir="",
+    name_filter="",
+    directories_only=False,
+):
+    """Creates a non-native QFileDialog with scrollbar stylesheet overrides cleared."""
+    dialog = QFileDialog(parent, title, start_dir, name_filter)
+    dialog.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+    if directories_only:
+        dialog.setFileMode(QFileDialog.FileMode.Directory)
+        dialog.setOption(QFileDialog.Option.ShowDirsOnly, True)
+    else:
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+
+    # Clear inherited scrollbar stylesheet rules on the dialog and its child views
+    dialog.setStyleSheet(_CLEAR_DIALOG_SCROLLBAR_QSS)
+    for child in dialog.findChildren(QObject):
+        if hasattr(child, "setStyleSheet"):
+            try:
+                child.setStyleSheet(_CLEAR_DIALOG_SCROLLBAR_QSS)
+            except Exception:
+                pass
+    return dialog
 
 
 def _replace_with_retry(src_path, dst_path, is_closing=None, max_attempts=10, base_delay=0.05):
@@ -241,38 +293,39 @@ class BatchToolsController:
     def _select_open_file(self, title, start_dir="", name_filter=""):
         if self._is_closing() or self._picker_busy:
             return ""
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
         self._picker_busy = True
         try:
             parent = self.win if self.win is not None and self.win.isVisible() else None
-            source_file, _ = QFileDialog.getOpenFileName(
+            dialog = _configure_non_native_file_dialog(
                 parent,
                 title,
-                start_dir,
-                name_filter,
+                start_dir=start_dir,
+                name_filter=name_filter,
+                directories_only=False,
             )
-            return source_file or ""
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return ""
+            selected = dialog.selectedFiles()
+            return selected[0] if selected else ""
         finally:
             self._picker_busy = False
 
     def _select_existing_directory(self, title, start_dir=""):
         if self._is_closing() or self._picker_busy:
             return ""
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
         self._picker_busy = True
         try:
             parent = self.win if self.win is not None and self.win.isVisible() else None
-            export_dir = QFileDialog.getExistingDirectory(
+            dialog = _configure_non_native_file_dialog(
                 parent,
                 title,
-                start_dir,
-                QFileDialog.Option.ShowDirsOnly,
+                start_dir=start_dir,
+                directories_only=True,
             )
-            return export_dir or ""
+            if dialog.exec() != QDialog.DialogCode.Accepted:
+                return ""
+            selected = dialog.selectedFiles()
+            return selected[0] if selected else ""
         finally:
             self._picker_busy = False
 
@@ -330,9 +383,9 @@ class BatchToolsController:
                 parent_dir = os.path.dirname(ap)
                 if parent_dir:
                     folder_scan_cache.pop(parent_dir, None)
-            watched = getattr(self.win, "current_watched_dir", None)
-            if watched:
-                folder_scan_cache.pop(os.path.abspath(watched), None)
+                watched = getattr(self.win, "current_watched_dir", None)
+                if watched:
+                    folder_scan_cache.pop(os.path.abspath(watched), None)
 
         # Re-run ComfyUI metadata badge scan for modified items using existing window signals/scan_id
         thread_pool = getattr(self.win, "thread_pool", None)
@@ -461,7 +514,7 @@ class BatchToolsController:
                             palette = img.getpalette()
                             if palette:
                                 clean_img.putpalette(palette)
-                        clean_img.paste(img)
+                            clean_img.paste(img)
 
                     save_kwargs = {}
                     if icc_profile:
@@ -560,8 +613,8 @@ class BatchToolsController:
             if source_file.lower().endswith(".json"):
                 with open(source_file, "r", encoding="utf-8") as f:
                     content = json.load(f)
-                    if isinstance(content, dict):
-                        exif_dict = content
+                if isinstance(content, dict):
+                    exif_dict = content
             else:
                 exif_data_bytes, exif_dict = extract_image_metadata(source_file)
 
@@ -608,7 +661,7 @@ class BatchToolsController:
                                 except Exception:
                                     pass
 
-                        _save_pil_atomic(target, path, is_closing=is_closing, **save_kwargs)
+                    _save_pil_atomic(target, path, is_closing=is_closing, **save_kwargs)
                     success_count += 1
                     modified_paths.append(path)
                 except Exception as e:
