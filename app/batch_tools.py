@@ -276,25 +276,6 @@ class BatchToolsController:
         finally:
             self._picker_busy = False
 
-    def _select_existing_directory(self, title, start_dir=""):
-        if self._is_closing() or self._picker_busy:
-            return ""
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
-        self._picker_busy = True
-        try:
-            parent = self.win if self.win is not None and self.win.isVisible() else None
-            export_dir = QFileDialog.getExistingDirectory(
-                parent,
-                title,
-                start_dir,
-                QFileDialog.Option.ShowDirsOnly
-            )
-            return export_dir or ""
-        finally:
-            self._picker_busy = False
-
     def _run_background_batch(self, worker_fn):
         if self._is_closing():
             return

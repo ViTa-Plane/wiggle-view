@@ -54,12 +54,13 @@ class FolderScannerSignals(QObject):
 
 
 class FolderScannerTask(QRunnable):
-    def __init__(self, folder_path, scan_id, signals, active_scan_getter=None):
+    def __init__(self, folder_path, scan_id, signals, active_scan_getter=None, settings_file=None):
         super().__init__()
         self.folder_path = folder_path
         self.scan_id = scan_id
         self.signals = signals
         self.active_scan_getter = active_scan_getter
+        self.settings_file = settings_file
 
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
@@ -151,7 +152,7 @@ class FolderScannerTask(QRunnable):
 
     def run(self):
         valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        settings = load_settings()
+        settings = load_settings(self.settings_file) if self.settings_file else load_settings()
         include_subfolders = settings.get("include_subfolders", False)
         folder_depth = max(1, int(settings.get("subfolder_depth", 1)))
 
@@ -195,6 +196,7 @@ class ThumbnailLoaderTask(QRunnable):
         existing_thumb_path=None,
         jpeg_quality=None,
         persist_to_db=True,
+        encrypt_thumbnail_cache=None,
     ):
         super().__init__()
         self.file_path = file_path
@@ -206,6 +208,9 @@ class ThumbnailLoaderTask(QRunnable):
         self.existing_thumb_path = existing_thumb_path
         self.jpeg_quality = jpeg_quality
         self.persist_to_db = bool(persist_to_db)
+        self.encrypt_thumbnail_cache = (
+            None if encrypt_thumbnail_cache is None else bool(encrypt_thumbnail_cache)
+        )
 
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
@@ -215,6 +220,7 @@ class ThumbnailLoaderTask(QRunnable):
             return
 
         try:
+            settings = None
             if self.jpeg_quality is None:
                 settings = load_settings()
                 raw_q = settings.get("thumbnail_jpeg_quality", 88)
@@ -225,8 +231,18 @@ class ThumbnailLoaderTask(QRunnable):
             else:
                 jpeg_quality = max(1, min(100, int(self.jpeg_quality)))
 
+            if self.encrypt_thumbnail_cache is None:
+                if settings is None:
+                    settings = load_settings()
+                encrypt_enabled = bool(settings.get("encrypt_thumbnail_cache", True))
+            else:
+                encrypt_enabled = self.encrypt_thumbnail_cache
+
             cache_dir = self.cache_dir or os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
-            db_cache = ThumbnailSQLiteCache.get_shared(cache_dir)
+            db_cache = ThumbnailSQLiteCache.get_shared(
+                cache_dir,
+                encrypt_enabled=encrypt_enabled,
+            )
             qimg, virtual_path = db_cache.generate_and_cache_qimage(
                 self.file_path,
                 target_size=self.target_size,
@@ -273,12 +289,15 @@ class BatchConvertWorker(QRunnable):
                     _, exif_dict = extract_image_metadata(path)
 
                 with Image.open(path) as img:
-                    if target_ext in ["jpg", "jpeg"] and (
-                            img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info)):
+                    has_palette_transparency = (
+                        img.mode == "P" and "transparency" in getattr(img, "info", {})
+                    )
+                    if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
+                        img = img.convert("RGBA")
+
+                    if target_ext in ["jpg", "jpeg"] and img.mode in ("RGBA", "LA"):
                         background = Image.new("RGB", img.size, (255, 255, 255))
-                        if img.mode == "P":
-                            img = img.convert("RGBA")
-                        background.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
+                        background.paste(img, mask=img.split()[-1])
                         img_to_save = background
                     else:
                         img_to_save = img.convert("RGB") if target_ext in ["jpeg", "jpg"] else img
@@ -354,13 +373,8 @@ class ComfyMetadataScannerTask(QRunnable):
 
             file_path = item["file_path"]
             if file_path.lower().endswith(".png"):
-                try:
-                    with Image.open(file_path) as img:
-                        if hasattr(img, "text") and img.text:
-                            if any(k in img.text for k in ["workflow", "prompt"]):
-                                batch.append(file_path)
-                except Exception:
-                    pass
+                if _png_has_comfy_metadata(file_path):
+                    batch.append(file_path)
 
                 if len(batch) >= 50:
                     self.signals.comfy_batch_ready.emit(self.scan_id, batch)
@@ -381,11 +395,15 @@ class CacheCleanupTask(QRunnable):
         try:
             settings = load_settings()
             limit_str = settings.get("disk_cache_limit_mb", "1 GB")
+            encrypt_enabled = bool(settings.get("encrypt_thumbnail_cache", True))
 
             if not os.path.exists(self.cache_dir):
                 return
 
-            db_cache = ThumbnailSQLiteCache.get_shared(self.cache_dir)
+            db_cache = ThumbnailSQLiteCache.get_shared(
+                self.cache_dir,
+                encrypt_enabled=encrypt_enabled,
+            )
             db_cache.purge_loose_jpeg_files()
 
             if limit_str == "Disabled":

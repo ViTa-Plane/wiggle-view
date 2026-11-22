@@ -7,8 +7,14 @@ from io import BytesIO
 from PIL import Image, ImageOps, ImageFile
 from PySide6.QtGui import QImage
 
+try:
+    from .encryption import EncryptionError, decrypt_data, encrypt_data
+except ImportError:
+    from encryption import EncryptionError, decrypt_data, encrypt_data
+
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
+
 
 class _ThreadLocalConnState:
     """Tracks per-thread SQLite connection and generation counter for safe connection lifecycle."""
@@ -36,16 +42,32 @@ class ThumbnailSQLiteCache:
 
     _instances = {}
     _instances_lock = threading.Lock()
+    _pil_decode_lock = threading.Lock()
 
     @classmethod
-    def get_shared(cls, cache_dir, db_filename="thumbnails_cache.db", flush_threshold=32, flush_interval_sec=3.0):
+    def get_shared(
+        cls,
+        cache_dir,
+        db_filename="thumbnails_cache.db",
+        flush_threshold=32,
+        flush_interval_sec=3.0,
+        encrypt_enabled=True,
+    ):
         norm_dir = os.path.abspath(cache_dir)
         key = (norm_dir, db_filename)
         with cls._instances_lock:
             inst = cls._instances.get(key)
             if inst is None:
-                inst = cls(norm_dir, db_filename=db_filename, flush_threshold=flush_threshold, flush_interval_sec=flush_interval_sec)
+                inst = cls(
+                    norm_dir,
+                    db_filename=db_filename,
+                    flush_threshold=flush_threshold,
+                    flush_interval_sec=flush_interval_sec,
+                    encrypt_enabled=encrypt_enabled,
+                )
                 cls._instances[key] = inst
+            else:
+                inst.set_encryption_enabled(encrypt_enabled)
             return inst
 
     @classmethod
@@ -59,23 +81,42 @@ class ThumbnailSQLiteCache:
             except Exception:
                 pass
 
-    def __init__(self, cache_dir, db_filename="thumbnails_cache.db", flush_threshold=32, flush_interval_sec=3.0):
+    def __init__(
+        self,
+        cache_dir,
+        db_filename="thumbnails_cache.db",
+        flush_threshold=32,
+        flush_interval_sec=3.0,
+        encrypt_enabled=True,
+    ):
         self.cache_dir = cache_dir
         os.makedirs(self.cache_dir, exist_ok=True)
         self.db_path = os.path.join(self.cache_dir, db_filename)
         self.flush_threshold = max(1, int(flush_threshold))
         self.flush_interval_sec = max(0.2, float(flush_interval_sec))
+        self._encrypt_enabled = bool(encrypt_enabled)
 
         self._lock = threading.RLock()
         self._conn_generation = 0
         self._closed = False
         self._tls = threading.local()
-        self._all_states = []       # weak/tracked list of _ThreadLocalConnState for cleanup
+        self._all_states = []
         self._pending_puts = {}       # cache_key -> (source_path, size_bytes, now, blob)
         self._pending_access = {}     # cache_key -> last_accessed_float
         self._last_flush_time = time.monotonic()
 
         self._init_db()
+
+    def set_encryption_enabled(self, enabled: bool):
+        with self._lock:
+            self._encrypt_enabled = bool(enabled)
+
+    def _prepare_blob_for_storage(self, jpeg_blob: bytes) -> bytes:
+        with self._lock:
+            encrypt_enabled = self._encrypt_enabled
+        if not encrypt_enabled:
+            return jpeg_blob
+        return encrypt_data(jpeg_blob)
 
     def _get_thread_state(self):
         state = getattr(self._tls, "state", None)
@@ -107,8 +148,17 @@ class ThumbnailSQLiteCache:
             state.close()
 
         if state.conn is None:
-            state.conn = self._create_connection()
-            state.generation = current_gen
+            conn = self._create_connection()
+            with self._lock:
+                if self._closed:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    raise sqlite3.ProgrammingError("ThumbnailSQLiteCache is closed.")
+                current_gen = self._conn_generation
+                state.conn = conn
+                state.generation = current_gen
 
         return state.conn
 
@@ -147,15 +197,20 @@ class ThumbnailSQLiteCache:
             sig = f"{abs_p}|{int(target_size)}|{int(jpeg_quality)}"
         return hashlib.sha256(sig.encode("utf-8", errors="replace")).hexdigest()
 
-    @staticmethod
-    def _decode_blob_to_qimage(blob):
+    def _decode_blob_to_qimage(self, blob):
         if not blob:
             return QImage()
+        raw_bytes = bytes(blob) if isinstance(blob, (bytes, bytearray, memoryview)) else blob
+        try:
+            raw_bytes = decrypt_data(raw_bytes, allow_unencrypted=True)
+        except EncryptionError as exc:
+            print(f"SQLite cache decrypt error: {exc}")
+            return QImage()
         img = QImage()
-        if img.loadFromData(blob, "JPG"):
-            return img
-        if img.loadFromData(blob):
-            return img
+        if img.loadFromData(raw_bytes, "JPG"):
+            return img.copy()
+        if img.loadFromData(raw_bytes):
+            return img.copy()
         return QImage()
 
     def get_qimage(self, cache_key):
@@ -197,17 +252,29 @@ class ThumbnailSQLiteCache:
         """Queues a compressed JPEG BLOB in memory and flushes in batches to reduce SSD writes."""
         if not cache_key or pil_img is None:
             return 0
+        quality = max(1, min(100, int(jpeg_quality)))
         buf = BytesIO()
-        rgb_img = pil_img.convert("RGB") if pil_img.mode not in ("RGB", "L") else pil_img
-        rgb_img.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=True)
+        has_palette_transparency = (
+            pil_img.mode == "P" and "transparency" in getattr(pil_img, "info", {})
+        )
+        if has_palette_transparency or pil_img.mode in ("RGBA", "LA", "PA"):
+            rgba_img = pil_img if pil_img.mode == "RGBA" else pil_img.convert("RGBA")
+            bg = Image.new("RGBA", rgba_img.size, (13, 19, 33, 255))
+            rgb_img = Image.alpha_composite(bg, rgba_img).convert("RGB")
+        elif pil_img.mode not in ("RGB", "L"):
+            rgb_img = pil_img.convert("RGB")
+        else:
+            rgb_img = pil_img
+        rgb_img.save(buf, format="JPEG", quality=quality, optimize=True)
         blob = buf.getvalue()
-        size_bytes = len(blob)
+        stored_blob = self._prepare_blob_for_storage(blob)
+        size_bytes = len(stored_blob)
         now = time.time()
 
         with self._lock:
             if self._closed:
                 return 0
-            self._pending_puts[cache_key] = (source_path, size_bytes, now, blob)
+            self._pending_puts[cache_key] = (source_path, size_bytes, now, stored_blob)
             self._pending_access.pop(cache_key, None)
             if self._should_flush_locked():
                 self._flush_locked()
@@ -279,33 +346,75 @@ class ThumbnailSQLiteCache:
             for k, v in access_updates.items():
                 self._pending_access.setdefault(k, v)
 
+    def _encode_pil_thumbnail_jpeg(self, source_path, target_size, quality):
+        size_px = max(16, int(target_size))
+        with self._pil_decode_lock:
+            with Image.open(source_path) as raw_img:
+                raw_img.load()
+                transposed = ImageOps.exif_transpose(raw_img)
+                if transposed is not raw_img:
+                    raw_img.close()
+                    img = transposed
+                else:
+                    img = raw_img
+
+                try:
+                    has_palette_transparency = (
+                        img.mode == "P" and "transparency" in getattr(img, "info", {})
+                    )
+                    if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
+                        work_img = img.convert("RGBA")
+                    else:
+                        work_img = img
+
+                    try:
+                        # Downscale using draft/thumbnail before compositing to keep memory low
+                        if hasattr(work_img, "draft") and work_img.mode in ("RGB", "L", "YCbCr"):
+                            try:
+                                work_img.draft(work_img.mode, (size_px * 2, size_px * 2))
+                            except Exception:
+                                pass
+                        work_img.thumbnail((size_px, size_px), Image.Resampling.LANCZOS)
+
+                        if work_img.mode in ("RGBA", "LA", "PA"):
+                            rgba_thumb = work_img if work_img.mode == "RGBA" else work_img.convert("RGBA")
+                            bg = Image.new("RGBA", rgba_thumb.size, (13, 19, 33, 255))
+                            rgb_img = Image.alpha_composite(bg, rgba_thumb).convert("RGB")
+                        elif work_img.mode not in ("RGB", "L"):
+                            rgb_img = work_img.convert("RGB")
+                        else:
+                            rgb_img = work_img
+
+                        buf = BytesIO()
+                        rgb_img.save(buf, format="JPEG", quality=quality, optimize=False)
+                        return buf.getvalue()
+                    finally:
+                        if work_img is not img:
+                            work_img.close()
+                finally:
+                    img.close()
+
     def generate_and_cache_qimage(self, source_path, target_size=170, jpeg_quality=90, persist_to_db=True):
         """Loads/caches thumbnail solely in SQLite BLOB without creating loose JPEG files on disk."""
-        cache_key = self.make_cache_key(source_path, target_size=target_size, jpeg_quality=jpeg_quality)
+        quality = max(1, min(100, int(jpeg_quality)))
+        cache_key = self.make_cache_key(source_path, target_size=target_size, jpeg_quality=quality)
         cached = self.get_qimage(cache_key)
         if cached is not None and not cached.isNull():
             return cached, f"sqlite://{cache_key}"
         try:
-            with Image.open(source_path) as raw_img:
-                raw_img.load()
-                img = ImageOps.exif_transpose(raw_img)
-                thumb = img.copy()
-                thumb.thumbnail((int(target_size), int(target_size)), Image.Resampling.LANCZOS)
-                buf = BytesIO()
-                rgb_img = thumb.convert("RGB") if thumb.mode not in ("RGB", "L") else thumb
-                rgb_img.save(buf, format="JPEG", quality=int(jpeg_quality), optimize=False)
-                blob = buf.getvalue()
-                size_bytes = len(blob)
-                now = time.time()
-                if persist_to_db:
-                    with self._lock:
-                        if not self._closed:
-                            self._pending_puts[cache_key] = (source_path, size_bytes, now, blob)
-                            self._pending_access.pop(cache_key, None)
-                            if self._should_flush_locked():
-                                self._flush_locked()
-                qimg = self._decode_blob_to_qimage(blob)
-                return (qimg if qimg is not None else QImage()), f"sqlite://{cache_key}"
+            blob = self._encode_pil_thumbnail_jpeg(source_path, target_size, quality)
+            stored_blob = self._prepare_blob_for_storage(blob)
+            size_bytes = len(stored_blob)
+            now = time.time()
+            if persist_to_db:
+                with self._lock:
+                    if not self._closed:
+                        self._pending_puts[cache_key] = (source_path, size_bytes, now, stored_blob)
+                        self._pending_access.pop(cache_key, None)
+                        if self._should_flush_locked():
+                            self._flush_locked()
+            qimg = self._decode_blob_to_qimage(stored_blob)
+            return (qimg if qimg is not None else QImage()), f"sqlite://{cache_key}"
         except Exception as e:
             print(f"Thumbnail generation failed for {source_path}: {e}")
             return QImage(), None

@@ -25,10 +25,12 @@ class FileOperationsController:
             if discarded.get("type") == "delete":
                 for _, staged_path in discarded.get("pairs", []):
                     if staged_path and os.path.exists(staged_path):
-                        try:
-                            os.remove(staged_path)
-                        except OSError:
-                            pass
+                        ok, err = self._send_file_to_recycle_bin(staged_path)
+                        if not ok:
+                            try:
+                                os.remove(staged_path)
+                            except OSError:
+                                pass
         self._redo_stack.clear()
 
     def refresh_after_history_op(self, affected_paths):
@@ -342,24 +344,102 @@ class FileOperationsController:
             self.win.set_status("No valid image files pasted.")
 
     def copy_selected_files(self, paths, cut=False):
-        if not paths:
-            paths = [item["file_path"] for item in self.win.loaded_items if os.path.exists(item["file_path"])]
+        raw_paths = list(paths) if paths else [
+            item["file_path"] for item in self.win.loaded_items if item.get("file_path")
+        ]
 
-        if not paths:
+        unique_paths = []
+        seen = set()
+        for p in raw_paths:
+            if not p:
+                continue
+            abs_p = os.path.abspath(p)
+            if abs_p not in seen and os.path.exists(abs_p):
+                seen.add(abs_p)
+                unique_paths.append(abs_p)
+
+        if not unique_paths:
             self.win.set_status("No images available to copy.")
             return
 
         clipboard = QGuiApplication.clipboard()
         mime_data = QMimeData()
-        urls = [QUrl.fromLocalFile(p) for p in paths if os.path.exists(p)]
+        urls = [QUrl.fromLocalFile(p) for p in unique_paths]
         mime_data.setUrls(urls)
         clipboard.setMimeData(mime_data)
 
-        self._cut_source_paths = paths if cut else []
+        self._cut_source_paths = unique_paths if cut else []
 
         action_name = "Cut" if cut else "Copied"
-        target_desc = "selected file(s)" if self.win.workspace_grid.selected_file_paths else "entire gallery"
-        self.win.set_status(f"{action_name} {len(paths)} file(s) ({target_desc}) to clipboard.")
+        has_explicit_selection = bool(getattr(self.win.workspace_grid, "selected_file_paths", None))
+        target_desc = "selected file(s)" if has_explicit_selection else "entire gallery"
+        self.win.set_status(f"{action_name} {len(unique_paths)} file(s) ({target_desc}) to clipboard.")
+
+    def _send_file_to_recycle_bin(self, target_path):
+        """Sends a single file to the OS Recycle Bin via send2trash or Win32 SHFileOperationW."""
+        abs_target = os.path.abspath(target_path)
+        if not os.path.exists(abs_target):
+            return True, None
+
+        last_err = None
+        try:
+            from send2trash import send2trash  # type: ignore
+
+            send2trash(abs_target)
+            if not os.path.exists(abs_target):
+                return True, None
+            last_err = "send2trash completed, but file still exists."
+        except ImportError:
+            pass
+        except Exception as exc:
+            last_err = f"send2trash failed: {exc}"
+
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                FO_DELETE = 3
+                FOF_SILENT = 0x0004
+                FOF_NOCONFIRMATION = 0x0010
+                FOF_ALLOWUNDO = 0x0040
+                FOF_NOERRORUI = 0x0400
+
+                class _SHFILEOPSTRUCTW(ctypes.Structure):
+                    _fields_ = [
+                        ("hwnd", wintypes.HWND),
+                        ("wFunc", wintypes.UINT),
+                        ("pFrom", wintypes.LPCWSTR),
+                        ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", wintypes.WORD),
+                        ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", wintypes.LPVOID),
+                        ("lpszProgressTitle", wintypes.LPCWSTR),
+                    ]
+
+                p_from = abs_target + "\x00\x00"
+                flags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+                op = _SHFILEOPSTRUCTW(
+                    hwnd=None,
+                    wFunc=FO_DELETE,
+                    pFrom=p_from,
+                    pTo=None,
+                    fFlags=flags,
+                    fAnyOperationsAborted=False,
+                    hNameMappings=None,
+                    lpszProgressTitle=None,
+                )
+                shell32 = ctypes.windll.shell32
+                shell32.SHFileOperationW.argtypes = [ctypes.POINTER(_SHFILEOPSTRUCTW)]
+                shell32.SHFileOperationW.restype = ctypes.c_int
+                rc = shell32.SHFileOperationW(ctypes.byref(op))
+                if rc == 0 and not op.fAnyOperationsAborted and not os.path.exists(abs_target):
+                    return True, None
+                return False, f"SHFileOperationW rc={rc}, aborted={bool(op.fAnyOperationsAborted)}"
+            except Exception as exc:
+                return False, f"Win32 recycle bin error: {exc}"
+
+        return False, last_err or "No Recycle Bin backend available."
 
     def delete_selected_files(self, paths):
         if not paths:
@@ -367,7 +447,8 @@ class FileOperationsController:
             return
 
         settings = load_settings(self.settings_file)
-        confirm_enabled = settings.get("confirm_on_delete", True)
+        confirm_enabled = bool(settings.get("confirm_on_delete", True))
+        use_undo_staging = not (bool(settings.get("use_recycle_bin", True)))
 
         if confirm_enabled:
             reply = QMessageBox.question(
@@ -379,23 +460,43 @@ class FileOperationsController:
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        if use_undo_staging:
+            os.makedirs(self.win.undo_trash_dir, exist_ok=True)
+
+        if self.win.current_watched_dir:
+            self.win.file_watcher.removePaths(self.win.file_watcher.directories())
+
         deleted_paths = set()
         deleted_records = []
+        failed_errors = []
 
         for path in paths:
             norm_path = os.path.abspath(path)
             if os.path.exists(norm_path):
-                try:
-                    staged_name = f"{uuid.uuid4().hex}_{os.path.basename(norm_path)}"
-                    staged_path = os.path.join(self.win.undo_trash_dir, staged_name)
-                    shutil.move(norm_path, staged_path)
-                    deleted_paths.add(norm_path)
-                    deleted_records.append((norm_path, staged_path))
-                except Exception as e:
-                    print(f"DEBUG Error staging delete for {path}: {e}")
+                if use_undo_staging:
+                    try:
+                        staged_name = f"{uuid.uuid4().hex}_{os.path.basename(norm_path)}"
+                        staged_path = os.path.join(self.win.undo_trash_dir, staged_name)
+                        shutil.move(norm_path, staged_path)
+                        deleted_paths.add(norm_path)
+                        deleted_records.append((norm_path, staged_path))
+                    except Exception as e:
+                        failed_errors.append(f"{os.path.basename(norm_path)}: {e}")
+                        print(f"DEBUG Error staging delete for {path}: {e}")
+                else:
+                    ok, err = self._send_file_to_recycle_bin(norm_path)
+                    if ok:
+                        deleted_paths.add(norm_path)
+                    else:
+                        failed_errors.append(f"{os.path.basename(norm_path)}: {err}")
+                        print(f"DEBUG Error moving {path} to Recycle Bin: {err}")
+
+        if self.win.current_watched_dir:
+            self.win.folder_sync.sync_file_watcher_paths(self.win.current_watched_dir)
 
         if deleted_paths:
-            self.record_undo_action({"type": "delete", "pairs": deleted_records})
+            if use_undo_staging and deleted_records:
+                self.record_undo_action({"type": "delete", "pairs": deleted_records})
 
             self.win.loaded_items = [
                 item for item in self.win.loaded_items
@@ -409,23 +510,32 @@ class FileOperationsController:
 
             deleted_count = len(deleted_paths)
             total_remaining = len(self.win.loaded_items)
-            self.win.set_status(f"Moved {deleted_count} file(s) to Recycle Bin. Total remaining: {total_remaining}")
+            if use_undo_staging:
+                status_msg = f"Deleted {deleted_count} file(s) (Ctrl+Z to undo). Total remaining: {total_remaining}"
+            else:
+                status_msg = f"Moved {deleted_count} file(s) to Recycle Bin. Total remaining: {total_remaining}"
+            if failed_errors:
+                status_msg += f" ({len(failed_errors)} failed)"
+            self.win.set_status(status_msg)
 
             self.win.right_sidebar.inspector_label.setText(
                 f"Inspector Properties:\n\n• Folder Selected\n• Total Images: {total_remaining}\n• Selected: None"
             )
         else:
-            self.win.set_status("Deletion failed: No files were removed.")
+            detail = f" ({failed_errors[0]})" if failed_errors else ""
+            self.win.set_status(f"Deletion failed: No files were removed.{detail}")
 
     def flush_staged_trash_to_recycle_bin(self):
         trash_dir = getattr(self.win, "undo_trash_dir", None)
         if trash_dir and os.path.exists(trash_dir):
             try:
-                from send2trash import send2trash
                 for fname in os.listdir(trash_dir):
                     fpath = os.path.join(trash_dir, fname)
                     if os.path.exists(fpath):
-                        send2trash(fpath)
-                shutil.rmtree(trash_dir, ignore_errors=True)
+                        ok, err = self._send_file_to_recycle_bin(fpath)
+                        if not ok:
+                            print(f"Error flushing {fpath} to Recycle Bin: {err}")
+                if os.path.exists(trash_dir) and not os.listdir(trash_dir):
+                    shutil.rmtree(trash_dir, ignore_errors=True)
             except Exception as e:
                 print(f"Error flushing staged deletes to Recycle Bin: {e}")

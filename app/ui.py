@@ -36,7 +36,10 @@ try:
 except ImportError:
     from sqlite_thumb_cache import ThumbnailSQLiteCache
 
-SETTINGS_FILE = "settings.json"
+from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
+SETTINGS_FILE = str(BASE_DIR / "settings.json")
 
 try:
     from .crash_reporter import install_crash_reporter
@@ -111,10 +114,22 @@ class MetadataLoaderTask(QRunnable):
             img_size = reader.size()
             if img_size.isValid():
                 dims_str = f"{img_size.width()} \u00d7 {img_size.height()} px"
+            else:
+                try:
+                    with Image.open(self.file_path) as pil_img:
+                        w, h = pil_img.size
+                        if w > 0 and h > 0:
+                            dims_str = f"{w} \u00d7 {h} px"
+                except Exception:
+                    pass
 
         if self._is_closing():
             return
-        exif_text = extract_exif_metadata(self.file_path)
+
+        try:
+            exif_text = extract_exif_metadata(self.file_path)
+        except Exception as e:
+            exif_text = f"EXIF read error: {e}"
 
         if self._is_closing():
             return
@@ -175,9 +190,16 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.meta_signals = MetadataWorkerSignals()
         self.meta_signals.metadata_ready.connect(self.on_metadata_ready)
 
+        settings_init = load_settings(SETTINGS_FILE)
+        encrypt_thumbs = bool(settings_init.get("encrypt_thumbnail_cache", True))
+        self._cached_encrypt_thumbnail_cache = encrypt_thumbs
+
         self.thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
         os.makedirs(self.thumb_cache_dir, exist_ok=True)
-        self.thumb_db_cache = ThumbnailSQLiteCache.get_shared(self.thumb_cache_dir)
+        self.thumb_db_cache = ThumbnailSQLiteCache.get_shared(
+            self.thumb_cache_dir,
+            encrypt_enabled=encrypt_thumbs,
+        )
 
         if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
             self.thumb_db_cache.purge_loose_jpeg_files()
@@ -217,6 +239,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         save_settings(SETTINGS_FILE, {"include_subfolders": False})
 
         self._refresh_cached_jpeg_quality()
+        self._refresh_cached_encrypt_thumbnail_cache()
         self.startup_settings_print()
 
         self._setup_ui()
@@ -230,12 +253,14 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 folder_dir = os.path.dirname(abs_path)
                 self.initial_target_image = abs_path
 
+            self.current_watched_dir = folder_dir
             self.left_browser.set_selected_folder(folder_dir)
             self.path_label.setText(f"{folder_dir}")
             self.save_last_folder(folder_dir)
+            QTimer.singleShot(15, lambda fp=folder_dir: self.folder_sync.sync_file_watcher_paths(fp))
 
             self.scan_id += 1
-            scanner_task = FolderScannerTask(folder_dir, self.scan_id, self.scanner_signals)
+            scanner_task = FolderScannerTask(folder_dir, self.scan_id, self.scanner_signals, active_scan_getter=self.get_active_scan_id, settings_file=SETTINGS_FILE,)
             self.thread_pool.start(scanner_task)
         else:
             self.load_last_folder()
@@ -256,6 +281,14 @@ class MainWindow(QMainWindow, WindowDragHandler):
         except (TypeError, ValueError):
             quality = 90
         self._cached_jpeg_quality = max(1, min(100, quality))
+
+    def _refresh_cached_encrypt_thumbnail_cache(self):
+        settings = load_settings(SETTINGS_FILE)
+        encrypt_thumbs = bool(settings.get("encrypt_thumbnail_cache", True))
+        self._cached_encrypt_thumbnail_cache = encrypt_thumbs
+        if hasattr(self, "thumb_db_cache") and self.thumb_db_cache is not None:
+            if hasattr(self.thumb_db_cache, "set_encryption_enabled"):
+                self.thumb_db_cache.set_encryption_enabled(encrypt_thumbs)
 
     def start_thumbnail_task(self, file_path, scan_id):
         if self._is_closing:
@@ -586,7 +619,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
         QThreadPool.globalInstance().setMaxThreadCount(max_threads)
 
     def startup_settings_print(self):
-        settings = load_settings()
+        settings = load_settings(SETTINGS_FILE)
         print(f"thumbnail_jpeg_quality: {settings.get('thumbnail_jpeg_quality', None)}")
         print(f"encrypt_thumbnail_cache: {settings.get('encrypt_thumbnail_cache', None)}")
 
@@ -715,7 +748,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             folder_path,
             current_scan_id,
             self.scanner_signals,
-            active_scan_getter=self.get_active_scan_id
+            active_scan_getter=self.get_active_scan_id,
+            settings_file=SETTINGS_FILE,
         )
         self.thread_pool.start(scanner_task)
 
@@ -1148,6 +1182,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
                     max_favorites=updated_settings.get("max_favorites", 15),
                 )
             self._refresh_cached_jpeg_quality()
+            self._refresh_cached_encrypt_thumbnail_cache()
             self._apply_scroll_speed_setting()
             if hasattr(self.workspace_grid, 'update_cache_limit_from_settings'):
                 self.workspace_grid.update_cache_limit_from_settings()

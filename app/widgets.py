@@ -29,89 +29,111 @@ class WindowDragHandler:
 
 
 class ResizeHandleWidget(QWidget):
-    def __init__(self, parent_window):
-        super().__init__()
-        self.parent_window = parent_window
-        self.setFixedSize(16, 16)
-        self.hovered = False
+    """Self-painting bottom-right corner resize grip that reliably resizes viewer windows."""
 
-        self._resizing = False
-        self._resize_start_geometry = None
-        self._resize_start_global_pos = None
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.parent_window = parent if parent is not None else self.window()
+        self.dragging = False
+        self.drag_start_pos = QPoint()
+        self.start_geometry = QRect()
+        self.hovered = False
+        self.setFixedSize(18, 18)
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, False)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
+        self.setAutoFillBackground(False)
+
+    def _target_window(self):
+        if self.parent_window is not None:
+            return self.parent_window
+        return self.window()
 
     def enterEvent(self, event):
         self.hovered = True
+        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
         self.update()
         super().enterEvent(event)
 
     def leaveEvent(self, event):
         self.hovered = False
+        if not self.dragging:
+            self.unsetCursor()
         self.update()
         super().leaveEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and not self.parent_window.isMaximized():
-            self._resizing = True
-            self._resize_start_geometry = self.parent_window.frameGeometry()
-            self._resize_start_global_pos = event.globalPosition().toPoint()
-            event.accept()
+        if event.button() == Qt.MouseButton.LeftButton:
+            win = self._target_window()
+            if win is not None and not win.isFullScreen():
+                self.dragging = True
+                self.drag_start_pos = event.globalPosition().toPoint()
+                self.start_geometry = win.geometry()
+                if hasattr(win, "_user_resized"):
+                    win._user_resized = True
+                if hasattr(win, "_resize_edge"):
+                    win._resize_edge = None
+                self.grabMouse()
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._resizing and event.buttons() == Qt.MouseButton.LeftButton:
-            diff = event.globalPosition().toPoint() - self._resize_start_global_pos
-            geom = self._resize_start_geometry
-
-            w = max(self.parent_window.minimumWidth(), geom.width() + diff.x())
-            h = max(self.parent_window.minimumHeight(), geom.height() + diff.y())
-
-            self.parent_window.setGeometry(geom.x(), geom.y(), w, h)
-            event.accept()
+        if self.dragging and (event.buttons() & Qt.MouseButton.LeftButton):
+            win = self._target_window()
+            if win is not None and not win.isFullScreen():
+                delta = event.globalPosition().toPoint() - self.drag_start_pos
+                new_w = max(win.minimumWidth(), self.start_geometry.width() + delta.x())
+                new_h = max(win.minimumHeight(), self.start_geometry.height() + delta.y())
+                win.resize(new_w, new_h)
+                event.accept()
+                return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
-        self._resizing = False
-        event.accept()
+        if event.button() == Qt.MouseButton.LeftButton and self.dragging:
+            self.dragging = False
+            try:
+                self.releaseMouse()
+            except RuntimeError:
+                pass
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
-        try:
-            if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
-                return
-            if QApplication.instance() is None or QApplication.closingDown():
-                return
-            parent_win = getattr(self, "parent_window", None)
-            if parent_win is not None and bool(getattr(parent_win, "_is_closing", False)):
-                return
-            if not self.paintEngine() or not self.paintEngine().isActive() and False:
-                pass
-        except RuntimeError:
+        if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
             return
 
-        painter = None
+        painter = QPainter(self)
+        if not painter.isActive():
+            return
+
         try:
-            painter = QPainter(self)
-            if not painter.isActive():
-                return
-
-            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-            color = QColor("#38bdf8") if self.hovered else QColor("#64748b")
-            pen = QPen(color, 1.5)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            stroke = QColor("#38bdf8") if (self.hovered or self.dragging) else QColor("#94a3b8")
+            pen = QPen(stroke, 1.5)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             painter.setPen(pen)
 
-            triangle = QPolygon([
-                QPoint(15, 15),
-                QPoint(15, 5),
-                QPoint(5, 15)
-            ])
-            painter.drawPolygon(triangle)
-        except RuntimeError:
-            return
+
+            if not True:
+                w = self.width()
+                h = self.height()
+                painter.drawLine(w - 3, h - 13, w - 13, h - 3)
+                painter.drawLine(w - 3, h - 9, w - 9, h - 3)
+                painter.drawLine(w - 3, h - 5, w - 5, h - 3)
+            else:
+                triangle = QPolygon([
+                    QPoint(15, 15),
+                    QPoint(15, 5),
+                    QPoint(5, 15)
+                ])
+                painter.drawPolygon(triangle)
+
         finally:
-            if painter is not None and painter.isActive():
-                try:
-                    painter.end()
-                except RuntimeError:
-                    pass
+            if painter.isActive():
+                painter.end()
 
 
 class TitleBar(QWidget, WindowDragHandler):
@@ -319,13 +341,14 @@ class ResponsiveGridWidget(QWidget):
                 has_any_modifier = is_shift or is_ctrl or is_alt
 
                 if (
-                    event.button() == Qt.MouseButton.LeftButton
-                    and not has_any_modifier
-                    and path in self.selected_file_paths
-                    and len(self.selected_file_paths) > 1
+                        event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)
+                        and not has_any_modifier
+                        and path in self.selected_file_paths
+                        and len(self.selected_file_paths) > 1
                 ):
-                    self._pending_click_index = index
-                    self._pending_click_path = path
+                    if event.button() == Qt.MouseButton.LeftButton:
+                        self._pending_click_index = index
+                        self._pending_click_path = path
                     self.last_clicked_index = index
                     self.update()
                     super().mousePressEvent(event)
@@ -702,6 +725,7 @@ class ResponsiveGridWidget(QWidget):
             or getattr(main_window, "_get_active_scan_id", None)
         )
         current_scan_id = getattr(main_window, "scan_id", 0)
+        cached_encrypt = getattr(main_window, "_cached_encrypt_thumbnail_cache", None)
 
         for fp, existing_tp in pending.items():
             if self.is_thumbnail_pending(fp):
@@ -715,6 +739,7 @@ class ResponsiveGridWidget(QWidget):
                 scan_id=current_scan_id,
                 active_scan_getter=active_scan_getter,
                 existing_thumb_path=existing_tp,
+                encrypt_thumbnail_cache=cached_encrypt,
             )
             main_window.thread_pool.start(task)
 

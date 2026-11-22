@@ -23,6 +23,7 @@ DEFAULT_SETTINGS = {
     "disk_cache_limit_mb": "Disabled",
     "thread_pool_concurrency": "Auto (Max Cores)",
     "confirm_on_delete": True,
+    "use_recycle_bin": True,
     "loop_gallery_navigation": True,
     "include_subfolders": False,
     "subfolder_depth": 1,

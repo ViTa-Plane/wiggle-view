@@ -50,17 +50,18 @@ class CrashReporter:
         self._file = open(self.log_path, "a", encoding="utf-8", buffering=1)
         self._write_session_header()
 
-        if not faulthandler.is_enabled():
-            faulthandler.enable(file=self._file, all_threads=True)
-        else:
+        if faulthandler.is_enabled():
             try:
                 faulthandler.disable()
-                faulthandler.enable(file=self._file, all_threads=True)
             except Exception:
                 pass
+        faulthandler.enable(file=self._file, all_threads=True)
 
+        self._prev_sys_excepthook = sys.excepthook
         sys.excepthook = self._handle_sys_exception
+
         if hasattr(threading, "excepthook"):
+            self._prev_threading_excepthook = threading.excepthook
             threading.excepthook = self._handle_threading_exception
 
         if qInstallMessageHandler is not None and QtMsgType is not None:
@@ -153,7 +154,13 @@ class CrashReporter:
                 pass
 
     def close(self):
-        """Flush and close the crash log file handle."""
+        """Flush and close the crash log file handle safely."""
+        try:
+            if faulthandler.is_enabled():
+                faulthandler.disable()
+        except Exception:
+            pass
+
         with self._lock:
             if self._file and not self._file.closed:
                 try:
@@ -161,7 +168,8 @@ class CrashReporter:
                     self._file.close()
                 except OSError:
                     pass
-                self._file = None
+            self._file = None
+            self._installed = False
 
 
 _DEFAULT_REPORTER = None

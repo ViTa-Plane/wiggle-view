@@ -71,12 +71,17 @@ class AboutDialog(QDialog, WindowDragHandler):
         self.content_label.setWordWrap(True)
         self.content_label.setOpenExternalLinks(True)
         self.content_label.setText(
-            f"<b>WiggleView</b> alpha {__version__}<br><br>"
-            "image gallery and ref image viewer with "
-            "high-performance multithreaded scanning, custom window controls, "
-            "smooth canvas zooming & panning.<br><br>"
+            f"<b>WiggleView</b>  {__version__}<br><br>"
+            "gallery/image viewer with "
+            "high-performance multithreaded scanning, custom EXIF tools, encrypted database,batch conversion, and "
+            "detached ref image canvas with smooth zooming & panning.<br><br>"
             "<b>GitHub Repository:</b><br>"
             "<a href='https://github.com/ViTa-Plane/wiggle-view' style='color: #3b82f6; text-decoration: none;'>https://github.com/ViTa-Plane/wiggle-view</a>"
+            # "<br><br><br>If you like the app:   "
+            # "<a href='https://ko-fi.com/andybunny' style='color: #3b82f6; text-decoration: none;'>Buy me a Ko-Fi ^.^</a>"
+            # "<b>    Thank you!</b>"
+
+
         )
         self.content_label.setStyleSheet("""
             QLabel {
@@ -498,6 +503,7 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.thumb_quality_val_label.setText(f"{q_val}%")
 
         self.confirm_delete_chk.setChecked(settings.get("confirm_on_delete", True))
+        self.use_recycle_chk.setChecked(settings.get("use_recycle_bin", True))
         self.loop_nav_chk.setChecked(settings.get("loop_gallery_navigation", True))
 
         disk_limit_map = {"Disabled": 0, "500 MB": 1, "1 GB": 2, "2 GB": 3, "Unlimited": 4}
@@ -539,6 +545,7 @@ class SettingsDialog(QDialog, WindowDragHandler):
             "max_thumbnail_cache": self.max_cache_combo.currentText(),
             "thumbnail_jpeg_quality": self.thumb_quality_slider.value(),
             "confirm_on_delete": self.confirm_delete_chk.isChecked(),
+            "use_recycle_bin": self.use_recycle_chk.isChecked(),
             "loop_gallery_navigation": self.loop_nav_chk.isChecked(),
             "include_subfolders": self.include_subfolders_chk.isChecked(),
             "subfolder_depth": self.folder_depth_spin.value(),
@@ -964,9 +971,13 @@ class SettingsDialog(QDialog, WindowDragHandler):
         safety_label = QLabel("<b>File Operations & Safety</b>")
         advanced_layout.addWidget(safety_label)
 
-        self.confirm_delete_chk = QCheckBox("Confirm before moving files to Recycle Bin")
+        self.confirm_delete_chk = QCheckBox("Confirm before deleting files")
         self.confirm_delete_chk.setToolTip("Displays a confirmation dialog when pressing Delete/Backspace.")
         advanced_layout.addWidget(self.confirm_delete_chk)
+
+        self.use_recycle_chk = QCheckBox("Use Recycle Bin")
+        self.use_recycle_chk.setToolTip("delete files to recycle bin, undo is disabled")
+        advanced_layout.addWidget(self.use_recycle_chk)
 
         advanced_layout.addStretch()
         self.tab_widget.addTab(advanced_tab, "Advanced")
@@ -1015,8 +1026,8 @@ class SettingsDialog(QDialog, WindowDragHandler):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
 
-        self.resize_handle = ResizeHandleWidget(self)
-        btn_layout.addWidget(self.resize_handle, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
+        # self.resize_handle = ResizeHandleWidget(self)
+        # btn_layout.addWidget(self.resize_handle, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
 
         container_layout.addLayout(btn_layout)
         main_layout.addWidget(self.container)

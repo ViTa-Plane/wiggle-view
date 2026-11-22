@@ -2,9 +2,103 @@ import os
 from collections import OrderedDict
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject, QTimer, QPointF
-from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader
+from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader, QPen, QPainterPath
 from .widgets import ResizeHandleWidget
 from .helpers import load_settings, save_settings
+
+
+PIN_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>"""
+
+UNPIN_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" y1="2" x2="22" y2="22"></line><line x1="12" y1="17" x2="12" y2="22"></line><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h12"></path><path d="M15 9.34V6h1a2 2 0 0 0 0-4H7.89"></path></svg>"""
+
+
+class PinIconButton(QPushButton):
+    """Custom button rendering pin/unpin icons cleanly on Windows frameless windows."""
+
+    def __init__(self, pinned: bool = True, parent=None):
+        super().__init__(parent)
+        self._pinned = bool(pinned)
+        self._hovered = False
+        self.setFixedSize(32, 28)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._sync_tooltip()
+
+    def _sync_tooltip(self):
+        if self._pinned:
+            self.setToolTip("Always on Top: ON (Click to Unpin)")
+        else:
+            self.setToolTip("Always on Top: OFF (Click to Pin)")
+
+    def set_pinned(self, pinned: bool):
+        self._pinned = bool(pinned)
+        self._sync_tooltip()
+        self.update()
+
+    def is_pinned(self) -> bool:
+        return self._pinned
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        if not painter.isActive():
+            return
+        try:
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            rect = self.rect().adjusted(2, 2, -2, -2)
+
+            if self._hovered:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor("#1e293b"))
+                painter.drawRoundedRect(rect, 6, 6)
+
+            if self._pinned:
+                color = QColor("#38bdf8") if self._hovered else QColor("#e2e8f0")
+            else:
+                color = QColor("#cbd5e1") if self._hovered else QColor("#94a3b8")
+
+            pen = QPen(color, 1.8)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            painter.setPen(pen)
+
+            cx = self.width() / 2.0
+            cy = self.height() / 2.0
+
+            # Pushpin head, collar, and needle
+            painter.drawRoundedRect(QRect(int(cx - 4.5), int(cy - 8.5), 9, 3), 1.5, 1.5)
+            body = QPainterPath()
+            body.moveTo(cx - 3.0, cy - 5.5)
+            body.lineTo(cx + 3.0, cy - 5.5)
+            body.lineTo(cx + 5.0, cy + 1.5)
+            body.lineTo(cx - 5.0, cy + 1.5)
+            body.closeSubpath()
+            if self._pinned:
+                painter.setBrush(color)
+            else:
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawPath(body)
+
+            painter.drawLine(QPointF(cx, cy + 1.5), QPointF(cx, cy + 8.0))
+
+            if not self._pinned:
+                slash_pen = QPen(QColor("#f87171") if self._hovered else QColor("#94a3b8"), 1.6)
+                slash_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                painter.setPen(slash_pen)
+                painter.drawLine(QPointF(cx - 6.5, cy - 6.5), QPointF(cx + 6.5, cy + 6.5))
+        finally:
+            if painter.isActive():
+                painter.end()
 
 
 class ImageLoaderSignals(QObject):
@@ -403,6 +497,9 @@ class ImageViewerWindow(QWidget):
         super().__init__(parent)
 
         self._closing = False
+        self._user_resized = False
+        self._toggling_topmost = False
+        self._has_positioned_window = False
         self.image_path = image_path
         self.items = list(items_list) if items_list else []
         self.main_parent = parent
@@ -420,19 +517,14 @@ class ImageViewerWindow(QWidget):
         self.setMinimumSize(300, 280)
 
         settings = load_settings()
-        self.is_always_on_top = settings.get("viewer_always_on_top", True)
+        self.is_always_on_top = bool(settings.get("viewer_always_on_top", True))
         self._prefetch_enabled = settings.get("prefetch_images", True)
         self._loop_navigation = settings.get("loop_gallery_navigation", True)
         self._smooth_scaling = settings.get("smooth_scaling", True)
         self._invert_wheel_zoom = settings.get("invert_mouse_wheel_zoom", False)
         self._mouse_zoom = bool(settings.get("mouse_zoom", True))
 
-        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
-        if self.is_always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
-
-        self.setWindowFlags(flags)
-        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._apply_window_flags(self.is_always_on_top, show_if_visible=False)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
@@ -458,15 +550,43 @@ class ImageViewerWindow(QWidget):
         self.load_image_threaded(self.image_path)
         QTimer.singleShot(30, self.update_title_zoom)
 
+    def _build_window_flags(self, always_on_top: bool) -> Qt.WindowType:
+        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+        if always_on_top:
+            flags |= Qt.WindowType.WindowStaysOnTopHint
+        else:
+            flags &= ~Qt.WindowType.WindowStaysOnTopHint
+        return flags
+
+    def _apply_window_flags(self, always_on_top: bool, show_if_visible: bool = False):
+        was_visible = self.isVisible()
+        pos = self.pos()
+        size = self.size()
+
+        self._toggling_topmost = True
+        try:
+            self.setWindowFlags(self._build_window_flags(always_on_top))
+            if not self.isFullScreen():
+                self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+            if show_if_visible and was_visible:
+                self.setGeometry(QRect(pos, size))
+                self.show()
+                self._position_corner_grip()
+                self.raise_()
+                self.activateWindow()
+        finally:
+            self._toggling_topmost = False
+
     def _is_closing(self):
         return self._closing
 
     def enterEvent(self, event):
         """Automatically activate window and grant keyboard focus when the mouse hovers over."""
-        self.activateWindow()
-        self.setFocus()
-        if hasattr(self, 'canvas') and self.canvas:
-            self.canvas.setFocus()
+        if not self._toggling_topmost:
+            self.activateWindow()
+            self.setFocus()
+            if hasattr(self, 'canvas') and self.canvas:
+                self.canvas.setFocus()
         super().enterEvent(event)
 
     def _store_in_cache(self, file_path, pixmap, full_size):
@@ -492,7 +612,7 @@ class ImageViewerWindow(QWidget):
             return
 
         file_title = os.path.basename(path)
-        self.title_label.setText(f"🔍 Loading: {file_title}...")
+        self.title_label.setText(f"Loading: {file_title}...")
 
         task = ImageLoaderTask(path, self.loader_signals, is_closing_getter=self._is_closing)
         self.thread_pool.start(task)
@@ -564,7 +684,7 @@ class ImageViewerWindow(QWidget):
             target_w = img_w
             target_h = img_h
 
-            if target_w > (max_w - padding_w) or target_h > (max_h - padding_h):
+            if target_w > (max_w - padding_w) or target_h > (max_h - padding_w):
                 if img_aspect > ((max_w - padding_w) / (max_h - padding_h)):
                     target_w = max_w - padding_w
                     target_h = int(target_w / img_aspect)
@@ -575,12 +695,15 @@ class ImageViewerWindow(QWidget):
             final_w = max(400, target_w + padding_w)
             final_h = max(300, target_h + padding_h)
 
-            self.resize(final_w, final_h)
+            if not self._user_resized:
+                self.resize(final_w, final_h)
 
-            center_point = screen_geom.center()
-            window_geom = self.frameGeometry()
-            window_geom.moveCenter(center_point)
-            self.move(window_geom.topLeft())
+            if not self._has_positioned_window:
+                center_point = screen_geom.center()
+                window_geom = self.frameGeometry()
+                window_geom.moveCenter(center_point)
+                self.move(window_geom.topLeft())
+                self._has_positioned_window = True
 
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
@@ -712,25 +835,18 @@ class ImageViewerWindow(QWidget):
         title_layout = QHBoxLayout(self.title_container)
         title_layout.setContentsMargins(4, 0, 4, 0)
 
-        self.pin_btn = QPushButton("📌" if self.is_always_on_top else "📍")
-        self.pin_btn.setFixedSize(28, 28)
-        self.pin_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.pin_btn.setToolTip("Toggle Always on Top")
-        self.pin_btn.setStyleSheet("""
-            QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-size: 13px; }
-            QPushButton:hover { background-color: #1e293b; color: #ffffff; }
-        """)
+        self.pin_btn = PinIconButton(self.is_always_on_top, self.title_container)
         self.pin_btn.clicked.connect(self.toggle_always_on_top)
         title_layout.addWidget(self.pin_btn)
 
         file_title = os.path.basename(self.image_path)
-        self.title_label = QLabel(f"🔍 Loading: {file_title}...")
+        self.title_label = QLabel(f"Loading: {file_title}...")
         self.title_label.setStyleSheet("color: #cbd5e1; font-size: 12px; font-weight: bold; background: transparent;")
         title_layout.addWidget(self.title_label)
 
         title_layout.addStretch()
 
-        btn_close = QPushButton("✕")
+        btn_close = QPushButton("x")
         btn_close.setFixedSize(26, 26)
         btn_close.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_close.setStyleSheet("""
@@ -763,14 +879,33 @@ class ImageViewerWindow(QWidget):
         self.container_layout.addWidget(self.canvas, stretch=1)
 
         bottom_layout = QHBoxLayout()
-        bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setContentsMargins(0, 0, 2, 2)
         bottom_layout.addStretch()
 
         self.resize_grip = ResizeHandleWidget(self)
-        bottom_layout.addWidget(self.resize_grip)
+        bottom_layout.addWidget(self.resize_grip, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
 
         self.container_layout.addLayout(bottom_layout)
         self.main_layout.addWidget(self.container)
+        self.resize_grip.show()
+        self.resize_grip.raise_()
+
+    def _position_corner_grip(self):
+        if not hasattr(self, "resize_grip") or self.resize_grip is None:
+            return
+        if self._is_focus_mode or self.isFullScreen():
+            self.resize_grip.hide()
+            return
+        self.resize_grip.show()
+        self.resize_grip.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._position_corner_grip()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._position_corner_grip()
 
     def toggle_focus_mode(self):
         """Toggles visibility of window canvas elements for a clean borderless image view."""
@@ -805,6 +940,7 @@ class ImageViewerWindow(QWidget):
                     border-radius: 10px;
                 }
             """)
+            self._position_corner_grip()
 
         self.update_title_zoom()
 
@@ -816,7 +952,7 @@ class ImageViewerWindow(QWidget):
             self.container_layout.setSpacing(8)
 
             self.title_container.setVisible(True)
-            self.resize_grip.setVisible(True)
+            self.resize_grip.setVisible(not self._is_focus_mode)
             self.container.setStyleSheet("""
                 QFrame {
                     background-color: #0b0f19;
@@ -825,6 +961,8 @@ class ImageViewerWindow(QWidget):
                 }
             """)
             self.showNormal()
+            if not self._is_focus_mode:
+                self._position_corner_grip()
         else:
             self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, False)
             self.main_layout.setContentsMargins(0, 0, 0, 0)
@@ -846,23 +984,12 @@ class ImageViewerWindow(QWidget):
 
     def toggle_always_on_top(self):
         self.is_always_on_top = not self.is_always_on_top
-        self.pin_btn.setText("📌" if self.is_always_on_top else "📍")
+        if hasattr(self.pin_btn, "set_pinned"):
+            self.pin_btn.set_pinned(self.is_always_on_top)
+        else:
+            self.pin_btn.setText("Pin" if self.is_always_on_top else "Unpin")
 
-        pos = self.pos()
-        size = self.size()
-        was_visible = self.isVisible()
-
-        flags = Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
-        if self.is_always_on_top:
-            flags |= Qt.WindowType.WindowStaysOnTopHint
-
-        self.setWindowFlags(flags)
-        if was_visible:
-            self.show()
-            self.setGeometry(QRect(pos, size))
-            self.raise_()
-            self.activateWindow()
-
+        self._apply_window_flags(self.is_always_on_top, show_if_visible=True)
         save_settings(new_values={"viewer_always_on_top": self.is_always_on_top})
 
     def _get_resize_edge(self, global_pos):
@@ -993,7 +1120,9 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint
         )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        self._position_corner_grip()
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         if self._closing:
@@ -1026,8 +1155,8 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             target_w = img_w
             target_h = img_h
 
-            if target_w > (max_w - padding_w) or target_h > (max_h - padding_h):
-                if img_aspect > ((max_w - padding_w) / (max_h - padding_h)):
+            if target_w > (max_w - padding_w) or target_h > (max_h - padding_w):
+                if img_aspect > ((max_w - padding_w) / (max_h - padding_w)):
                     target_w = max_w - padding_w
                     target_h = int(target_w / img_aspect)
                 else:
@@ -1037,12 +1166,15 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             final_w = max(400, target_w + padding_w)
             final_h = max(300, target_h + padding_h)
 
-            self.resize(final_w, final_h)
+            if not self._user_resized:
+                self.resize(final_w, final_h)
 
-            center_point = screen_geom.center()
-            window_geom = self.frameGeometry()
-            window_geom.moveCenter(center_point)
-            self.move(window_geom.topLeft())
+            if not self._has_positioned_window:
+                center_point = screen_geom.center()
+                window_geom = self.frameGeometry()
+                window_geom.moveCenter(center_point)
+                self.move(window_geom.topLeft())
+                self._has_positioned_window = True
 
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
