@@ -181,11 +181,11 @@ class TitleBar(QWidget, WindowDragHandler):
             self.max_btn.clicked.connect(self.toggle_maximize)
             h_layout.addWidget(self.max_btn)
 
-        self.close_btn = QPushButton("x")
+        self.close_btn = QPushButton("×")
         self.close_btn.setFixedSize(28, 28)
         self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.close_btn.setStyleSheet("""
-            QPushButton { background-color: transparent; color: #94a3b8; border: none; border-radius: 6px; font-weight: bold; }
+            QPushButton { background-color: transparent; color: #94a3b8; font-size: 14px; padding-top: 0px; padding-bottom: 2px; border: none; border-radius: 6px; font-weight: bold; }
             QPushButton:hover { background-color: #c42b1c; color: #ffffff; }
         """)
         self.close_btn.clicked.connect(self.parent_window.close)
