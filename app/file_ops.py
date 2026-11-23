@@ -1,16 +1,392 @@
 import os
+import re
 import shutil
 import uuid
 from PIL import Image
 from PySide6.QtCore import Qt, QMimeData, QUrl
-from PySide6.QtGui import QGuiApplication
-from PySide6.QtWidgets import QMenu, QMessageBox
+from PySide6.QtGui import QColor, QGuiApplication
+from PySide6.QtWidgets import (
+    QMenu, QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
+    QLineEdit, QSpinBox, QCheckBox, QTableWidget, QTableWidgetItem,
+    QHeaderView, QPushButton, QLabel, QFrame, QGraphicsDropShadowEffect
+)
 
 from .helpers import load_settings
+from .widgets import WindowDragHandler, TitleBar
+
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def sanitize_filename_component(name: str, fallback: str = "file") -> str:
+    """Sanitizes a filename so path separators, traversal sequences, or invalid chars cannot escape target dirs."""
+    if not isinstance(name, str) or not name:
+        return fallback
+    safe = os.path.basename(name)
+    safe = safe.replace("..", "_")
+    safe = "".join("_" if (ch in _INVALID_FILENAME_CHARS or ord(ch) < 32) else ch for ch in safe)
+    safe = safe.strip(" .")
+    return safe if safe else fallback
+
+
+def build_rename_plan(paths, pattern: str, start_index: int = 1, pad_width: int = 0, lowercase_ext: bool = False):
+    """Computes collision-safe rename operations for single or multiple files.
+
+    Returns a list of dicts:
+    {
+        "src": src_abs,
+        "old_name": orig_name,
+        "dst": candidate_abs,
+        "new_name": os.path.basename(candidate_abs),
+        "changed": bool,
+    }
+    """
+    unique_paths = []
+    seen = set()
+    for p in (paths or []):
+        if not p:
+            continue
+        abs_p = os.path.abspath(p)
+        if abs_p not in seen and os.path.isfile(abs_p):
+            seen.add(abs_p)
+            unique_paths.append(abs_p)
+
+    if not unique_paths:
+        return []
+
+    is_batch = len(unique_paths) > 1
+    raw_pattern = (pattern or "").strip()
+    if not raw_pattern:
+        raw_pattern = "image_{n}" if is_batch else os.path.splitext(os.path.basename(unique_paths[0]))[0]
+
+    effective_pad = (
+        max(1, int(pad_width))
+        if int(pad_width or 0) > 0
+        else (max(2, len(str(len(unique_paths) + int(start_index)))) if is_batch else 1)
+    )
+    all_selected_lower = {os.path.normcase(p) for p in unique_paths}
+    reserved_targets = set()
+    plan = []
+
+    for offset, src_abs in enumerate(unique_paths):
+        idx = int(start_index) + offset
+        num_str = f"{idx:0{effective_pad}d}"
+        parent_dir = os.path.dirname(src_abs)
+        orig_name = os.path.basename(src_abs)
+        orig_stem, raw_ext = os.path.splitext(orig_name)
+        ext = raw_ext.lower() if lowercase_ext else raw_ext
+        clean_ext = raw_ext.lstrip(".")
+        safe_orig = sanitize_filename_component(orig_stem, fallback="image")
+
+        if not is_batch:
+            entered_stem, entered_ext = os.path.splitext(raw_pattern)
+            if entered_ext.lower() == raw_ext.lower() and entered_stem:
+                target_stem = sanitize_filename_component(entered_stem, fallback=orig_stem)
+            else:
+                target_stem = sanitize_filename_component(raw_pattern, fallback=orig_stem)
+        else:
+            has_counter = bool(re.search(r"\{(n|index)\}", raw_pattern, flags=re.IGNORECASE))
+            rendered = re.sub(r"\{n\}|\{index\}", num_str, raw_pattern, flags=re.IGNORECASE)
+            rendered = re.sub(r"\{name\}", safe_orig, rendered, flags=re.IGNORECASE)
+            rendered = re.sub(r"\{ext\}", clean_ext, rendered, flags=re.IGNORECASE)
+            if not has_counter:
+                rendered = f"{rendered}_{num_str}"
+            target_stem = sanitize_filename_component(rendered, fallback=f"image_{num_str}")
+
+        candidate_name = f"{target_stem}{ext}"
+        candidate_abs = os.path.abspath(os.path.join(parent_dir, candidate_name))
+        if os.path.commonpath([parent_dir, candidate_abs]) != parent_dir:
+            candidate_abs = os.path.abspath(
+                os.path.join(parent_dir, f"{sanitize_filename_component(target_stem, fallback='image')}_{num_str}{ext}")
+            )
+
+        counter = 1
+        while True:
+            norm_cand = os.path.normcase(candidate_abs)
+            exists_outside_selection = os.path.exists(candidate_abs) and (norm_cand not in all_selected_lower)
+            already_used = norm_cand in reserved_targets
+            if not exists_outside_selection and not already_used:
+                break
+            candidate_abs = os.path.join(parent_dir, f"{target_stem}_{counter:03d}{ext}")
+            counter += 1
+
+        reserved_targets.add(os.path.normcase(candidate_abs))
+        final_name = os.path.basename(candidate_abs)
+        changed = os.path.normcase(src_abs) != os.path.normcase(candidate_abs)
+        plan.append({
+            "src": src_abs,
+            "old_name": orig_name,
+            "dst": candidate_abs,
+            "new_name": final_name,
+            "changed": changed,
+        })
+
+    return plan
+
+
+class RenamePreviewDialog(QDialog, WindowDragHandler):
+    """Borderless rename & batch-rename dialog matching SettingsDialog styling with live Old Name -> New Name preview."""
+
+    def __init__(self, paths, parent=None):
+        super().__init__(parent)
+        WindowDragHandler.__init__(self)
+        self.paths = [os.path.abspath(p) for p in (paths or []) if p and os.path.isfile(p)]
+        self.is_batch = len(self.paths) > 1
+        self._result_plan = []
+
+        self.setWindowTitle("Batch Rename Preview" if self.is_batch else "Rename File")
+        self.resize(780 if self.is_batch else 560, 480 if self.is_batch else 250)
+        self.setMinimumSize(540 if self.is_batch else 480, 380 if self.is_batch else 220)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+
+        self._setup_ui()
+        self._refresh_preview()
+
+    def done(self, result):
+        if hasattr(self, "container") and self.container is not None:
+            self.container.setGraphicsEffect(None)
+        super().done(result)
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.container = QFrame(self)
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: #0d1321;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+            }
+            QLabel {
+                color: #f8fafc;
+                font-family: sans-serif;
+                font-size: 12px;
+                border: none;
+                background: transparent;
+            }
+            QLineEdit, QSpinBox {
+                background-color: #05070a;
+                color: #f8fafc;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 12px;
+            }
+            QLineEdit:focus, QSpinBox:focus {
+                border-color: #3b82f6;
+            }
+            QCheckBox {
+                color: #cbd5e1;
+                font-family: sans-serif;
+                font-size: 12px;
+                spacing: 8px;
+                background: transparent;
+            }
+            QCheckBox::indicator {
+                width: 16px;
+                height: 16px;
+                border: 1px solid #1e293b;
+                border-radius: 4px;
+                background: #131b2e;
+            }
+            QCheckBox::indicator:checked {
+                background: #3b82f6;
+                border-color: #3b82f6;
+            }
+            QTableWidget {
+                background-color: #05070a;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                gridline-color: #1e293b;
+                font-size: 12px;
+            }
+            QHeaderView::section {
+                background-color: #131b2e;
+                color: #94a3b8;
+                border: 1px solid #1e293b;
+                padding: 6px;
+                font-weight: 600;
+            }
+            QPushButton {
+                background-color: #131b2e;
+                color: #cbd5e1;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 8px 16px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #1a233a;
+                color: #f1f5f9;
+                border-color: #334155;
+            }
+            QPushButton#primaryBtn {
+                background-color: #3b82f6;
+                border: none;
+                color: #ffffff;
+                padding: 8px 18px;
+                font-weight: bold;
+            }
+            QPushButton#primaryBtn:hover {
+                background-color: #2563eb;
+            }
+            QPushButton#primaryBtn:disabled {
+                background-color: #1e293b;
+                color: #64748b;
+            }
+        """)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(shadow)
+
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(16, 16, 16, 16)
+        container_layout.setSpacing(12)
+
+        title_text = "Batch Rename Preview" if self.is_batch else "Rename File"
+        container_layout.addWidget(TitleBar(title_text, self, show_min_max=False))
+
+        if self.is_batch:
+            help_lbl = QLabel(
+                "Tokens: <b>{n}</b> (sequence number), <b>{name}</b> (original stem), <b>{ext}</b> (extension). "
+                "If <b>{n}</b> is omitted, a counter is appended automatically."
+            )
+            help_lbl.setWordWrap(True)
+            help_lbl.setStyleSheet("color: #cbd5e1;")
+            container_layout.addWidget(help_lbl)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        if not self.is_batch:
+            stem, _ = os.path.splitext(os.path.basename(self.paths[0]))
+            default_pattern = stem
+            label_text = "New filename:"
+        else:
+            default_pattern = "image_{n}"
+            label_text = "Name pattern:"
+
+        self.pattern_edit = QLineEdit(default_pattern)
+        self.pattern_edit.selectAll()
+        self.pattern_edit.textChanged.connect(self._refresh_preview)
+        form.addRow(label_text, self.pattern_edit)
+
+        options_row = QHBoxLayout()
+        self.start_spin = QSpinBox()
+        self.start_spin.setRange(0, 999999)
+        self.start_spin.setValue(1)
+        self.start_spin.valueChanged.connect(self._refresh_preview)
+
+        self.pad_spin = QSpinBox()
+        self.pad_spin.setRange(0, 8)
+        self.pad_spin.setSpecialValueText("Auto")
+        self.pad_spin.setValue(0)
+        self.pad_spin.valueChanged.connect(self._refresh_preview)
+
+        self.lower_ext_chk = QCheckBox("Lowercase extension")
+        self.lower_ext_chk.stateChanged.connect(self._refresh_preview)
+
+        if self.is_batch:
+            options_row.addWidget(QLabel("Start #:"))
+            options_row.addWidget(self.start_spin)
+            options_row.addSpacing(12)
+            options_row.addWidget(QLabel("Zero-padding:"))
+            options_row.addWidget(self.pad_spin)
+            options_row.addSpacing(12)
+        else:
+            self.start_spin.hide()
+            self.pad_spin.hide()
+
+        options_row.addWidget(self.lower_ext_chk)
+        options_row.addStretch()
+        form.addRow("Options:", options_row)
+
+        container_layout.addLayout(form)
+
+        self.table = QTableWidget(0, 3)
+        self.table.setHorizontalHeaderLabels(["Current Name", "Preview New Name", "Status"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setColumnWidth(0, 230)
+        container_layout.addWidget(self.table, stretch=1)
+
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("color: #cbd5e1;")
+        container_layout.addWidget(self.summary_label)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.cancel_btn.clicked.connect(self.reject)
+
+        self.apply_btn = QPushButton("Apply Rename")
+        self.apply_btn.setObjectName("primaryBtn")
+        self.apply_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.apply_btn.clicked.connect(self.accept)
+
+        btn_row.addWidget(self.cancel_btn)
+        btn_row.addWidget(self.apply_btn)
+        container_layout.addLayout(btn_row)
+
+        main_layout.addWidget(self.container)
+
+    def mousePressEvent(self, event):
+        self.handle_mouse_press(self, event)
+
+    def mouseMoveEvent(self, event):
+        self.handle_mouse_move(self, event)
+
+    def _refresh_preview(self):
+        plan = build_rename_plan(
+            self.paths,
+            pattern=self.pattern_edit.text(),
+            start_index=self.start_spin.value(),
+            pad_width=self.pad_spin.value(),
+            lowercase_ext=self.lower_ext_chk.isChecked(),
+        )
+        self._result_plan = plan
+        self.table.setRowCount(len(plan))
+        changed_count = 0
+
+        for row_idx, entry in enumerate(plan):
+            old_item = QTableWidgetItem(entry["old_name"])
+            new_item = QTableWidgetItem(entry["new_name"])
+            if entry["changed"]:
+                changed_count += 1
+                status_text = "Rename"
+                new_item.setForeground(Qt.GlobalColor.cyan)
+            else:
+                status_text = "Unchanged"
+                new_item.setForeground(Qt.GlobalColor.gray)
+
+            status_item = QTableWidgetItem(status_text)
+            self.table.setItem(row_idx, 0, old_item)
+            self.table.setItem(row_idx, 1, new_item)
+            self.table.setItem(row_idx, 2, status_item)
+
+        self.summary_label.setText(f"Ready to rename {changed_count} of {len(plan)} file(s).")
+        self.apply_btn.setEnabled(changed_count > 0)
+
+    def get_rename_plan(self):
+        return [entry for entry in self._result_plan if entry.get("changed")]
 
 
 class FileOperationsController:
-    """Handles clipboard copy/cut/paste, drag-and-drop move/copy, staged deletes, and undo/redo."""
+    """Handles clipboard copy/cut/paste, drag-and-drop move/copy, staged deletes, renames, and undo/redo."""
 
     def __init__(self, win, settings_file="settings.json"):
         self.win = win
@@ -39,7 +415,7 @@ class FileOperationsController:
             self.win.folder_scan_cache.pop(d, None)
         if self.win.current_watched_dir:
             self.win.folder_scan_cache.pop(os.path.abspath(self.win.current_watched_dir), None)
-            self.win.folder_sync.perform_smooth_folder_sync()
+        self.win.folder_sync.perform_smooth_folder_sync()
 
     def ensure_folder_in_watch_and_cache(self, folder_path):
         if not folder_path or not os.path.isdir(folder_path):
@@ -94,6 +470,24 @@ class FileOperationsController:
             self._redo_stack.append(action)
             self.win.set_status(f"Restored {len(action['pairs'])} deleted file(s).")
 
+        elif op_type == "rename":
+            staged_map = []
+            for orig_src, current_dst in reversed(action["pairs"]):
+                if os.path.exists(current_dst):
+                    os.makedirs(os.path.dirname(orig_src), exist_ok=True)
+                    tmp_path = os.path.join(
+                        os.path.dirname(current_dst),
+                        f".tmp_undo_{uuid.uuid4().hex}_{os.path.basename(current_dst)}"
+                    )
+                    os.replace(current_dst, tmp_path)
+                    staged_map.append((tmp_path, orig_src))
+            for tmp_path, orig_src in staged_map:
+                if os.path.exists(tmp_path):
+                    os.replace(tmp_path, orig_src)
+                    affected.extend([tmp_path, orig_src])
+            self._redo_stack.append(action)
+            self.win.set_status(f"Undid rename of {len(action['pairs'])} file(s).")
+
         if self.win.current_watched_dir:
             self.win.folder_sync.sync_file_watcher_paths(self.win.current_watched_dir)
         self.refresh_after_history_op(affected)
@@ -137,9 +531,126 @@ class FileOperationsController:
             self._undo_stack.append(action)
             self.win.set_status(f"Redid delete of {len(action['pairs'])} file(s).")
 
+        elif op_type == "rename":
+            staged_map = []
+            for orig_src, target_dst in action["pairs"]:
+                if os.path.exists(orig_src):
+                    os.makedirs(os.path.dirname(target_dst), exist_ok=True)
+                    tmp_path = os.path.join(
+                        os.path.dirname(orig_src),
+                        f".tmp_redo_{uuid.uuid4().hex}_{os.path.basename(orig_src)}"
+                    )
+                    os.replace(orig_src, tmp_path)
+                    staged_map.append((tmp_path, target_dst))
+            for tmp_path, target_dst in staged_map:
+                if os.path.exists(tmp_path):
+                    os.replace(tmp_path, target_dst)
+                    affected.extend([tmp_path, target_dst])
+            self._undo_stack.append(action)
+            self.win.set_status(f"Redid rename of {len(action['pairs'])} file(s).")
+
         if self.win.current_watched_dir:
             self.win.folder_sync.sync_file_watcher_paths(self.win.current_watched_dir)
         self.refresh_after_history_op(affected)
+
+    def rename_selected_files(self, paths):
+        unique_paths = []
+        seen = set()
+        for p in (paths or []):
+            if not p:
+                continue
+            abs_p = os.path.abspath(p)
+            if abs_p not in seen and os.path.isfile(abs_p):
+                seen.add(abs_p)
+                unique_paths.append(abs_p)
+
+        if not unique_paths:
+            self.win.set_status("Rename failed: No image(s) selected.")
+            return
+
+        dlg = RenamePreviewDialog(unique_paths, parent=self.win)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+
+        planned_entries = dlg.get_rename_plan()
+        planned_ops = [(entry["src"], entry["dst"]) for entry in planned_entries]
+        if not planned_ops:
+            self.win.set_status("No files required renaming.")
+            return
+
+        if self.win.current_watched_dir:
+            self.win.file_watcher.removePaths(self.win.file_watcher.directories())
+
+        renamed_records = []
+        failed_errors = []
+
+        temp_stages = []
+        for src_abs, final_dst_abs in planned_ops:
+            if not os.path.exists(src_abs):
+                failed_errors.append(f"{os.path.basename(src_abs)}: file missing")
+                continue
+            tmp_path = os.path.join(
+                os.path.dirname(src_abs),
+                f".tmp_ren_{uuid.uuid4().hex}_{os.path.basename(src_abs)}"
+            )
+            try:
+                os.replace(src_abs, tmp_path)
+                temp_stages.append((src_abs, tmp_path, final_dst_abs))
+            except Exception as e:
+                failed_errors.append(f"{os.path.basename(src_abs)}: {e}")
+
+        for src_abs, tmp_path, final_dst_abs in temp_stages:
+            try:
+                os.replace(tmp_path, final_dst_abs)
+                renamed_records.append((src_abs, final_dst_abs))
+            except Exception as e:
+                failed_errors.append(f"{os.path.basename(src_abs)} -> {os.path.basename(final_dst_abs)}: {e}")
+                if os.path.exists(tmp_path):
+                    try:
+                        os.replace(tmp_path, src_abs)
+                    except OSError:
+                        pass
+
+        if self.win.current_watched_dir:
+            self.win.folder_sync.sync_file_watcher_paths(self.win.current_watched_dir)
+
+        if renamed_records:
+            self.record_undo_action({"type": "rename", "pairs": renamed_records})
+            old_to_new = {os.path.normcase(src): dst for src, dst in renamed_records}
+
+            for item in self.win.loaded_items:
+                norm_fp = os.path.normcase(os.path.abspath(item.get("file_path", "")))
+                if norm_fp in old_to_new:
+                    new_fp = old_to_new[norm_fp]
+                    new_name = os.path.basename(new_fp)
+                    item["file_path"] = new_fp
+                    item["filename"] = new_name.lower()
+                    item["display_name"] = (new_name[:16] + "..") if len(new_name) > 18 else new_name
+                    try:
+                        st = os.stat(new_fp)
+                        item["size"] = st.st_size
+                        item["mtime"] = st.st_mtime
+                    except OSError:
+                        pass
+                    self.win.start_thumbnail_task(new_fp, self.win.scan_id)
+
+            if hasattr(self.win.workspace_grid, "selected_file_paths"):
+                self.win.workspace_grid.selected_file_paths = {
+                    old_to_new.get(os.path.normcase(os.path.abspath(p)), p)
+                    for p in self.win.workspace_grid.selected_file_paths
+                }
+
+            self.win.rebuild_path_index()
+            if self.win.current_watched_dir in self.win.folder_scan_cache:
+                self.win.folder_scan_cache[self.win.current_watched_dir] = list(self.win.loaded_items)
+            self.win.apply_sorting()
+
+            msg = f"Renamed {len(renamed_records)} file(s) (Ctrl+Z to undo)."
+            if failed_errors:
+                msg += f" ({len(failed_errors)} failed)"
+            self.win.set_status(msg)
+        elif failed_errors:
+            self.win.set_status(f"Rename failed: {failed_errors[0]}")
 
     def move_files_to_folder(self, src_paths, target_folder):
         if not src_paths or not target_folder or not os.path.isdir(target_folder):
@@ -159,13 +670,18 @@ class FileOperationsController:
             if not is_copy and os.path.dirname(src_abs) == target_abs:
                 continue
 
-            filename = os.path.basename(src_abs)
-            dest_abs = os.path.join(target_abs, filename)
-            base, ext = os.path.splitext(filename)
-            suffix = "_copy" if is_copy else "_moved"
+            raw_name = os.path.basename(src_abs)
+            base, ext = os.path.splitext(raw_name)
+            safe_base = sanitize_filename_component(base, fallback="image")
+            safe_filename = f"{safe_base}{ext}"
+            dest_abs = os.path.abspath(os.path.join(target_abs, safe_filename))
+            if os.path.commonpath([target_abs, dest_abs]) != target_abs:
+                continue
+
+            suffix = "_"
             counter = 1
             while os.path.exists(dest_abs):
-                dest_abs = os.path.join(target_abs, f"{base}{suffix}{counter}{ext}")
+                dest_abs = os.path.join(target_abs, f"{safe_base}{suffix}{counter:04d}{ext}")
                 counter += 1
 
             try:
@@ -225,6 +741,7 @@ class FileOperationsController:
         copy_action = menu.addAction("Copy")
         cut_action = menu.addAction("Cut")
         paste_action = menu.addAction("Paste")
+        rename_action = menu.addAction("Batch Rename..." if len(selected_paths) > 1 else "Rename...")
         menu.addSeparator()
         delete_action = menu.addAction("Delete")
 
@@ -233,6 +750,7 @@ class FileOperationsController:
 
         copy_action.setEnabled(has_selection)
         cut_action.setEnabled(has_selection)
+        rename_action.setEnabled(has_selection)
         delete_action.setEnabled(has_selection)
 
         clipboard = QGuiApplication.clipboard()
@@ -247,6 +765,8 @@ class FileOperationsController:
             self.copy_selected_files(selected_paths, cut=True)
         elif action == paste_action:
             self.paste_files_from_clipboard()
+        elif action == rename_action:
+            self.rename_selected_files(selected_paths)
         elif action == delete_action:
             self.delete_selected_files(selected_paths)
 
@@ -271,6 +791,7 @@ class FileOperationsController:
         moved_records = []
         success_count = 0
         cut_paths = self._cut_source_paths
+        dest_dir_abs = os.path.abspath(self.win.current_watched_dir)
 
         for url in mime_data.urls():
             src_path = url.toLocalFile()
@@ -279,13 +800,17 @@ class FileOperationsController:
                 if ext not in valid_exts:
                     continue
                 try:
-                    filename = os.path.basename(src_path)
-                    dest_path = os.path.join(self.win.current_watched_dir, filename)
-
-                    base, file_ext = os.path.splitext(filename)
+                    raw_name = os.path.basename(src_path)
+                    base, file_ext = os.path.splitext(raw_name)
+                    safe_base = sanitize_filename_component(base, fallback="image")
+                    safe_filename = f"{safe_base}{file_ext}"
+                    dest_path = os.path.abspath(os.path.join(dest_dir_abs, safe_filename))
+                    if os.path.commonpath([dest_dir_abs, dest_path]) != dest_dir_abs:
+                        continue
+                    suffix = "_"
                     counter = 1
                     while os.path.exists(dest_path):
-                        dest_path = os.path.join(self.win.current_watched_dir, f"{base}_copy{counter}{file_ext}")
+                        dest_path = os.path.join(dest_dir_abs, f"{safe_base}{suffix}{counter:04d}{file_ext}")
                         counter += 1
 
                     if cut_paths and os.path.abspath(src_path) in [os.path.abspath(p) for p in cut_paths]:
@@ -475,7 +1000,8 @@ class FileOperationsController:
             if os.path.exists(norm_path):
                 if use_undo_staging:
                     try:
-                        staged_name = f"{uuid.uuid4().hex}_{os.path.basename(norm_path)}"
+                        raw_base = sanitize_filename_component(os.path.basename(norm_path), fallback="file")
+                        staged_name = f"{uuid.uuid4().hex}_{raw_base}"
                         staged_path = os.path.join(self.win.undo_trash_dir, staged_name)
                         shutil.move(norm_path, staged_path)
                         deleted_paths.add(norm_path)

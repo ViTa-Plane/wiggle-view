@@ -1,6 +1,15 @@
 import sys
+from PIL import Image
 from PySide6.QtWidgets import QApplication
 from app.ui import MainWindow
+
+
+# Eagerly initialize Pillow image plugins on the main thread so worker threads
+# do not trigger native plugin/DLL imports during background encoding.
+try:
+    Image.init()
+except Exception:
+    pass
 
 
 if __name__ == "__main__":

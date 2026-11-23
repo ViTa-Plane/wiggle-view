@@ -7,7 +7,7 @@ import time
 
 from PIL import Image, PngImagePlugin
 from PIL.ExifTags import TAGS
-from PySide6.QtCore import QObject, QRunnable, Signal
+from PySide6.QtCore import QObject, QRunnable, Signal, QTimer
 from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
 
 from .dialogs import BatchCompleteDialog, BatchConvertDialog
@@ -39,6 +39,19 @@ QScrollBar::sub-page:horizontal {
 }
 """
 
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+
+def sanitize_filename_component(name: str, fallback: str = "untitled") -> str:
+    """Sanitizes a filename stem to prevent path traversal and invalid Windows/POSIX characters."""
+    if not isinstance(name, str) or not name:
+        return fallback
+    safe = os.path.basename(name)
+    safe = safe.replace("..", "_")
+    safe = "".join("_" if (ch in _INVALID_FILENAME_CHARS or ord(ch) < 32) else ch for ch in safe)
+    safe = safe.strip(" .")
+    return safe if safe else fallback
+
 
 def _configure_non_native_file_dialog(
     parent,
@@ -56,7 +69,6 @@ def _configure_non_native_file_dialog(
     else:
         dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
 
-    # Clear inherited scrollbar stylesheet rules on the dialog and its child views
     dialog.setStyleSheet(_CLEAR_DIALOG_SCROLLBAR_QSS)
     for child in dialog.findChildren(QObject):
         if hasattr(child, "setStyleSheet"):
@@ -148,9 +160,73 @@ def _save_pil_atomic(img, target_path, is_closing=None, **save_kwargs):
     write_bytes_atomic(target_path, buf.getvalue(), is_closing=is_closing)
 
 
+def _looks_like_comfy_prompt_graph(obj):
+    """Returns True if a parsed JSON dict resembles a ComfyUI API prompt graph ({node_id: {inputs, class_type}})."""
+    if not isinstance(obj, dict) or not obj:
+        return False
+    node_like_count = 0
+    for v in obj.values():
+        if isinstance(v, dict) and ("class_type" in v or "inputs" in v):
+            node_like_count += 1
+    return node_like_count >= 1
+
+
+def _looks_like_comfy_workflow_graph(obj):
+    """Returns True if a parsed JSON dict resembles a ComfyUI UI workflow graph ({nodes, links})."""
+    if not isinstance(obj, dict):
+        return False
+    has_nodes = isinstance(obj.get("nodes"), list)
+    has_links = isinstance(obj.get("links"), list)
+    return has_nodes and has_links
+
+
+def _extract_comfy_chunks_from_json_payload(content):
+    """
+    Normalizes an imported JSON payload into PNG text chunk entries for ComfyUI metadata.
+    Supports:
+      - Direct ComfyUI workflow JSON ({nodes, links, ...}) -> {"workflow": "<json>"}
+      - Direct ComfyUI prompt JSON ({"1": {"inputs": ..., "class_type": ...}, ...}) -> {"prompt": "<json>"}
+      - Exported wrapper dicts containing "workflow" and/or "prompt" keys/strings
+    Returns a dict mapping PNG text chunk key ("workflow" / "prompt") -> JSON string.
+    """
+    chunks = {}
+    if not isinstance(content, dict):
+        return chunks
+
+    # Case 1: Wrapper dict explicitly carrying "workflow" and/or "prompt"
+    for key in ("workflow", "prompt"):
+        if key in content and content[key] is not None:
+            val = content[key]
+            if isinstance(val, str):
+                stripped = val.strip()
+                if stripped:
+                    try:
+                        parsed = json.loads(stripped)
+                        chunks[key] = json.dumps(parsed)
+                    except Exception:
+                        chunks[key] = stripped
+            elif isinstance(val, (dict, list)):
+                chunks[key] = json.dumps(val)
+
+    if chunks:
+        return chunks
+
+    # Case 2: Raw ComfyUI workflow JSON file (e.g., *_workflow.json)
+    if _looks_like_comfy_workflow_graph(content):
+        chunks["workflow"] = json.dumps(content)
+        return chunks
+
+    # Case 3: Raw ComfyUI prompt graph JSON file
+    if _looks_like_comfy_prompt_graph(content):
+        chunks["prompt"] = json.dumps(content)
+        return chunks
+
+    return chunks
+
+
 class _BatchTaskSignals(QObject):
     progress = Signal(str)
-    finished = Signal(str, str, list)  # dialog_title, status_message, modified_paths
+    finished = Signal(str, str, list)
 
 
 class _BatchFunctionWorker(QRunnable):
@@ -355,7 +431,6 @@ class BatchToolsController:
         if not abs_paths:
             return
 
-        # Reset has_comfy on modified items so ComfyMetadataScannerTask re-evaluates cleanly
         items_by_path = getattr(self.win, "items_by_path", None)
         loaded_items = getattr(self.win, "loaded_items", None)
         modified_items = []
@@ -376,18 +451,16 @@ class BatchToolsController:
                     if item not in modified_items:
                         modified_items.append(item)
 
-        # Invalidate cached folder scan entries covering modified files
         folder_scan_cache = getattr(self.win, "folder_scan_cache", None)
         if isinstance(folder_scan_cache, dict):
             for ap in abs_paths:
                 parent_dir = os.path.dirname(ap)
                 if parent_dir:
                     folder_scan_cache.pop(parent_dir, None)
-                watched = getattr(self.win, "current_watched_dir", None)
-                if watched:
-                    folder_scan_cache.pop(os.path.abspath(watched), None)
+            watched = getattr(self.win, "current_watched_dir", None)
+            if watched:
+                folder_scan_cache.pop(os.path.abspath(watched), None)
 
-        # Re-run ComfyUI metadata badge scan for modified items using existing window signals/scan_id
         thread_pool = getattr(self.win, "thread_pool", None)
         comfy_signals = getattr(self.win, "comfy_signals", None)
         scan_id = getattr(self.win, "scan_id", 0)
@@ -400,7 +473,6 @@ class BatchToolsController:
             )
             thread_pool.start(comfy_task)
 
-        # Refresh grid badges/cards via existing MainWindow helpers
         schedule_repaint = getattr(self.win, "_schedule_grid_repaint", None)
         if callable(schedule_repaint):
             schedule_repaint(relayout=False)
@@ -412,7 +484,6 @@ class BatchToolsController:
                 elif hasattr(workspace_grid, "update"):
                     workspace_grid.update()
 
-        # Refresh right-sidebar inspector if any modified file is currently selected
         workspace_grid = getattr(self.win, "workspace_grid", None)
         selected_paths = getattr(workspace_grid, "selected_file_paths", None) if workspace_grid is not None else None
         if selected_paths:
@@ -422,11 +493,31 @@ class BatchToolsController:
                 self.win.on_selection_changed(list(selected_paths))
 
     def _on_background_batch_finished(self, title, msg, modified_paths=None):
+        """Completes batch UI refresh safely after modal dialog/paint state settles."""
         if self._is_closing():
             return
-        self._refresh_modified_files_metadata(modified_paths)
-        self.win.set_status(msg)
-        BatchCompleteDialog(self.win, title, msg).exec()
+
+        pending_paths = list(modified_paths or [])
+        status_text = msg
+        dialog_title = title
+        dialog_msg = msg
+
+        def _finalize_after_dialog():
+            if self._is_closing():
+                return
+            try:
+                self._refresh_modified_files_metadata(pending_paths)
+            except Exception as e:
+                print(f"Error refreshing modified files metadata: {e}")
+            try:
+                self.win.set_status(status_text)
+            except Exception:
+                pass
+
+        try:
+            BatchCompleteDialog(self.win, dialog_title, dialog_msg).exec()
+        finally:
+            QTimer.singleShot(0, _finalize_after_dialog)
 
     def batch_convert_images(self):
         paths = self._get_selected_existing_paths("batch conversion")
@@ -514,7 +605,7 @@ class BatchToolsController:
                             palette = img.getpalette()
                             if palette:
                                 clean_img.putpalette(palette)
-                            clean_img.paste(img)
+                        clean_img.paste(img)
 
                     save_kwargs = {}
                     if icc_profile:
@@ -552,15 +643,19 @@ class BatchToolsController:
         def _work(emit_progress, is_closing):
             success_count = 0
             last_json_filename = ""
+            export_abs = os.path.abspath(export_dir)
 
             for idx, path in enumerate(paths, 1):
                 if is_closing():
                     break
                 try:
                     emit_progress(f"Exporting EXIF ({idx}/{len(paths)}): {os.path.basename(path)}")
-                    base_name = os.path.splitext(os.path.basename(path))[0]
-                    json_filename = f"{base_name}_EXIF.json"
-                    out_json = os.path.join(export_dir, json_filename)
+                    raw_stem = os.path.splitext(os.path.basename(path))[0]
+                    safe_stem = sanitize_filename_component(raw_stem, fallback=f"image_{idx}")
+                    json_filename = f"{safe_stem}_EXIF.json"
+                    out_json = os.path.abspath(os.path.join(export_abs, json_filename))
+                    if os.path.commonpath([export_abs, out_json]) != export_abs:
+                        continue
                     last_json_filename = json_filename
 
                     _, metadata_dict = extract_image_metadata(path)
@@ -609,14 +704,28 @@ class BatchToolsController:
         def _work(emit_progress, is_closing):
             exif_data_bytes = None
             exif_dict = {}
+            comfy_chunks = {}
 
             if source_file.lower().endswith(".json"):
                 with open(source_file, "r", encoding="utf-8") as f:
                     content = json.load(f)
                 if isinstance(content, dict):
-                    exif_dict = content
+                    exif_dict = dict(content)
+                    comfy_chunks = _extract_comfy_chunks_from_json_payload(content)
             else:
                 exif_data_bytes, exif_dict = extract_image_metadata(source_file)
+                try:
+                    with Image.open(source_file) as src_img:
+                        if getattr(src_img, "text", None):
+                            for k in ("workflow", "prompt"):
+                                if k in src_img.text and src_img.text[k]:
+                                    comfy_chunks[k] = src_img.text[k]
+                except Exception:
+                    pass
+
+            # Also pick up workflow/prompt entries if present inside a full EXIF JSON dump
+            if not comfy_chunks and isinstance(exif_dict, dict):
+                comfy_chunks = _extract_comfy_chunks_from_json_payload(exif_dict)
 
             tags_rev = {v: k for k, v in TAGS.items()}
             success_count = 0
@@ -633,12 +742,30 @@ class BatchToolsController:
                         target.load()
                         if file_ext == ".png":
                             meta = PngImagePlugin.PngInfo()
+                            # Preserve existing PNG text chunks first (so existing workflow/prompt stay unless overridden)
+                            existing_text = {}
                             if hasattr(target, "text") and target.text:
                                 for k, v in target.text.items():
                                     if not k.lower().startswith("jfif"):
-                                        meta.add_text(k, str(v))
+                                        existing_text[k] = str(v)
+
+                            # Apply imported ComfyUI chunks under canonical 'workflow' / 'prompt' keys
+                            for k, v in comfy_chunks.items():
+                                existing_text[k] = str(v)
+
+                            # Apply remaining metadata entries while avoiding overwriting canonical ComfyUI keys
+                            # with non-JSON or stringified wrapper values unless no canonical chunk was extracted
                             for k, v in exif_dict.items():
-                                meta.add_text(str(k), str(v))
+                                k_str = str(k)
+                                if k_str.lower().startswith("jfif"):
+                                    continue
+                                if k_str in ("workflow", "prompt") and k_str in comfy_chunks:
+                                    continue
+                                existing_text[k_str] = str(v)
+
+                            for k, v in existing_text.items():
+                                meta.add_text(k, v)
+
                             save_kwargs["pnginfo"] = meta
                         else:
                             if file_ext in (".jpg", ".jpeg", ".webp"):
@@ -689,6 +816,7 @@ class BatchToolsController:
         def _work(emit_progress, is_closing):
             success_count = 0
             failed_count = 0
+            export_abs = os.path.abspath(export_dir)
 
             for idx, path in enumerate(paths, 1):
                 if is_closing():
@@ -707,8 +835,12 @@ class BatchToolsController:
                                     break
 
                     if workflow_content:
-                        base_name = os.path.splitext(os.path.basename(path))[0]
-                        out_json = os.path.join(export_dir, f"{base_name}_workflow.json")
+                        raw_stem = os.path.splitext(os.path.basename(path))[0]
+                        safe_stem = sanitize_filename_component(raw_stem, fallback=f"workflow_{idx}")
+                        out_json = os.path.abspath(os.path.join(export_abs, f"{safe_stem}_workflow.json"))
+                        if os.path.commonpath([export_abs, out_json]) != export_abs:
+                            failed_count += 1
+                            continue
                         try:
                             parsed_json = json.loads(workflow_content)
                             out_text = json.dumps(parsed_json, indent=4)

@@ -3,7 +3,7 @@ from collections import OrderedDict
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
 from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject, QTimer, QPointF
 from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader, QPen, QPainterPath
-from .widgets import ResizeHandleWidget
+from .widgets import ResizeHandleWidget, WindowDragHandler
 from .helpers import load_settings, save_settings
 
 
@@ -102,9 +102,9 @@ class PinIconButton(QPushButton):
 
 
 class ImageLoaderSignals(QObject):
-    image_loaded = Signal(str, QImage, QSize)       # file_path, decoded_qimage, full_size
-    image_prefetched = Signal(str, QImage, QSize)   # file_path, decoded_qimage, full_size
-    full_res_loaded = Signal(str, QPixmap)          # file_path, loaded_full_pixmap
+    image_loaded = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
+    image_prefetched = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
+    full_res_loaded = Signal(str, QPixmap)  # file_path, loaded_full_pixmap
 
 
 def _decode_image_proxy(file_path):
@@ -354,8 +354,8 @@ class ImageViewerCanvas(QWidget):
         if self._is_right_dragging and (event.buttons() & Qt.MouseButton.RightButton):
             if window and not window.isFullScreen() and self._drag_start_pos is not None:
                 window.move(event.globalPosition().toPoint() - self._drag_start_pos)
-                event.accept()
-                return
+            event.accept()
+            return
 
         super().mouseMoveEvent(event)
 
@@ -480,7 +480,7 @@ class ImageViewerCanvas(QWidget):
         self.update()
 
 
-class ImageViewerWindow(QWidget):
+class ImageViewerWindow(QWidget, WindowDragHandler):
     """
     Multithreaded image viewer window supporting persistent shared RAM caching,
     instant proxy loading for huge images (>2MP), background neighbor prefetching,
@@ -495,11 +495,13 @@ class ImageViewerWindow(QWidget):
             items_list = getattr(parent, "loaded_items", [])
 
         super().__init__(parent)
+        WindowDragHandler.__init__(self)
 
         self._closing = False
         self._user_resized = False
         self._toggling_topmost = False
         self._has_positioned_window = False
+        self._dragging_window = False
         self.image_path = image_path
         self.items = list(items_list) if items_list else []
         self.main_parent = parent
@@ -654,6 +656,69 @@ class ImageViewerWindow(QWidget):
             task = FullResLoaderTask(file_path, self.loader_signals, is_closing_getter=self._is_closing)
             self.thread_pool.start(task)
 
+    def _compute_target_window_size(self, full_size, max_screen_fraction=1.0):
+        """Computes the target window size for an image while respecting screen bounds."""
+        h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
+        main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
+        padding_w = h_margins + main_margins + 4
+
+        title_h = self.title_container.sizeHint().height() if hasattr(self, 'title_container') else 30
+        bottom_h = 30
+        v_spacing = self.container_layout.spacing() * 2
+        v_margins = self.container_layout.contentsMargins().top() + self.container_layout.contentsMargins().bottom()
+        main_v_margins = self.main_layout.contentsMargins().top() + self.main_layout.contentsMargins().bottom()
+
+        padding_h = title_h + bottom_h + v_spacing + v_margins + main_v_margins
+
+        img_w = full_size.width()
+        img_h = full_size.height()
+        img_aspect = img_w / img_h if img_h > 0 else 1.0
+
+        screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
+        max_w = (screen_geom.width() * max_screen_fraction) - 100
+        max_h = (screen_geom.height() * max_screen_fraction) - 100
+
+        target_w = img_w
+        target_h = img_h
+
+        if target_w > (max_w - padding_w) or target_h > (max_h - padding_w):
+            if img_aspect > ((max_w - padding_w) / (max_h - padding_h)):
+                target_w = max_w - padding_w
+                target_h = int(target_w / img_aspect)
+            else:
+                target_h = max_h - padding_h
+                target_w = int(target_h * img_aspect)
+
+        final_w = max(400, int(target_w + padding_w))
+        final_h = max(300, int(target_h + padding_h))
+        return final_w, final_h, screen_geom
+
+    def _apply_size_preserving_center(self, final_w, final_h, screen_geom, max_screen_fraction=1.0):
+        """Resizes the window around its current center point (or centers on first open)."""
+        if not self._has_positioned_window:
+            self.resize(final_w, final_h)
+            center_point = screen_geom.center()
+            window_geom = self.frameGeometry()
+            window_geom.moveCenter(center_point)
+            self.move(window_geom.topLeft())
+            self._has_positioned_window = True
+            return
+
+        if self._user_resized:
+            return
+
+        current_geom = self.frameGeometry()
+        anchor_center = current_geom.center()
+
+        # Frame offset accounts for non-client/translucent margins if frameGeometry differs from geometry()
+        frame_dx = self.geometry().x() - current_geom.x()
+        frame_dy = self.geometry().y() - current_geom.y()
+
+        new_top_left_x = anchor_center.x() - (final_w // 2) + frame_dx
+        new_top_left_y = anchor_center.y() - (final_h // 2) + frame_dy
+
+        self.setGeometry(int(new_top_left_x), int(new_top_left_y), final_w, final_h)
+
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         if self._closing:
             return
@@ -661,49 +726,8 @@ class ImageViewerWindow(QWidget):
         self.full_pixmap_size = full_size
 
         if full_size.isValid() and not self.isFullScreen():
-            h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
-            main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
-            padding_w = h_margins + main_margins + 4
-
-            title_h = self.title_container.sizeHint().height() if hasattr(self, 'title_container') else 30
-            bottom_h = 30
-            v_spacing = self.container_layout.spacing() * 2
-            v_margins = self.container_layout.contentsMargins().top() + self.container_layout.contentsMargins().bottom()
-            main_v_margins = self.main_layout.contentsMargins().top() + self.main_layout.contentsMargins().bottom()
-
-            padding_h = title_h + bottom_h + v_spacing + v_margins + main_v_margins
-
-            img_w = full_size.width()
-            img_h = full_size.height()
-            img_aspect = img_w / img_h if img_h > 0 else 1.0
-
-            screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
-            max_w = screen_geom.width() - 100
-            max_h = screen_geom.height() - 100
-
-            target_w = img_w
-            target_h = img_h
-
-            if target_w > (max_w - padding_w) or target_h > (max_h - padding_w):
-                if img_aspect > ((max_w - padding_w) / (max_h - padding_h)):
-                    target_w = max_w - padding_w
-                    target_h = int(target_w / img_aspect)
-                else:
-                    target_h = max_h - padding_h
-                    target_w = int(target_h * img_aspect)
-
-            final_w = max(400, target_w + padding_w)
-            final_h = max(300, target_h + padding_h)
-
-            if not self._user_resized:
-                self.resize(final_w, final_h)
-
-            if not self._has_positioned_window:
-                center_point = screen_geom.center()
-                window_geom = self.frameGeometry()
-                window_geom.moveCenter(center_point)
-                self.move(window_geom.topLeft())
-                self._has_positioned_window = True
+            final_w, final_h, screen_geom = self._compute_target_window_size(full_size, max_screen_fraction=1.0)
+            self._apply_size_preserving_center(final_w, final_h, screen_geom, max_screen_fraction=1.0)
 
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path
@@ -841,6 +865,8 @@ class ImageViewerWindow(QWidget):
 
         file_title = os.path.basename(self.image_path)
         self.title_label = QLabel(f"Loading: {file_title}...")
+        self.title_label.setObjectName("TitleLabel")
+        self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.title_label.setStyleSheet("color: #cbd5e1; font-size: 12px; font-weight: bold; background: transparent;")
         title_layout.addWidget(self.title_label)
 
@@ -1033,6 +1059,7 @@ class ImageViewerWindow(QWidget):
             self._resize_edge = self._get_resize_edge(global_pos)
 
             if self._resize_edge:
+                self._dragging_window = False
                 self._drag_pos = global_pos.toPoint()
                 self._start_geometry = self.geometry()
                 event.accept()
@@ -1041,17 +1068,21 @@ class ImageViewerWindow(QWidget):
             if not self._is_focus_mode:
                 local_pos = self.mapFromGlobal(global_pos.toPoint())
                 if local_pos.y() < 40:
-                    self._drag_pos = global_pos.toPoint() - self.frameGeometry().topLeft()
+                    self._dragging_window = True
                     self._resize_edge = None
-                    event.accept()
+                    self.handle_mouse_press(self, event)
+                    return
+
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         if self.isFullScreen() or self._is_focus_mode:
+            super().mouseMoveEvent(event)
             return
 
         global_pos = event.globalPosition()
 
-        if not self._resize_edge:
+        if not self._resize_edge and not getattr(self, "_dragging_window", False):
             edge = self._get_resize_edge(global_pos)
             if edge in ("top_left", "bottom_right"):
                 self.setCursor(Qt.CursorShape.SizeFDiagCursor)
@@ -1082,17 +1113,27 @@ class ImageViewerWindow(QWidget):
             event.accept()
             return
 
-        if hasattr(self, '_drag_pos') and self.mapFromGlobal(global_pos.toPoint()).y() < 40:
-            self.move(global_pos.toPoint() - self._drag_pos)
+        if getattr(self, "_dragging_window", False) and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.handle_mouse_move(self, event)
             event.accept()
+            return
+
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            was_dragging = getattr(self, "_dragging_window", False)
             self._resize_edge = None
+            self._dragging_window = False
             if hasattr(self, '_drag_pos'):
                 del self._drag_pos
             self.setCursor(Qt.CursorShape.ArrowCursor)
-            event.accept()
+            if was_dragging:
+                self.handle_mouse_release(event)
+                event.accept()
+                return
+
+        super().mouseReleaseEvent(event)
 
 
 class DetachedImageViewerCanvas(ImageViewerCanvas):
@@ -1132,49 +1173,8 @@ class DetachedImageViewerWindow(ImageViewerWindow):
 
         if self._is_first_open and full_size.isValid() and not self.isFullScreen():
             self._is_first_open = False
-            h_margins = self.container_layout.contentsMargins().left() + self.container_layout.contentsMargins().right()
-            main_margins = self.main_layout.contentsMargins().left() + self.main_layout.contentsMargins().right()
-            padding_w = h_margins + main_margins + 4
-
-            title_h = self.title_container.sizeHint().height() if hasattr(self, 'title_container') else 30
-            bottom_h = 30
-            v_spacing = self.container_layout.spacing() * 2
-            v_margins = self.container_layout.contentsMargins().top() + self.container_layout.contentsMargins().bottom()
-            main_v_margins = self.main_layout.contentsMargins().top() + self.main_layout.contentsMargins().bottom()
-
-            padding_h = title_h + bottom_h + v_spacing + v_margins + main_v_margins
-
-            img_w = full_size.width()
-            img_h = full_size.height()
-            img_aspect = img_w / img_h if img_h > 0 else 1.0
-
-            screen_geom = self.screen().availableGeometry() if self.screen() else QRect(0, 0, 1920, 1080)
-            max_w = screen_geom.width() / 2
-            max_h = screen_geom.height() / 2
-
-            target_w = img_w
-            target_h = img_h
-
-            if target_w > (max_w - padding_w) or target_h > (max_h - padding_w):
-                if img_aspect > ((max_w - padding_w) / (max_h - padding_w)):
-                    target_w = max_w - padding_w
-                    target_h = int(target_w / img_aspect)
-                else:
-                    target_h = max_h - padding_h
-                    target_w = int(target_h * img_aspect)
-
-            final_w = max(400, target_w + padding_w)
-            final_h = max(300, target_h + padding_h)
-
-            if not self._user_resized:
-                self.resize(final_w, final_h)
-
-            if not self._has_positioned_window:
-                center_point = screen_geom.center()
-                window_geom = self.frameGeometry()
-                window_geom.moveCenter(center_point)
-                self.move(window_geom.topLeft())
-                self._has_positioned_window = True
+            final_w, final_h, screen_geom = self._compute_target_window_size(full_size, max_screen_fraction=0.5)
+            self._apply_size_preserving_center(final_w, final_h, screen_geom, max_screen_fraction=0.5)
 
         self.canvas.display_pixmap = pixmap
         self.canvas.image_path = file_path

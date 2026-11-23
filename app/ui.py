@@ -1,9 +1,11 @@
 import os
 import platform
 import re
+import html
 import shutil
 import subprocess
 import tempfile
+import threading
 from collections import OrderedDict
 from PIL import Image
 
@@ -41,6 +43,10 @@ from pathlib import Path
 BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
 SETTINGS_FILE = str(BASE_DIR / "settings.json")
 
+# Serialize Pillow image/PNG text/EXIF decoding across worker threads on Windows
+# to prevent native decoder / plugin race conditions during rapid actions.
+_PIL_METADATA_LOCK = threading.Lock()
+
 try:
     from .crash_reporter import install_crash_reporter
 except ImportError:
@@ -49,8 +55,25 @@ except ImportError:
 _CRASH_REPORTER = install_crash_reporter(app_name="WiggleView")
 
 
+try:
+    from shiboken6 import isValid as _shiboken_is_valid
+except ImportError:
+    _shiboken_is_valid = None
+
+
+def _qt_alive(obj) -> bool:
+    if obj is None:
+        return False
+    if _shiboken_is_valid is not None:
+        try:
+            return bool(_shiboken_is_valid(obj))
+        except Exception:
+            return False
+    return True
+
+
 class MetadataWorkerSignals(QObject):
-    metadata_ready = Signal(str, str, str, str, str)
+    metadata_ready = Signal(int, str, str, str, str, str)
 
 
 class _SqliteThumbnailTask(QRunnable):
@@ -73,90 +96,121 @@ class _SqliteThumbnailTask(QRunnable):
         return callable(self.active_scan_getter) and self.scan_id != self.active_scan_getter()
 
     def run(self):
-        if self._is_stale():
+        try:
+            if self._is_stale():
+                return
+            if self.db_cache is None or not self.source_path or not os.path.exists(self.source_path):
+                return
+            qimg, virtual_path = self.db_cache.generate_and_cache_qimage(
+                self.source_path,
+                target_size=self.target_size,
+                jpeg_quality=self.jpeg_quality
+            )
+            if self._is_stale():
+                return
+            if qimg is not None and not qimg.isNull():
+                try:
+                    self.signals.thumbnail_ready.emit(self.scan_id, self.source_path, virtual_path, qimg)
+                except RuntimeError:
+                    pass
+        except BaseException:
             return
-        if self.db_cache is None or not os.path.exists(self.source_path):
-            return
-        qimg, virtual_path = self.db_cache.generate_and_cache_qimage(
-            self.source_path,
-            target_size=self.target_size,
-            jpeg_quality=self.jpeg_quality
-        )
-        if self._is_stale():
-            return
-        if qimg is not None and not qimg.isNull():
-            try:
-                self.signals.thumbnail_ready.emit(self.scan_id, self.source_path, virtual_path, qimg)
-            except RuntimeError:
-                pass
 
 
 class MetadataLoaderTask(QRunnable):
-    """Background worker task to load QImage dimensions, EXIF, and ComfyUI metadata off the GUI thread."""
+    """Background worker task to load image dimensions, EXIF, and ComfyUI metadata off the GUI thread."""
 
-    def __init__(self, file_path, filename, size_str, signals, is_closing_getter=None):
+    def __init__(
+        self,
+        file_path,
+        filename,
+        size_str,
+        signals,
+        scan_id=0,
+        active_scan_getter=None,
+        is_closing_getter=None,
+    ):
         super().__init__()
         self.file_path = file_path
         self.filename = filename
         self.size_str = size_str
         self.signals = signals
+        self.scan_id = scan_id
+        self.active_scan_getter = active_scan_getter
         self.is_closing_getter = is_closing_getter
 
-    def _is_closing(self):
-        return callable(self.is_closing_getter) and self.is_closing_getter()
+    def _is_stale(self):
+        if callable(self.is_closing_getter) and self.is_closing_getter():
+            return True
+        return callable(self.active_scan_getter) and self.scan_id != self.active_scan_getter()
 
     def run(self):
-        if self._is_closing():
-            return
-        dims_str = "Unknown dims"
-        if os.path.exists(self.file_path):
-            reader = QImageReader(self.file_path)
-            img_size = reader.size()
-            if img_size.isValid():
-                dims_str = f"{img_size.width()} \u00d7 {img_size.height()} px"
-            else:
+        try:
+            if self._is_stale():
+                return
+
+            dims_str = "Unknown dims"
+            if self.file_path and os.path.isfile(self.file_path):
                 try:
-                    with Image.open(self.file_path) as pil_img:
-                        w, h = pil_img.size
-                        if w > 0 and h > 0:
-                            dims_str = f"{w} \u00d7 {h} px"
+                    with _PIL_METADATA_LOCK:
+                        if self._is_stale() or not os.path.isfile(self.file_path):
+                            return
+                        with Image.open(self.file_path) as pil_img:
+                            w, h = pil_img.size
+                            if w > 0 and h > 0:
+                                dims_str = f"{w} \u00d7 {h} px"
                 except Exception:
                     pass
 
-        if self._is_closing():
-            return
+            if self._is_stale():
+                return
 
-        try:
-            exif_text = extract_exif_metadata(self.file_path)
-        except Exception as e:
-            exif_text = f"EXIF read error: {e}"
+            if not self.file_path or not os.path.isfile(self.file_path):
+                exif_text = "File no longer exists."
+            else:
+                try:
+                    with _PIL_METADATA_LOCK:
+                        if self._is_stale() or not os.path.isfile(self.file_path):
+                            return
+                        exif_text = extract_exif_metadata(self.file_path)
+                except Exception as e:
+                    exif_text = f"EXIF read error: {e}"
 
-        if self._is_closing():
-            return
-        comfy_text = ""
-        if self.file_path.lower().endswith(".png"):
+            if self._is_stale():
+                return
+
+            comfy_text = ""
+            if self.file_path and self.file_path.lower().endswith(".png") and os.path.isfile(self.file_path):
+                try:
+                    with _PIL_METADATA_LOCK:
+                        if self._is_stale() or not os.path.isfile(self.file_path):
+                            return
+                        with Image.open(self.file_path) as img:
+                            if hasattr(img, "text") and img.text:
+                                for key in ("workflow", "prompt"):
+                                    if key in img.text:
+                                        import json
+                                        try:
+                                            parsed = json.loads(img.text[key])
+                                            comfy_text = json.dumps(parsed, indent=4)
+                                            break
+                                        except Exception:
+                                            comfy_text = img.text[key]
+                                            break
+                except Exception as e:
+                    print(f"Error scanning ComfyUI metadata: {e}")
+
+            if self._is_stale():
+                return
+
             try:
-                with Image.open(self.file_path) as img:
-                    if hasattr(img, "text") and img.text:
-                        for key in ["workflow", "prompt"]:
-                            if key in img.text:
-                                import json
-                                try:
-                                    parsed = json.loads(img.text[key])
-                                    comfy_text = json.dumps(parsed, indent=4)
-                                    break
-                                except Exception:
-                                    comfy_text = img.text[key]
-                                    break
-            except Exception as e:
-                print(f"Error scanning ComfyUI metadata: {e}")
-
-        if self._is_closing():
+                self.signals.metadata_ready.emit(
+                    self.scan_id, self.file_path, self.filename, dims_str, exif_text, comfy_text
+                )
+            except RuntimeError:
+                pass
+        except BaseException:
             return
-        try:
-            self.signals.metadata_ready.emit(self.file_path, self.filename, dims_str, exif_text, comfy_text)
-        except RuntimeError:
-            pass
 
 
 class MainWindow(QMainWindow, WindowDragHandler):
@@ -192,6 +246,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         settings_init = load_settings(SETTINGS_FILE)
         encrypt_thumbs = bool(settings_init.get("encrypt_thumbnail_cache", True))
+        self.debug_mode = bool(settings_init.get("debug_mode", False))
         self._cached_encrypt_thumbnail_cache = encrypt_thumbs
 
         self.thumb_cache_dir = os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
@@ -240,9 +295,10 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         self._refresh_cached_jpeg_quality()
         self._refresh_cached_encrypt_thumbnail_cache()
-        self.startup_settings_print()
-
         self._setup_ui()
+
+        if self.debug_mode:
+            self.startup_settings_print()
 
         if initial_image_path and os.path.exists(initial_image_path):
             abs_path = os.path.abspath(initial_image_path)
@@ -266,7 +322,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.load_last_folder()
 
         self.crash_log_path = getattr(_CRASH_REPORTER, "log_path", None)
-        if self.crash_log_path:
+        if self.crash_log_path and self.debug_mode:
             print(f"Crash report log: {self.crash_log_path}")
         QTimer.singleShot(120, self.center_current_folder_in_tree)
 
@@ -346,6 +402,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
         parent_dir = os.path.dirname(fp).lower() if fp else ""
         raw_name = item.get("filename") or os.path.basename(fp).lower() or item.get("display_name", "").lower()
         return (parent_dir, self._natural_name_key(raw_name), raw_name, fp.lower())
+
+    def _item_type_sort_key(self, item):
+        """Deterministic file-type sort key grouping by extension/format, then name."""
+        fp = os.path.abspath(item.get("file_path", "")) if item.get("file_path") else ""
+        raw_ext = item.get("ext") or item.get("extension") or os.path.splitext(fp)[1] or ""
+        ext_norm = str(raw_ext).strip().lower().lstrip(".")
+        return (ext_norm, self._item_name_sort_key(item))
 
     def _sync_sort_state_from_settings(self):
         """Ensures active sort criteria/reverse stay synchronized with persisted settings."""
@@ -454,6 +517,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.menu_bar.about_requested.connect(self.show_about_dialog)
         self.menu_bar.favorite_selected.connect(self.jump_to_favorite_folder)
         self.menu_bar.add_favorite_requested.connect(self.add_current_folder_to_favorites)
+        self.menu_bar.rename_requested.connect(
+            lambda: self.file_ops.rename_selected_files(self.get_target_file_paths())
+        )
         self.menu_bar.convert_requested.connect(self.batch_tools.batch_convert_images)
         self.menu_bar.purge_exif_requested.connect(self.batch_tools.batch_purge_exif)
         self.menu_bar.inject_exif_requested.connect(self.batch_tools.batch_inject_exif)
@@ -655,7 +721,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
     def set_footer_status(self, message):
         if self._is_closing:
             return
-        self.status_label.setText(f"Status: {message}")
+        if _qt_alive(getattr(self, "status_label", None)):
+            self.status_label.setText(f"Status: {message}")
 
     def set_status(self, message, log=True):
         if self._is_closing:
@@ -665,18 +732,21 @@ class MainWindow(QMainWindow, WindowDragHandler):
             footer_msg = f"{child_prefix} | {message}"
         else:
             footer_msg = message
-        self.status_label.setText(f"Status: {footer_msg}")
-        if log and hasattr(self.right_sidebar, 'log_text'):
-            log_widget = self.right_sidebar.log_text
-            if hasattr(log_widget, "appendPlainText"):
-                log_widget.appendPlainText(f"\u2022 {message}")
-            else:
-                current_text = log_widget.toPlainText()
-                prefix = f"{current_text}\n" if current_text else ""
-                log_widget.setPlainText(f"{prefix}\u2022 {message}")
-            log_widget.verticalScrollBar().setValue(
-                log_widget.verticalScrollBar().maximum()
-            )
+        if _qt_alive(getattr(self, "status_label", None)):
+            self.status_label.setText(f"Status: {footer_msg}")
+        sidebar = getattr(self, "right_sidebar", None)
+        if log and _qt_alive(sidebar) and hasattr(sidebar, 'log_text'):
+            log_widget = sidebar.log_text
+            if _qt_alive(log_widget):
+                if hasattr(log_widget, "appendPlainText"):
+                    log_widget.appendPlainText(f"\u2022 {message}")
+                else:
+                    current_text = log_widget.toPlainText()
+                    prefix = f"{current_text}\n" if current_text else ""
+                    log_widget.setPlainText(f"{prefix}\u2022 {message}")
+                log_widget.verticalScrollBar().setValue(
+                    log_widget.verticalScrollBar().maximum()
+                )
 
     def open_folder_dialog(self):
         data = load_settings(SETTINGS_FILE)
@@ -740,9 +810,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.workspace_grid.clear_cache_if_needed(max_allowed=3000)
 
         self.set_status(f"Scanning folder: {os.path.basename(folder_path)}")
-        self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n\u2022 Folder: {os.path.basename(folder_path)}\n\u2022 Scanning..."
-        )
+        sidebar = getattr(self, "right_sidebar", None)
+        if _qt_alive(sidebar):
+            inspector = getattr(sidebar, "inspector_label", None)
+            if _qt_alive(inspector):
+                inspector.setText(
+                    f"Inspector Properties:\n\n\u2022 Folder: {os.path.basename(folder_path)}\n\u2022 Scanning..."
+                )
 
         scanner_task = FolderScannerTask(
             folder_path,
@@ -793,26 +867,26 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.workspace_grid.set_cards(self.loaded_items)
             self.set_status(f"Ready \u2014 Total images in gallery: {total_count}")
 
-            if self.current_watched_dir:
-                self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
-                if len(self.folder_scan_cache) > self._MAX_FOLDER_CACHE:
-                    self.folder_scan_cache.popitem(last=False)
+        if self.current_watched_dir:
+            self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
+            if len(self.folder_scan_cache) > self._MAX_FOLDER_CACHE:
+                self.folder_scan_cache.popitem(last=False)
 
-            comfy_task = ComfyMetadataScannerTask(
-                self.loaded_items,
-                scan_id,
-                self.comfy_signals,
-                active_scan_getter=self.get_active_scan_id
-            )
-            self.thread_pool.start(comfy_task)
+        comfy_task = ComfyMetadataScannerTask(
+            self.loaded_items,
+            scan_id,
+            self.comfy_signals,
+            active_scan_getter=self.get_active_scan_id
+        )
+        self.thread_pool.start(comfy_task)
 
-            if hasattr(self, 'thumb_db_cache') and self.thumb_db_cache is not None:
-                self.thumb_db_cache.flush()
+        if hasattr(self, 'thumb_db_cache') and self.thumb_db_cache is not None:
+            self.thumb_db_cache.flush()
 
-            if hasattr(self, 'initial_target_image') and self.initial_target_image:
-                target = self.initial_target_image
-                self.initial_target_image = None
-                self.open_image_viewer(target)
+        if hasattr(self, 'initial_target_image') and self.initial_target_image:
+            target = self.initial_target_image
+            self.initial_target_image = None
+            self.open_image_viewer(target)
 
     def on_comfy_batch_ready(self, scan_id, file_paths):
         if self._is_closing or scan_id != self.scan_id:
@@ -837,13 +911,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if self.thumbs_ready_count < self.total_thumbs_to_generate:
             self.thumbs_ready_count += 1
 
-            if not hasattr(self, '_status_throttle_timer'):
-                self._status_throttle_timer = QTimer(self)
-                self._status_throttle_timer.setSingleShot(True)
-                self._status_throttle_timer.timeout.connect(self._flush_thumbnail_status)
+        if not hasattr(self, '_status_throttle_timer'):
+            self._status_throttle_timer = QTimer(self)
+            self._status_throttle_timer.setSingleShot(True)
+            self._status_throttle_timer.timeout.connect(self._flush_thumbnail_status)
 
-            if not self._status_throttle_timer.isActive():
-                self._status_throttle_timer.start(150)
+        if not self._status_throttle_timer.isActive():
+            self._status_throttle_timer.start(150)
 
     def build_full_gallery_status(self):
         processed_count = min(self.thumbs_ready_count, self.total_thumbs_to_generate)
@@ -872,7 +946,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             )
         else:
             base_msg = (
-                f"Ready — Total images in gallery: {len(self.loaded_items)} "
+                f"Ready \u2014 Total images in gallery: {len(self.loaded_items)} "
                 f"| RAM Cache: {cache_count} items ({cache_size_str}){disk_suffix}"
             )
 
@@ -887,54 +961,85 @@ class MainWindow(QMainWindow, WindowDragHandler):
         self.set_footer_status(self.build_full_gallery_status())
 
     def on_card_selected(self, file_path, display_name):
-        if self._is_closing:
+        if self._is_closing or not _qt_alive(self):
             return
         filename = os.path.basename(file_path)
         item_info = self.items_by_path.get(file_path)
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
-        detailed_status = f"Selected: {filename}  |  Size: {size_str}"
-        self.status_label.setText(f"Status: {detailed_status}")
+        detailed_status = f"Selected: {filename} | Size: {size_str}"
+        if _qt_alive(getattr(self, "status_label", None)):
+            self.status_label.setText(f"Status: {detailed_status}")
 
-        self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n\u2022 File: {filename}\n\u2022 Size: {size_str}\n\u2022 Resolution: Loading (BG)...\n\u2022 Path: {file_path}"
-        )
-        self.right_sidebar.exif_view.setHtml("<i>Loading metadata in background thread...</i>")
-        if hasattr(self.right_sidebar, 'comfy_view'):
-            self.right_sidebar.comfy_view.setPlainText("Loading ComfyUI workflow...")
+        sidebar = getattr(self, "right_sidebar", None)
+        if _qt_alive(sidebar):
+            inspector = getattr(sidebar, "inspector_label", None)
+            if _qt_alive(inspector):
+                inspector.setText(
+                    f"Inspector Properties:\n\n\u2022 File: {filename}\n\u2022 Size: {size_str}\n\u2022 Resolution: Loading (BG)...\n\u2022 Path: {file_path}"
+                )
+            exif_view = getattr(sidebar, "exif_view", None)
+            if _qt_alive(exif_view):
+                exif_view.setHtml("<i>Loading metadata in background thread...</i>")
+            comfy_view = getattr(sidebar, "comfy_view", None)
+            if _qt_alive(comfy_view):
+                comfy_view.setPlainText("Loading ComfyUI workflow...")
 
         task = MetadataLoaderTask(
             file_path,
             filename,
             size_str,
             self.meta_signals,
+            scan_id=self.scan_id,
+            active_scan_getter=self.get_active_scan_id,
             is_closing_getter=self._is_shutting_down,
         )
         self.thread_pool.start(task)
 
-    def on_metadata_ready(self, file_path, filename, dims_str, exif_text, comfy_text):
-        if self._is_closing:
+    def on_metadata_ready(self, scan_id, file_path, filename, dims_str, exif_text, comfy_text):
+        if self._is_closing or not _qt_alive(self) or scan_id != self.scan_id:
             return
-        if not self.workspace_grid.selected_file_paths or file_path not in self.workspace_grid.selected_file_paths:
+        grid = getattr(self, "workspace_grid", None)
+        if not _qt_alive(grid):
+            return
+        selected = getattr(grid, "selected_file_paths", None) or ()
+        if file_path not in selected:
             return
 
-        item_info = self.items_by_path.get(file_path)
+        item_info = self.items_by_path.get(file_path) if isinstance(self.items_by_path, dict) else None
         size_str = format_file_size(item_info.get("size", 0)) if item_info else "Unknown size"
 
-        self.right_sidebar.inspector_label.setText(
-            f"Inspector Properties:\n\n\u2022 File: {filename}\n\u2022 Size: {size_str}\n\u2022 Resolution: {dims_str}\n\u2022 Path: {file_path}"
-        )
-        self.right_sidebar.exif_view.setHtml(exif_text)
+        sidebar = getattr(self, "right_sidebar", None)
+        if _qt_alive(sidebar):
+            inspector = getattr(sidebar, "inspector_label", None)
+            if _qt_alive(inspector):
+                inspector.setText(
+                    f"Inspector Properties:\n\n"
+                    f"\u2022 File: {filename}\n"
+                    f"\u2022 Size: {size_str}\n"
+                    f"\u2022 Resolution: {dims_str}\n"
+                    f"\u2022 Path: {file_path}"
+                )
 
-        if hasattr(self.right_sidebar, 'comfy_view'):
-            if comfy_text:
-                self.right_sidebar.comfy_view.setPlainText(comfy_text)
-            elif file_path.lower().endswith(".png"):
-                self.right_sidebar.comfy_view.setPlainText("No ComfyUI workflow or prompt found in this PNG.")
-            else:
-                self.right_sidebar.comfy_view.setPlainText("ComfyUI workflows are only stored in PNG metadata.")
+            exif_view = getattr(sidebar, "exif_view", None)
+            if _qt_alive(exif_view):
+                safe_exif = exif_text if isinstance(exif_text, str) else html.escape(str(exif_text))
+                exif_view.setHtml(safe_exif)
 
-        self.status_label.setText(f"Status: Selected: {filename}  |  Size: {size_str}  |  Dimensions: {dims_str}")
+            comfy_view = getattr(sidebar, "comfy_view", None)
+            if _qt_alive(comfy_view):
+                if comfy_text:
+                    comfy_view.setPlainText(comfy_text)
+                elif str(file_path).lower().endswith(".png"):
+                    comfy_view.setPlainText("No ComfyUI workflow or prompt found in this PNG.")
+                else:
+                    comfy_view.setPlainText("ComfyUI workflows are only stored in PNG metadata.")
+
+        status_lbl = getattr(self, "status_label", None)
+        if _qt_alive(status_lbl):
+            status_lbl.setText(
+                f"Status: Selected: {filename} | Size: {size_str} | Dimensions: {dims_str}"
+            )
 
     def open_image_viewer(self, file_path):
         modifiers = QGuiApplication.keyboardModifiers()
@@ -998,6 +1103,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.loaded_items.sort(key=lambda x: x.get("mtime", 0), reverse=not is_rev)
         elif criteria == "size":
             self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
+        elif criteria == "type":
+            self.loaded_items.sort(key=self._item_type_sort_key, reverse=is_rev)
 
     def apply_sorting(self):
         if not self.loaded_items:
@@ -1016,6 +1123,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
         elif criteria == "size":
             self.loaded_items.sort(key=lambda x: x.get("size", 0), reverse=not is_rev)
             self.set_status(f"Sorted by Size ({'Smallest first' if is_rev else 'Largest first'})")
+        elif criteria == "type":
+            self.loaded_items.sort(key=self._item_type_sort_key, reverse=is_rev)
+            self.set_status(f"Sorted by File Type ({'Z-A' if is_rev else 'A-Z'})")
 
         if self.current_watched_dir and self.current_watched_dir in self.folder_scan_cache:
             self.folder_scan_cache[self.current_watched_dir] = list(self.loaded_items)
@@ -1034,36 +1144,50 @@ class MainWindow(QMainWindow, WindowDragHandler):
             self.workspace_grid.invert_selection()
 
     def on_selection_changed(self, selected_paths):
-        if self._is_closing:
+        if self._is_closing or not _qt_alive(self):
             return
-        count = len(selected_paths)
+        safe_paths = list(selected_paths or ())
+        count = len(safe_paths)
         total = len(self.loaded_items)
+        sidebar = getattr(self, "right_sidebar", None)
 
         if count == 0:
-            self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n\u2022 Folder Selected\n\u2022 Total Images: {total}\n\u2022 Selected: None"
-            )
-            self.right_sidebar.exif_view.setHtml(
-                "<i>No EXIF metadata available.<br>Select an image to inspect camera details.</i>"
-            )
-            if hasattr(self.right_sidebar, 'comfy_view'):
-                self.right_sidebar.comfy_view.setPlainText("Select a PNG with ComfyUI workflow to view data.")
+            if _qt_alive(sidebar):
+                inspector = getattr(sidebar, "inspector_label", None)
+                if _qt_alive(inspector):
+                    inspector.setText(
+                        f"Inspector Properties:\n\n\u2022 Folder Selected\n\u2022 Total Images: {total}\n\u2022 Selected: None"
+                    )
+                exif_view = getattr(sidebar, "exif_view", None)
+                if _qt_alive(exif_view):
+                    exif_view.setHtml(
+                        "<i>No EXIF metadata available.<br>Select an image to inspect camera details.</i>"
+                    )
+                comfy_view = getattr(sidebar, "comfy_view", None)
+                if _qt_alive(comfy_view):
+                    comfy_view.setPlainText("Select a PNG with ComfyUI workflow to view data.")
             self.set_status(self.build_full_gallery_status())
         elif count == 1:
-            self.on_card_selected(selected_paths[0], os.path.basename(selected_paths[0]))
+            self.on_card_selected(safe_paths[0], os.path.basename(safe_paths[0]))
         else:
             total_bytes = sum(
-                self.items_by_path[p].get("size", 0) for p in selected_paths if p in self.items_by_path
+                self.items_by_path[p].get("size", 0) for p in safe_paths if p in self.items_by_path
             )
             size_str = format_file_size(total_bytes)
-            self.right_sidebar.inspector_label.setText(
-                f"Inspector Properties:\n\n\u2022 Multiple Items Selected\n\u2022 Selected: {count} of {total}\n\u2022 Combined Size: {size_str}"
-            )
-            self.right_sidebar.exif_view.setHtml(
-                f"<i>{count} images selected.<br>Select a single image to inspect EXIF metadata.</i>"
-            )
-            if hasattr(self.right_sidebar, 'comfy_view'):
-                self.right_sidebar.comfy_view.setPlainText("Multiple items selected.")
+            if _qt_alive(sidebar):
+                inspector = getattr(sidebar, "inspector_label", None)
+                if _qt_alive(inspector):
+                    inspector.setText(
+                        f"Inspector Properties:\n\n\u2022 Multiple Items Selected\n\u2022 Selected: {count} of {total}\n\u2022 Combined Size: {size_str}"
+                    )
+                exif_view = getattr(sidebar, "exif_view", None)
+                if _qt_alive(exif_view):
+                    exif_view.setHtml(
+                        f"<i>{count} images selected.<br>Select a single image to inspect EXIF metadata.</i>"
+                    )
+                comfy_view = getattr(sidebar, "comfy_view", None)
+                if _qt_alive(comfy_view):
+                    comfy_view.setPlainText("Multiple items selected.")
             self.set_status(f"Selected {count} of {total} items ({size_str})")
 
     def _schedule_keep_selected_in_view(self):
@@ -1088,8 +1212,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
             selected_paths = self.get_target_file_paths()
             if selected_paths:
                 self.file_ops.delete_selected_files(selected_paths)
-                event.accept()
-                return
+            event.accept()
+            return
 
         super().keyPressEvent(event)
 
@@ -1146,9 +1270,9 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
             if hasattr(self, 'left_browser') and self.left_browser:
                 self.left_browser.set_selected_folder(abs_folder)
-            self._center_folder_in_tree_for_path(abs_folder)
-            for delay_ms in (60, 220, 500):
-                QTimer.singleShot(delay_ms, lambda fp=abs_folder: self._center_folder_in_tree_for_path(fp))
+                self._center_folder_in_tree_for_path(abs_folder)
+                for delay_ms in (60, 220, 500):
+                    QTimer.singleShot(delay_ms, lambda fp=abs_folder: self._center_folder_in_tree_for_path(fp))
 
             self.apply_sorting()
             self.set_status(f"Opened favorite: {os.path.basename(abs_folder)}")
@@ -1199,7 +1323,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
             elif not getattr(self.workspace_grid, "selected_file_paths", None):
                 self.set_footer_status(self.build_full_gallery_status())
 
-        self.set_status("Ready")
+            self.set_status("Ready")
 
     def show_about_dialog(self):
         self.set_status("Viewing About Dialog...")
@@ -1229,6 +1353,13 @@ class MainWindow(QMainWindow, WindowDragHandler):
                 except Exception:
                     pass
 
+        if hasattr(self, "meta_signals") and self.meta_signals is not None:
+            try:
+                self.meta_signals.blockSignals(True)
+                self.meta_signals.metadata_ready.disconnect(self.on_metadata_ready)
+            except Exception:
+                pass
+
         settings = load_settings(SETTINGS_FILE)
 
         print("Closing the app, Wait for any active background thread tasks to finish cleanly")
@@ -1253,7 +1384,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
                                 shutil.rmtree(fpath)
                         except OSError:
                             pass
-                    print("purge_thumb_cache_on_exit: DONE")
+                print("purge_thumb_cache_on_exit: DONE")
             except Exception as e:
                 print(f"Error purging thumbnail cache: {e}")
 

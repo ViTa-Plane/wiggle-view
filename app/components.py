@@ -20,6 +20,7 @@ class TopMenuBar(QMenuBar):
     favorite_selected = Signal(str)  # Emits selected folder path from favorites
     add_favorite_requested = Signal()  # Emits signal to add current folder to favorites
     # --- Tool Signals ---
+    rename_requested = Signal()
     convert_requested = Signal()
     purge_exif_requested = Signal()
     inject_exif_requested = Signal()
@@ -32,11 +33,12 @@ class TopMenuBar(QMenuBar):
         self.sort_date_action = None
         self.sort_name_action = None
         self.sort_size_action = None
+        self.sort_type_action = None
         self.sort_reverse_action = None
         self.favorites = favorites or []
         self.max_favorites = max(1, int(max_favorites)) if max_favorites is not None else 15
-        self.initial_sort_criteria = sort_criteria
-        self.initial_sort_reverse = sort_reverse
+        self.initial_sort_criteria = str(sort_criteria or "name").lower()
+        self.initial_sort_reverse = bool(sort_reverse)
         self.setup_ui()
 
     def update_favorites(self, favorites_list, max_favorites=None):
@@ -114,9 +116,14 @@ class TopMenuBar(QMenuBar):
         self.sort_size_action.setChecked(self.initial_sort_criteria == "size")
         self.sort_size_action.triggered.connect(lambda: self._on_sort_selected("size"))
 
+        self.sort_type_action = QAction("By File Type", self, checkable=True)
+        self.sort_type_action.setChecked(self.initial_sort_criteria == "type")
+        self.sort_type_action.triggered.connect(lambda: self._on_sort_selected("type"))
+
         sort_menu.addAction(self.sort_name_action)
         sort_menu.addAction(self.sort_date_action)
         sort_menu.addAction(self.sort_size_action)
+        sort_menu.addAction(self.sort_type_action)
         sort_menu.addSeparator()
 
         self.sort_reverse_action = QAction("Reverse Order", self, checkable=True)
@@ -142,6 +149,8 @@ class TopMenuBar(QMenuBar):
         select_menu.addAction(inverse_action)
 
         tools_menu = self.addMenu("Tools")
+        rename_action = QAction("Rename...", self)
+        rename_action.triggered.connect(self.rename_requested.emit)
         convert_action = QAction("Convert...", self)
         convert_action.triggered.connect(self.convert_requested.emit)
         settings_action = QAction("Settings...", self)
@@ -155,6 +164,7 @@ class TopMenuBar(QMenuBar):
         export_comfy_action = QAction("Export ComfyUI Workflows...", self)
         export_comfy_action.triggered.connect(self.export_comfy_workflow_requested.emit)
 
+        tools_menu.addAction(rename_action)
         tools_menu.addAction(convert_action)
         tools_menu.addSeparator()
         tools_menu.addAction(purge_action)
@@ -172,6 +182,8 @@ class TopMenuBar(QMenuBar):
         self.sort_name_action.setChecked(criteria == "name")
         self.sort_date_action.setChecked(criteria == "date")
         self.sort_size_action.setChecked(criteria == "size")
+        if self.sort_type_action is not None:
+            self.sort_type_action.setChecked(criteria == "type")
         self.sort_criteria_changed.emit(criteria)
 
 
@@ -328,25 +340,25 @@ class DirectoryBrowserPanel(QFrame):
         self.tree_view.setColumnHidden(3, True)
         self.tree_view.setHeaderHidden(True)
         self.tree_view.setStyleSheet("""
-                    QTreeView {
-                        background-color: #05070a;
-                        color: #cbd5e1;
-                        border: 1px solid #1e293b;
-                        border-radius: 6px;
-                        font-size: 11px;
-                    }
-                    QTreeView::item {
-                        padding: 2px;
-                    }
-                    QTreeView::item:hover {
-                        background-color: #1e293b;
-                        color: #f8fafc;
-                    }
-                    QTreeView::item:selected {
-                        background-color: #3b82f6;
-                        color: #ffffff;
-                    }
-                """)
+            QTreeView {
+                background-color: #05070a;
+                color: #cbd5e1;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                font-size: 11px;
+            }
+            QTreeView::item {
+                padding: 2px;
+            }
+            QTreeView::item:hover {
+                background-color: #1e293b;
+                color: #f8fafc;
+            }
+            QTreeView::item:selected {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+        """)
 
         self.tree_view.setAcceptDrops(True)
         self.tree_view.setDragDropMode(QAbstractItemView.DragDropMode.DropOnly)
@@ -362,12 +374,12 @@ class DirectoryBrowserPanel(QFrame):
         self.btn_browse = QPushButton("📂 Open in Explorer")
         self.btn_browse.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_browse.setStyleSheet("""
-                    QPushButton {
-                        background-color: #3b82f6; color: white; border: none;
-                        border-radius: 6px; padding: 8px 12px; font-weight: bold; font-size: 11px;
-                    }
-                    QPushButton:hover { background-color: #2563eb; }
-                """)
+            QPushButton {
+                background-color: #3b82f6; color: white; border: none;
+                border-radius: 6px; padding: 8px 12px; font-weight: bold; font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2563eb; }
+        """)
         layout.addWidget(self.btn_browse)
 
     def on_dir_clicked(self, index: QModelIndex):
@@ -395,8 +407,8 @@ class DirectoryBrowserPanel(QFrame):
             current_idx = self.tree_view.currentIndex()
             if current_idx.isValid():
                 target_path = self.fs_model.filePath(current_idx)
-        if not target_path or not os.path.isdir(target_path):
-            return False
+            if not target_path or not os.path.isdir(target_path):
+                return False
 
         index = self.fs_model.index(os.path.abspath(target_path))
         if not index.isValid():

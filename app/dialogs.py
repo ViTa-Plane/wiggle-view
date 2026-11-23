@@ -478,6 +478,7 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.hw_accel_chk.setChecked(settings.get("smooth_scaling", True))
         self.purge_thumb_chk.setChecked(settings.get("purge_thumb_cache_on_exit", False))
         self.encrypt_thumb_chk.setChecked(settings.get("encrypt_thumbnail_cache", True))
+        self.debug_mode_chk.setChecked(settings.get("debug_mode", False))
 
         cache_map = {
             "Auto (System RAM)": 0,
@@ -507,7 +508,7 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.loop_nav_chk.setChecked(settings.get("loop_gallery_navigation", True))
 
         disk_limit_map = {"Disabled": 0, "500 MB": 1, "1 GB": 2, "2 GB": 3, "Unlimited": 4}
-        current_limit = settings.get("disk_cache_limit_mb", "Disabled")
+        current_limit = settings.get("disk_cache_limit_mb", "1 GB")
         self.disk_limit_combo.setCurrentIndex(disk_limit_map.get(current_limit, 0))
         self._on_disk_limit_changed(current_limit)
 
@@ -557,6 +558,7 @@ class SettingsDialog(QDialog, WindowDragHandler):
             "mouse_zoom": self.mouse_zoom_chk.isChecked(),
             "favorites": self._parse_favorites_text(),
             "max_favorites": self.max_favorites_spin.value(),
+            "debug_mode": self.debug_mode_chk.isChecked(),
         }
         save_settings(new_values=new_values)
 
@@ -960,6 +962,11 @@ class SettingsDialog(QDialog, WindowDragHandler):
         self.encrypt_thumb_chk.setToolTip("Encrypts the cached thumbnails")
         self.encrypt_thumb_chk.setChecked(True)
         advanced_form.addRow(self.encrypt_thumb_chk)
+
+        self.debug_mode_chk = QCheckBox("debug mode")
+        self.debug_mode_chk.setToolTip("debug messages on console")
+        self.debug_mode_chk.setChecked(False)
+        advanced_form.addRow(self.debug_mode_chk)
 
         advanced_layout.addLayout(advanced_form)
 

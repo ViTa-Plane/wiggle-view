@@ -7,6 +7,10 @@ from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLa
 from .helpers import load_settings
 from .workers import ThumbnailLoaderTask
 
+from pathlib import Path
+BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
+SETTINGS_FILE = str(BASE_DIR / "settings.json")
+
 
 class WindowDragHandler:
     def __init__(self):
@@ -155,8 +159,8 @@ class TitleBar(QWidget, WindowDragHandler):
 
         self.title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.title_label.setStyleSheet("""
-                    color: #94a3b8; font-family: sans-serif; font-size: 12px; font-weight: bold;border: none;background-color: transparent;
-                """)
+            color: #94a3b8; font-family: sans-serif; font-size: 12px; font-weight: bold;border: none;background-color: transparent;
+        """)
         h_layout.addWidget(self.title_label)
         h_layout.addStretch()
 
@@ -181,15 +185,15 @@ class TitleBar(QWidget, WindowDragHandler):
             self.max_btn.clicked.connect(self.toggle_maximize)
             h_layout.addWidget(self.max_btn)
 
-        self.close_btn = QPushButton("×")
-        self.close_btn.setFixedSize(28, 28)
-        self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.close_btn.setStyleSheet("""
-            QPushButton { background-color: transparent; color: #94a3b8; font-size: 14px; padding-top: 0px; padding-bottom: 2px; border: none; border-radius: 6px; font-weight: bold; }
-            QPushButton:hover { background-color: #c42b1c; color: #ffffff; }
-        """)
-        self.close_btn.clicked.connect(self.parent_window.close)
-        h_layout.addWidget(self.close_btn)
+            self.close_btn = QPushButton("×")
+            self.close_btn.setFixedSize(28, 28)
+            self.close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.close_btn.setStyleSheet("""
+                QPushButton { background-color: transparent; color: #94a3b8; font-size: 14px; padding-top: 0px; padding-bottom: 2px; border: none; border-radius: 6px; font-weight: bold; }
+                QPushButton:hover { background-color: #c42b1c; color: #ffffff; }
+            """)
+            self.close_btn.clicked.connect(self.parent_window.close)
+            h_layout.addWidget(self.close_btn)
 
         layout.addLayout(h_layout)
 
@@ -214,8 +218,8 @@ class TitleBar(QWidget, WindowDragHandler):
     def mouseReleaseEvent(self, event):
         if self.parent_window is not None:
             self.parent_window._dragging_window = False
-            if hasattr(self.parent_window, "_locked_pos"):
-                self.parent_window._locked_pos = self.parent_window.pos()
+        if hasattr(self.parent_window, "_locked_pos"):
+            self.parent_window._locked_pos = self.parent_window.pos()
         self.handle_mouse_release(event)
 
 
@@ -232,6 +236,9 @@ class ResponsiveGridWidget(QWidget):
         self.cards = []
         self.selected_file_paths = set()
         self.last_clicked_index = None
+
+        settings_init = load_settings(SETTINGS_FILE)
+        self.debug_mode = bool(settings_init.get("debug_mode", False))
 
         self._drag_start_pos = None
         self._pending_click_index = -1
@@ -282,8 +289,8 @@ class ResponsiveGridWidget(QWidget):
         return bool(file_path) and (file_path in self.pixmap_cache or file_path in self._in_flight_thumbs)
 
     def set_cards(self, cards_data):
-        self.cards = cards_data
-        valid_paths = {item["file_path"] for item in cards_data}
+        self.cards = list(cards_data or [])
+        valid_paths = {item["file_path"] for item in self.cards if isinstance(item, dict) and item.get("file_path")}
         self.selected_file_paths.intersection_update(valid_paths)
         self.last_clicked_index = None
         self._pending_click_index = -1
@@ -341,10 +348,10 @@ class ResponsiveGridWidget(QWidget):
                 has_any_modifier = is_shift or is_ctrl or is_alt
 
                 if (
-                        event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)
-                        and not has_any_modifier
-                        and path in self.selected_file_paths
-                        and len(self.selected_file_paths) > 1
+                    event.button() in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton)
+                    and not has_any_modifier
+                    and path in self.selected_file_paths
+                    and len(self.selected_file_paths) > 1
                 ):
                     if event.button() == Qt.MouseButton.LeftButton:
                         self._pending_click_index = index
@@ -385,7 +392,7 @@ class ResponsiveGridWidget(QWidget):
             else:
                 if event.button() == Qt.MouseButton.LeftButton:
                     self.deselect_all()
-        super().mousePressEvent(event)
+                super().mousePressEvent(event)
 
     def mouseDoubleClickEvent(self, event: QMouseEvent):
         self._pending_click_index = -1
@@ -595,9 +602,12 @@ class ResponsiveGridWidget(QWidget):
 
             painter.fillRect(self.rect(), QColor("#0b0f19"))
 
+            cards_snapshot = list(self.cards or [])
+            selected_snapshot = set(self.selected_file_paths or ())
+
             width = self.width()
             cols, left_margin = self._get_grid_metrics(width)
-            if cols <= 0 or not self.cards:
+            if cols <= 0 or not cards_snapshot:
                 return
 
             parent_widget = self.parent()
@@ -614,7 +624,7 @@ class ResponsiveGridWidget(QWidget):
             card_h = self.cell_height - 12
 
             start_row = max(0, int(visible_top // self.cell_height) - 1)
-            end_row = min((len(self.cards) + cols - 1) // cols, int(visible_bottom // self.cell_height) + 2)
+            end_row = min((len(cards_snapshot) + cols - 1) // cols, int(visible_bottom // self.cell_height) + 2)
 
             card_bg_normal = QColor("#131b2e")
             card_bg_selected = QColor("#1e293b")
@@ -633,19 +643,26 @@ class ResponsiveGridWidget(QWidget):
                 and hasattr(main_window, "thumbnail_signals")
             )
 
+            queued_updates = []
+
             for row in range(start_row, end_row):
                 for col in range(cols):
                     index = row * cols + col
-                    if index >= len(self.cards):
+                    if index >= len(cards_snapshot):
                         break
 
-                    item = self.cards[index]
-                    file_path = item["file_path"]
+                    item = cards_snapshot[index]
+                    if not isinstance(item, dict):
+                        continue
+                    file_path = item.get("file_path")
+                    if not file_path:
+                        continue
+
                     x = left_margin + col * self.cell_width + 6
                     y = row * self.cell_height + 6
 
                     card_rect = QRect(x, y, card_w, card_h)
-                    is_selected = file_path in self.selected_file_paths
+                    is_selected = file_path in selected_snapshot
 
                     painter.setBrush(card_bg_selected if is_selected else card_bg_normal)
                     painter.setPen(border_selected if is_selected else border_normal)
@@ -656,7 +673,6 @@ class ResponsiveGridWidget(QWidget):
 
                     px = self.pixmap_cache.get(file_path)
                     if isinstance(px, QPixmap) and not px.isNull():
-                        self.pixmap_cache.move_to_end(file_path)
                         draw_x = img_x + (self.image_size - px.width()) // 2
                         draw_y = img_y + (self.image_size - px.height()) // 2
                         painter.drawPixmap(draw_x, draw_y, px)
@@ -664,17 +680,7 @@ class ResponsiveGridWidget(QWidget):
                         painter.fillRect(QRect(img_x, img_y, self.image_size, self.image_size), placeholder_bg)
 
                         if has_worker_pool and not self.is_thumbnail_pending(file_path):
-                            if not hasattr(self, "_queued_thumb_items"):
-                                self._queued_thumb_items = {}
-                            if not hasattr(self, "_thumb_flush_scheduled"):
-                                self._thumb_flush_scheduled = False
-
-                            if file_path not in self._queued_thumb_items:
-                                self._queued_thumb_items[file_path] = item.get("thumb_path")
-
-                            if not self._thumb_flush_scheduled:
-                                self._thumb_flush_scheduled = True
-                                QTimer.singleShot(0, self._flush_queued_thumbnail_tasks)
+                            queued_updates.append((file_path, item.get("thumb_path")))
 
                     if item.get("has_comfy"):
                         badge_text = "ComfyUI"
@@ -698,6 +704,18 @@ class ResponsiveGridWidget(QWidget):
 
                     text_rect = QRect(x + 6, y + card_h - 32, card_w - 12, 26)
                     painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, item.get("display_name", ""))
+
+            if queued_updates:
+                if not hasattr(self, "_queued_thumb_items"):
+                    self._queued_thumb_items = {}
+                if not hasattr(self, "_thumb_flush_scheduled"):
+                    self._thumb_flush_scheduled = False
+                for fp, tp in queued_updates:
+                    if fp not in self._queued_thumb_items:
+                        self._queued_thumb_items[fp] = tp
+                if not self._thumb_flush_scheduled:
+                    self._thumb_flush_scheduled = True
+                    QTimer.singleShot(0, self._flush_queued_thumbnail_tasks)
         finally:
             if painter.isActive():
                 painter.end()
@@ -797,7 +815,7 @@ class ResponsiveGridWidget(QWidget):
             self.pixmap_cache.popitem(last=False)
 
     def update_cache_limit_from_settings(self):
-        settings = load_settings()
+        settings = load_settings(SETTINGS_FILE)
         cache_setting = settings.get("max_thumbnail_cache", "Auto (System RAM)")
 
         if "Auto" in cache_setting or not cache_setting:
@@ -816,7 +834,8 @@ class ResponsiveGridWidget(QWidget):
         else:
             self._MAX_PIXMAP_CACHE_ITEMS = 2000
 
-        print(f"MAX_PIXMAP_CACHE_ITEMS: {self._MAX_PIXMAP_CACHE_ITEMS}")
+        if self.debug_mode:
+            print(f"MAX_PIXMAP_CACHE_ITEMS: {self._MAX_PIXMAP_CACHE_ITEMS}")
 
     def get_cache_memory_usage(self):
         total_bytes = 0

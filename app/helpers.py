@@ -1,8 +1,20 @@
 import os
 import json
 import tempfile
+from pathlib import Path
 from PIL import Image
 from PIL.ExifTags import TAGS, GPSTAGS
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+DEFAULT_SETTINGS_FILE = str(BASE_DIR / "settings.json")
+
+
+def resolve_settings_file(settings_file=None):
+    """Resolves the settings file path, defaulting to the project-root settings.json."""
+    if settings_file:
+        return os.path.abspath(str(settings_file))
+    return DEFAULT_SETTINGS_FILE
+
 
 # Define your default schema here. Add any future settings keys to this dictionary.
 DEFAULT_SETTINGS = {
@@ -20,7 +32,7 @@ DEFAULT_SETTINGS = {
     "encrypt_thumbnail_cache": True,
     "max_thumbnail_cache": "Auto (System RAM)",
     "thumbnail_jpeg_quality": 88,
-    "disk_cache_limit_mb": "Disabled",
+    "disk_cache_limit_mb": "1 GB",
     "thread_pool_concurrency": "Auto (Max Cores)",
     "confirm_on_delete": True,
     "use_recycle_bin": True,
@@ -31,33 +43,36 @@ DEFAULT_SETTINGS = {
     "default_zoom_mode": "Fit to Window (Default)",
     "invert_mouse_wheel_zoom": False,
     "mouse_zoom": True,
-    "viewer_always_on_top": True
+    "viewer_always_on_top": True,
+    "debug_mode": False
 }
 
 
-def load_settings(settings_file="settings.json"):
+def load_settings(settings_file=None):
     """Loads settings from JSON, merging with defaults so new keys are always present."""
+    resolved_path = resolve_settings_file(settings_file)
     settings = DEFAULT_SETTINGS.copy()
-    if os.path.exists(settings_file):
+    if os.path.exists(resolved_path):
         try:
-            with open(settings_file, "r", encoding="utf-8") as f:
+            with open(resolved_path, "r", encoding="utf-8") as f:
                 user_data = json.load(f)
-                if isinstance(user_data, dict):
-                    settings.update(user_data)
+            if isinstance(user_data, dict):
+                settings.update(user_data)
         except Exception as e:
             print(f"Error loading settings: {e}")
     return settings
 
 
-def save_settings(settings_file="settings.json", new_values=None):
+def save_settings(settings_file=None, new_values=None):
     """Safely updates and persists settings to JSON atomically without losing other keys."""
-    current_settings = load_settings(settings_file)
+    resolved_path = resolve_settings_file(settings_file)
+    current_settings = load_settings(resolved_path)
 
     if new_values and isinstance(new_values, dict):
         current_settings.update(new_values)
 
     try:
-        abs_settings = os.path.abspath(settings_file)
+        abs_settings = os.path.abspath(resolved_path)
         target_dir = os.path.dirname(abs_settings) or "."
         os.makedirs(target_dir, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix=".settings_", suffix=".tmp", dir=target_dir)
@@ -85,39 +100,53 @@ def format_file_size(b_size):
 
 
 def extract_exif_metadata(file_path):
-    """Extracts and formats comprehensive EXIF metadata and image info headers."""
+    """Extracts and formats comprehensive EXIF metadata and image info headers without forcing full pixel decode."""
     exif_text = "<b>EXIF Camera Data:</b><br><br>"
     found_exif = False
     try:
         with Image.open(file_path) as img:
+            exif_dict = {}
             raw_exif = None
-            try:
-                raw_exif = img.getexif()
-            except Exception:
-                pass
-            if not raw_exif and hasattr(img, "_getexif"):
+
+            # On PNGs, img.getexif() can trigger full pixel loading via PngImagePlugin.getexif().
+            # Prefer raw EXIF bytes from img.info.get("exif") when available.
+            info_map = getattr(img, "info", None) or {}
+            raw_exif_bytes = info_map.get("exif")
+            if raw_exif_bytes:
+                try:
+                    parsed_exif = Image.Exif()
+                    parsed_exif.load(raw_exif_bytes)
+                    raw_exif = parsed_exif
+                except Exception:
+                    raw_exif = None
+
+            if raw_exif is None and img.format != "PNG":
+                try:
+                    raw_exif = img.getexif()
+                except Exception:
+                    raw_exif = None
+
+            if not raw_exif and img.format != "PNG" and hasattr(img, "_getexif"):
                 try:
                     raw_exif = img._getexif()
                 except Exception:
-                    pass
-
-            exif_dict = {}
+                    raw_exif = None
 
             if raw_exif:
                 for tag_id, val in raw_exif.items():
                     tag_name = TAGS.get(tag_id, tag_id)
                     if isinstance(val, bytes):
                         try:
-                            val = val.decode('utf-8', errors='ignore').strip()
+                            val = val.decode("utf-8", errors="ignore").strip()
                         except Exception:
                             val = str(val)
                     elif isinstance(val, tuple):
                         val = ", ".join(str(v) for v in val)
                     exif_dict[str(tag_name)] = val
 
-            if hasattr(img, 'info') and img.info:
-                for k, v in img.info.items():
-                    if k not in ['exif', 'icc_profile'] and isinstance(v, (str, int, float)):
+            if info_map:
+                for k, v in info_map.items():
+                    if k not in ("exif", "icc_profile", "workflow", "prompt") and isinstance(v, (str, int, float)):
                         exif_dict[str(k)] = v
 
             if exif_dict:
@@ -164,7 +193,7 @@ def extract_image_metadata(path):
 
     try:
         with Image.open(path) as src:
-            exif_data_bytes = src.info.get('exif')
+            exif_data_bytes = src.info.get("exif")
 
             loaded_exif = None
             if exif_data_bytes:
@@ -210,9 +239,9 @@ def extract_image_metadata(path):
                 except Exception:
                     pass
 
-            if hasattr(src, 'info') and src.info:
+            if hasattr(src, "info") and src.info:
                 for k, v in src.info.items():
-                    if k not in ['exif', 'icc_profile', 'jfif'] and isinstance(v, (str, int, float, bytes)):
+                    if k not in ["exif", "icc_profile", "jfif"] and isinstance(v, (str, int, float, bytes)):
                         exif_dict[str(k)] = _clean_metadata_value(v)
 
     except Exception as e:
@@ -229,7 +258,7 @@ def extract_image_metadata(path):
 def _clean_metadata_value(val):
     if isinstance(val, bytes):
         try:
-            return val.decode('utf-8', errors='ignore').strip()
+            return val.decode("utf-8", errors="ignore").strip()
         except Exception:
             return str(val)
     elif isinstance(val, tuple):
@@ -237,9 +266,10 @@ def _clean_metadata_value(val):
     return str(val)
 
 
-def add_folder_to_favorites(folder_path, settings_file="settings.json"):
+def add_folder_to_favorites(folder_path, settings_file=None):
     """Adds a folder to favorites, moving it to the front if it exists, and caps by max_favorites."""
-    settings = load_settings(settings_file)
+    resolved_path = resolve_settings_file(settings_file)
+    settings = load_settings(resolved_path)
     favorites = settings.get("favorites", [])
     try:
         max_favs = int(settings.get("max_favorites", 15))
@@ -252,7 +282,7 @@ def add_folder_to_favorites(folder_path, settings_file="settings.json"):
     favorites.insert(0, folder_path)
     favorites = favorites[:max_favs]
 
-    save_settings(settings_file, {"favorites": favorites})
+    save_settings(resolved_path, {"favorites": favorites})
     return favorites
 
 
@@ -282,10 +312,10 @@ def get_optimal_thumbnail_cache_limit():
         total_ram_gb = 16.0
 
     if total_ram_gb <= 8.0:
-        return 2000    # ~225 MB for 8GB RAM systems
+        return 2000  # ~225 MB for 8GB RAM systems
     elif total_ram_gb <= 16.0:
-        return 5000    # ~560 MB for 16GB RAM systems
+        return 5000  # ~560 MB for 16GB RAM systems
     elif total_ram_gb <= 32.0:
-        return 10000   # ~1.1 GB for 32GB RAM systems
+        return 10000  # ~1.1 GB for 32GB RAM systems
     else:
-        return 20000   # ~2.2 GB for high-end workstations (64GB+)
+        return 20000  # ~2.2 GB for high-end workstations (64GB+)

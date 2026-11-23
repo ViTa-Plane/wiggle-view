@@ -8,6 +8,11 @@ from .helpers import load_settings
 from .workers import ComfyMetadataScannerTask
 
 
+def _path_key(path):
+    """Normalizes a filesystem path into a case-insensitive lookup key."""
+    return os.path.normcase(os.path.abspath(path)).lower()
+
+
 class ChildFolderScanSignals(QObject):
     scan_ready = Signal(int, str, list, set)
 
@@ -105,7 +110,8 @@ class ChildFolderScanTask(QRunnable):
         if self._is_stale():
             return
 
-        added_paths = sorted(disk_files - self.existing_paths_set)
+        existing_keys = {_path_key(p) for p in self.existing_paths_set}
+        added_paths = sorted(p for p in disk_files if _path_key(p) not in existing_keys)
         new_items = []
         for file_path in added_paths:
             if self._is_stale():
@@ -174,7 +180,7 @@ class FolderSyncController:
         if not getattr(self.win, "thumb_cache_dir", None):
             return False
         settings = load_settings(self.settings_file)
-        limit_val = settings.get("disk_cache_limit_mb", "Disabled")
+        limit_val = settings.get("disk_cache_limit_mb", "1 GB")
         if isinstance(limit_val, str) and limit_val.strip().lower() == "disabled":
             return False
         return bool(limit_val)
@@ -187,7 +193,7 @@ class FolderSyncController:
 
     @staticmethod
     def get_disk_cache_limit_str(settings):
-        limit_val = settings.get("disk_cache_limit_mb", "Disabled")
+        limit_val = settings.get("disk_cache_limit_mb", "1 GB")
         if isinstance(limit_val, (int, float)):
             return f"{float(limit_val):.2f} MB"
         if isinstance(limit_val, str):
@@ -391,6 +397,18 @@ class FolderSyncController:
             self.win.folder_scan_cache.pop(self.win.current_watched_dir, None)
             disk_files = set()
             if snap[0]:
+                try:
+                    with os.scandir(abs_root) as entries:
+                        for entry in entries:
+                            try:
+                                if entry.is_file(follow_symlinks=False):
+                                    if os.path.splitext(entry.name)[1].lower() in self._VALID_IMAGE_EXTS:
+                                        disk_files.add(os.path.abspath(entry.path))
+                            except OSError:
+                                continue
+                except OSError:
+                    pass
+            if not disk_files:
                 for name, kind, _sz, _mt in snap[2]:
                     if kind == "F":
                         disk_files.add(os.path.join(abs_root, name))
@@ -453,11 +471,11 @@ class FolderSyncController:
         # Preserve existing items from unchanged directories when doing incremental branch updates
         if self._branch_snapshots and changed_paths:
             unchanged_dirs = {
-                os.path.normcase(d) for d in watched_dirs if d not in changed_branches
+                _path_key(d) for d in watched_dirs if d not in changed_branches
             }
             for item in self.win.loaded_items:
                 item_abs = os.path.abspath(item["file_path"])
-                item_parent = os.path.normcase(os.path.dirname(item_abs))
+                item_parent = _path_key(os.path.dirname(item_abs))
                 if item_parent in unchanged_dirs:
                     disk_files.add(item_abs)
 
@@ -517,43 +535,51 @@ class FolderSyncController:
             self.sync_file_watcher_paths(self.win.current_watched_dir)
 
             current_disk_files = self._collect_disk_image_paths(changed_paths=pending_changes)
-            loaded_map = {os.path.abspath(item["file_path"]): item for item in self.win.loaded_items}
-            loaded_paths = set(loaded_map.keys())
+            current_disk_keys = {_path_key(p) for p in current_disk_files}
+            disk_by_key = {_path_key(p): os.path.abspath(p) for p in current_disk_files}
 
-            if current_disk_files == loaded_paths:
-                # Re-sync active sort order without disrupting existing view or selection
+            loaded_by_key = {_path_key(item["file_path"]): item for item in self.win.loaded_items}
+            loaded_keys = set(loaded_by_key.keys())
+
+            if current_disk_keys == loaded_keys:
                 if getattr(self.win, "loaded_items", None):
                     prev_selected = set(getattr(self.win.workspace_grid, "selected_file_paths", set()))
                     self.win.sort_loaded_items_quietly()
                     self.win.workspace_grid.set_cards(self.win.loaded_items)
                     if hasattr(self.win.workspace_grid, "selected_file_paths"):
                         self.win.workspace_grid.selected_file_paths = {
-                            p for p in prev_selected if os.path.abspath(p) in current_disk_files
+                            p for p in prev_selected if _path_key(p) in current_disk_keys
                         }
-                        self.win.workspace_grid.update()
+                    self.win.workspace_grid.update()
                 return
 
-            removed_paths = loaded_paths - current_disk_files
-            added_paths = sorted(current_disk_files - loaded_paths)
+            removed_keys = loaded_keys - current_disk_keys
+            added_keys = sorted(current_disk_keys - loaded_keys)
 
             v_bar = self.win.scroll_area.verticalScrollBar()
             prev_scroll = v_bar.value()
             prev_selected = set(getattr(self.win.workspace_grid, "selected_file_paths", set()))
 
-            if removed_paths:
+            removed_paths = set()
+            if removed_keys:
+                removed_paths = {os.path.abspath(loaded_by_key[k]["file_path"]) for k in removed_keys}
                 self.win.loaded_items = [
                     item for item in self.win.loaded_items
-                    if os.path.abspath(item["file_path"]) not in removed_paths
+                    if _path_key(item["file_path"]) not in removed_keys
                 ]
                 for rp in removed_paths:
                     if hasattr(self.win.workspace_grid, "pixmap_cache"):
                         self.win.workspace_grid.pixmap_cache.pop(rp, None)
 
             new_items = []
-            for ap in added_paths:
-                item = self._build_external_item(ap)
-                self.win.loaded_items.append(item)
-                new_items.append(item)
+            added_paths = []
+            for ak in added_keys:
+                added_path = disk_by_key[ak]
+                added_paths.append(added_path)
+                new_items.append(self._build_external_item(added_path))
+
+            if new_items:
+                self.win.loaded_items.extend(new_items)
 
             self.win.rebuild_path_index()
             if removed_paths or added_paths:
@@ -565,10 +591,10 @@ class FolderSyncController:
             self.win.workspace_grid.set_cards(self.win.loaded_items)
             if hasattr(self.win.workspace_grid, "selected_file_paths"):
                 self.win.workspace_grid.selected_file_paths = {
-                    p for p in prev_selected if os.path.abspath(p) in current_disk_files
+                    p for p in prev_selected if _path_key(p) in current_disk_keys
                 }
-                self.win.workspace_grid.update()
 
+            self.win.workspace_grid.update()
             QTimer.singleShot(0, lambda pos=prev_scroll: v_bar.setValue(pos))
 
             for item in new_items:
@@ -632,11 +658,12 @@ class FolderSyncController:
         if not self.win.current_watched_dir or os.path.abspath(self.win.current_watched_dir) != root_folder:
             return
 
-        loaded_map = {os.path.abspath(item["file_path"]): item for item in self.win.loaded_items}
-        loaded_paths = set(loaded_map.keys())
-        removed_paths = loaded_paths - disk_files
+        loaded_map = {_path_key(item["file_path"]): item for item in self.win.loaded_items}
+        loaded_keys = set(loaded_map.keys())
+        disk_keys = {_path_key(p) for p in disk_files}
+        removed_keys = loaded_keys - disk_keys
 
-        if not removed_paths and not new_items:
+        if not removed_keys and not new_items:
             self._force_grid_refresh_and_thumbnails(scan_id)
             return
 
@@ -644,19 +671,20 @@ class FolderSyncController:
         prev_scroll = v_bar.value()
         prev_selected = set(getattr(self.win.workspace_grid, "selected_file_paths", set()))
 
-        if removed_paths:
+        if removed_keys:
+            removed_paths = {os.path.abspath(loaded_map[k]["file_path"]) for k in removed_keys}
             self.win.loaded_items = [
                 item for item in self.win.loaded_items
-                if os.path.abspath(item["file_path"]) not in removed_paths
+                if _path_key(item["file_path"]) not in removed_keys
             ]
             for rp in removed_paths:
                 if hasattr(self.win.workspace_grid, "pixmap_cache"):
                     self.win.workspace_grid.pixmap_cache.pop(rp, None)
 
         if new_items:
-            existing_set = {os.path.abspath(item["file_path"]) for item in self.win.loaded_items}
+            existing_keys = {_path_key(item["file_path"]) for item in self.win.loaded_items}
             for item in new_items:
-                if os.path.abspath(item["file_path"]) not in existing_set:
+                if _path_key(item["file_path"]) not in existing_keys:
                     self.win.loaded_items.append(item)
 
         self.win.rebuild_path_index()
@@ -683,8 +711,9 @@ class FolderSyncController:
         self.win.grid_repaint_timer.stop()
         self.win.sort_loaded_items_quietly()
         if prev_selected is not None and disk_files is not None and hasattr(self.win.workspace_grid, "selected_file_paths"):
+            disk_keys = {_path_key(p) for p in disk_files}
             self.win.workspace_grid.selected_file_paths = {
-                p for p in prev_selected if os.path.abspath(p) in disk_files
+                p for p in prev_selected if _path_key(p) in disk_keys
             }
         self.win.workspace_grid.set_cards(self.win.loaded_items)
         self.win.workspace_grid.update()
@@ -694,19 +723,25 @@ class FolderSyncController:
             v_bar = self.win.scroll_area.verticalScrollBar()
             QTimer.singleShot(0, lambda pos=prev_scroll: v_bar.setValue(pos))
 
-        self.win.total_thumbs_to_generate = 0
-        self.win.thumbs_ready_count = 0
+        # Preserve already-cached items in the progress baseline so Processed / Left
+        # reflects the full scanned gallery rather than only newly queued uncached tasks.
+        total_items = len(self.win.loaded_items)
         queued = 0
         skipped_uncached = 0
         max_queued = getattr(self.win, "_MAX_CHILD_SCAN_THUMB_TASKS", 512)
         for item in self.win.loaded_items:
             if not self.win.workspace_grid.has_cached_pixmap(item["file_path"]):
                 if queued < max_queued:
-                    self.win.total_thumbs_to_generate += 1
                     self.win.start_thumbnail_task(item["file_path"], scan_id)
                     queued += 1
                 else:
                     skipped_uncached += 1
+
+        # Track total scanned items as the target and count already-cached items as ready,
+        # capped to total_items so Processed + Left stays consistent even when queued tasks are capped.
+        already_cached = max(0, total_items - (queued + skipped_uncached))
+        self.win.total_thumbs_to_generate = total_items
+        self.win.thumbs_ready_count = min(total_items, already_cached)
 
         comfy_task = ComfyMetadataScannerTask(
             self.win.loaded_items,

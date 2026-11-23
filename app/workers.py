@@ -1,7 +1,10 @@
 import io
 import os
+import shutil
 import struct
 import tempfile
+import time
+from pathlib import Path
 from PIL import Image, PngImagePlugin
 from PIL.ExifTags import TAGS, GPSTAGS
 
@@ -13,6 +16,101 @@ from .sqlite_thumb_cache import ThumbnailSQLiteCache
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _COMFY_TEXT_KEYS = (b"workflow", b"prompt")
+_TAGS_BY_NAME = {v: k for k, v in TAGS.items()}
+_GPSTAGS_BY_NAME = {v: k for k, v in GPSTAGS.items()}
+_INVALID_FILENAME_CHARS = '<>:"/\\|?*'
+
+BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
+SETTINGS_FILE = str(BASE_DIR / "settings.json")
+
+
+def _ensure_pil_initialized():
+    """Ensures Pillow plugins are registered before background image encoding."""
+    try:
+        if not getattr(Image, "_initialized", 0):
+            Image.init()
+    except Exception:
+        pass
+
+
+def sanitize_filename_component(name: str, fallback: str = "image") -> str:
+    """Sanitizes a filename stem to prevent path traversal and invalid Windows/POSIX characters."""
+    if not isinstance(name, str) or not name:
+        return fallback
+    safe = os.path.basename(name)
+    safe = safe.replace("..", "_")
+    safe = "".join("_" if (ch in _INVALID_FILENAME_CHARS or ord(ch) < 32) else ch for ch in safe)
+    safe = safe.strip(" .")
+    return safe if safe else fallback
+
+
+def _resolve_unique_output_path(out_dir, safe_stem, target_ext, src_abs=None):
+    """Returns a non-colliding output path, using '<safe_stem>_0001.<ext>' when a target already exists."""
+    candidate = os.path.abspath(os.path.join(out_dir, f"{safe_stem}.{target_ext}"))
+    if out_dir and os.path.commonpath([out_dir, candidate]) != out_dir:
+        return None
+
+    src_norm = os.path.normcase(os.path.abspath(src_abs)) if src_abs else None
+    if not os.path.exists(candidate) and (src_norm is None or os.path.normcase(candidate) != src_norm):
+        return candidate
+
+    counter = 1
+    while True:
+        numbered = os.path.abspath(os.path.join(out_dir, f"{safe_stem}_{counter:04d}.{target_ext}"))
+        if out_dir and os.path.commonpath([out_dir, numbered]) != out_dir:
+            return None
+        if not os.path.exists(numbered) and (src_norm is None or os.path.normcase(numbered) != src_norm):
+            return numbered
+        counter += 1
+
+
+def _replace_with_retry(src_path, dst_path, max_attempts=10, base_delay=0.05):
+    """Replaces dst_path with src_path, retrying briefly on transient Windows WinError 32 locks."""
+    last_err = None
+    for attempt in range(max_attempts):
+        try:
+            os.replace(src_path, dst_path)
+            return
+        except PermissionError as e:
+            last_err = e
+            winerror = getattr(e, "winerror", None)
+            if winerror not in (5, 32, None) and attempt == max_attempts - 1:
+                raise
+            time.sleep(min(0.5, base_delay * (1.5 ** attempt)))
+    if last_err is not None:
+        raise last_err
+
+
+def _write_bytes_atomic(target_path, data_bytes):
+    """Writes bytes to a temp file in the same directory and atomically replaces target_path."""
+    target_abs = os.path.abspath(target_path)
+    parent_dir = os.path.dirname(target_abs)
+    os.makedirs(parent_dir, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=parent_dir)
+    try:
+        try:
+            with os.fdopen(fd, "wb") as tmp_file:
+                tmp_file.write(data_bytes)
+                tmp_file.flush()
+                os.fsync(tmp_file.fileno())
+        except Exception:
+            fd = None
+            raise
+
+        try:
+            shutil.copystat(target_abs, tmp_path)
+        except OSError:
+            pass
+
+        _replace_with_retry(tmp_path, target_abs)
+    except Exception:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+        raise
 
 
 def _png_has_comfy_metadata(file_path):
@@ -42,7 +140,6 @@ def _png_has_comfy_metadata(file_path):
                         continue
                 else:
                     f.seek(chunk_len, os.SEEK_CUR)
-                # Skip 4-byte CRC
                 if len(f.read(4)) < 4:
                     return False
     except OSError:
@@ -61,7 +158,7 @@ class FolderScannerTask(QRunnable):
         self.scan_id = scan_id
         self.signals = signals
         self.active_scan_getter = active_scan_getter
-        self.settings_file = settings_file
+        self.settings_file = settings_file or SETTINGS_FILE
 
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
@@ -153,7 +250,7 @@ class FolderScannerTask(QRunnable):
 
     def run(self):
         valid_extensions = ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')
-        settings = load_settings(self.settings_file) if self.settings_file else load_settings()
+        settings = load_settings(self.settings_file or SETTINGS_FILE)
         include_subfolders = settings.get("include_subfolders", False)
         folder_depth = max(1, int(settings.get("subfolder_depth", 1)))
 
@@ -180,7 +277,7 @@ class FolderScannerTask(QRunnable):
 
 
 class ThumbnailSignalEmitter(QObject):
-    thumbnail_ready = Signal(int, str, str, QImage)  # scan_id, file_path, thumb_path, decoded_qimage
+    thumbnail_ready = Signal(int, str, str, QImage)
 
 
 class ThumbnailLoaderTask(QRunnable):
@@ -198,6 +295,7 @@ class ThumbnailLoaderTask(QRunnable):
         jpeg_quality=None,
         persist_to_db=True,
         encrypt_thumbnail_cache=None,
+        settings_file=None,
     ):
         super().__init__()
         self.file_path = file_path
@@ -212,6 +310,7 @@ class ThumbnailLoaderTask(QRunnable):
         self.encrypt_thumbnail_cache = (
             None if encrypt_thumbnail_cache is None else bool(encrypt_thumbnail_cache)
         )
+        self.settings_file = settings_file or SETTINGS_FILE
 
     def _is_cancelled(self):
         return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
@@ -222,8 +321,9 @@ class ThumbnailLoaderTask(QRunnable):
 
         try:
             settings = None
+            resolved_settings_file = self.settings_file or SETTINGS_FILE
             if self.jpeg_quality is None:
-                settings = load_settings()
+                settings = load_settings(resolved_settings_file)
                 raw_q = settings.get("thumbnail_jpeg_quality", 88)
                 try:
                     jpeg_quality = max(1, min(100, int(raw_q)))
@@ -234,7 +334,7 @@ class ThumbnailLoaderTask(QRunnable):
 
             if self.encrypt_thumbnail_cache is None:
                 if settings is None:
-                    settings = load_settings()
+                    settings = load_settings(resolved_settings_file)
                 encrypt_enabled = bool(settings.get("encrypt_thumbnail_cache", True))
             else:
                 encrypt_enabled = self.encrypt_thumbnail_cache
@@ -282,14 +382,12 @@ def _prepare_image_for_target(img, target_ext):
         return img.copy()
 
     if target_ext == "webp":
-        # WebP encoder (libwebp) expects RGB or RGBA; materialize cleanly without fp ties
         if has_palette_transparency or img.mode in ("RGBA", "LA", "PA"):
             converted = img.convert("RGBA")
         elif img.mode in ("RGB", "RGBA"):
             converted = img.copy()
         else:
             converted = img.convert("RGB")
-        # Ensure contiguous pixel buffer in RGB/RGBA
         if converted.mode not in ("RGB", "RGBA"):
             fixed = converted.convert("RGBA")
             converted.close()
@@ -304,11 +402,53 @@ def _prepare_image_for_target(img, target_ext):
     return img.copy()
 
 
+def _build_exif_bytes_for_target(target_img, exif_data_bytes, exif_dict):
+    """Prepares serialized EXIF bytes suitable for JPEG/WebP encoders."""
+    if exif_data_bytes:
+        try:
+            parsed = Image.Exif()
+            parsed.load(exif_data_bytes)
+            serialized = parsed.tobytes()
+            if serialized:
+                return serialized
+        except Exception:
+            pass
+
+    if exif_dict:
+        try:
+            exif_obj = target_img.getexif()
+            if exif_obj is None:
+                exif_obj = Image.Exif()
+            for k, v in exif_dict.items():
+                tag_id = _TAGS_BY_NAME.get(k) or _GPSTAGS_BY_NAME.get(k)
+                if tag_id is not None:
+                    try:
+                        exif_obj[tag_id] = v
+                    except Exception:
+                        pass
+            serialized = exif_obj.tobytes()
+            if serialized:
+                return serialized
+        except Exception:
+            pass
+
+    return None
+
+
 def _encode_image_bytes(img, save_format, save_kwargs):
     """Encodes a PIL Image into memory via BytesIO to avoid direct path-open issues on worker threads."""
+    _ensure_pil_initialized()
     buf = io.BytesIO()
     img.save(buf, format=save_format, **save_kwargs)
     return buf.getvalue()
+
+
+def _normalize_format_ext(fmt_or_ext):
+    """Normalizes format or extension names so '.jpg'/'.jpeg'/'jpg'/'jpeg' map consistently."""
+    ext = (fmt_or_ext or "").strip().lower().lstrip(".")
+    if ext == "jpg":
+        return "jpeg"
+    return ext
 
 
 class BatchConvertWorker(QRunnable):
@@ -322,72 +462,75 @@ class BatchConvertWorker(QRunnable):
         self.signals = signals
 
     def run(self):
+        _ensure_pil_initialized()
         success_count = 0
         failed_count = 0
-        target_ext = self.target_format.lower()
-        if target_ext == "jpg":
-            target_ext = "jpeg"
-        save_format = "JPEG" if target_ext == "jpeg" else self.target_format.upper()
+        skipped_same_format_count = 0
+        target_ext = _normalize_format_ext(self.target_format)
+        save_format = "JPEG" if target_ext == "jpeg" else (self.target_format or target_ext).strip().upper()
         clamped_quality = max(1, min(100, int(self.quality)))
 
         for path in self.paths:
             img_to_save = None
             try:
-                base, _ = os.path.splitext(path)
-                new_path = f"{base}.{target_ext}"
-                self.signals.progress_update.emit(f"Converting: {os.path.basename(path)}")
+                src_abs = os.path.abspath(path)
+                src_ext = _normalize_format_ext(os.path.splitext(src_abs)[1])
+                if src_ext and target_ext and src_ext == target_ext:
+                    skipped_same_format_count += 1
+                    continue
 
+                out_dir = os.path.dirname(src_abs)
+                raw_stem = os.path.splitext(os.path.basename(src_abs))[0]
+                safe_stem = sanitize_filename_component(raw_stem, fallback="image")
+                new_path = _resolve_unique_output_path(out_dir, safe_stem, target_ext, src_abs=src_abs)
+                if not new_path:
+                    failed_count += 1
+                    continue
+
+                self.signals.progress_update.emit(f"Converting: {os.path.basename(src_abs)}")
+
+                exif_data_bytes = None
                 exif_dict = {}
                 if self.transfer_exif:
-                    _, exif_dict = extract_image_metadata(path)
+                    exif_data_bytes, exif_dict = extract_image_metadata(src_abs)
 
-                with Image.open(path) as img:
+                with Image.open(src_abs) as img:
                     img_to_save = _prepare_image_for_target(img, target_ext)
 
                 save_kwargs = {}
                 if target_ext in ("jpeg", "jpg", "webp"):
                     save_kwargs["quality"] = clamped_quality
-                    if target_ext == "webp":
-                        save_kwargs["method"] = 4
+                if target_ext == "webp":
+                    save_kwargs["method"] = 4
 
-                if self.transfer_exif and exif_dict and target_ext != "webp":
+                if self.transfer_exif and (exif_data_bytes or exif_dict):
                     if target_ext == "png":
-                        meta = PngImagePlugin.PngInfo()
-                        for k, v in exif_dict.items():
-                            meta.add_text(str(k), str(v))
-                        save_kwargs["pnginfo"] = meta
-                    else:
-                        try:
-                            exif_obj = img_to_save.getexif()
-                            if exif_obj is None:
-                                exif_obj = Image.Exif()
+                        if exif_dict:
+                            meta = PngImagePlugin.PngInfo()
                             for k, v in exif_dict.items():
-                                tag_id = TAGS.get(k) or GPSTAGS.get(k)
-                                if tag_id is not None:
-                                    try:
-                                        exif_obj[tag_id] = v
-                                    except Exception:
-                                        pass
-                            exif_bytes = exif_obj.tobytes()
-                            if exif_bytes:
-                                save_kwargs["exif"] = exif_bytes
-                        except Exception:
-                            pass
+                                meta.add_text(str(k), str(v))
+                            save_kwargs["pnginfo"] = meta
+                    else:
+                        exif_bytes = _build_exif_bytes_for_target(img_to_save, exif_data_bytes, exif_dict)
+                        if exif_bytes:
+                            save_kwargs["exif"] = exif_bytes
 
                 try:
                     encoded_bytes = _encode_image_bytes(img_to_save, save_format, save_kwargs)
                 except Exception:
                     fallback_kwargs = {"quality": clamped_quality} if target_ext in ("jpeg", "jpg", "webp") else {}
+                    if target_ext == "webp":
+                        fallback_kwargs["method"] = 4
                     encoded_bytes = _encode_image_bytes(img_to_save, save_format, fallback_kwargs)
 
-                out_dir = os.path.dirname(os.path.abspath(new_path))
-                if out_dir:
-                    os.makedirs(out_dir, exist_ok=True)
-                with open(new_path, "wb") as out_f:
-                    out_f.write(encoded_bytes)
+                _write_bytes_atomic(new_path, encoded_bytes)
 
-                if self.remove_original and os.path.exists(path) and os.path.abspath(path) != os.path.abspath(new_path):
-                    os.remove(path)
+                if (
+                    self.remove_original
+                    and os.path.exists(src_abs)
+                    and os.path.normcase(src_abs) != os.path.normcase(new_path)
+                ):
+                    os.remove(src_abs)
 
                 success_count += 1
             except Exception as e:
@@ -401,7 +544,15 @@ class BatchConvertWorker(QRunnable):
                         pass
 
         qual_str = f" (Quality: {self.quality})" if self.target_format != "PNG" else ""
-        msg = f"Successfully converted {success_count} images to {self.target_format}{qual_str}."
+        if success_count > 0:
+            msg = f"Successfully converted {success_count} images to {self.target_format}{qual_str}."
+        elif skipped_same_format_count > 0 and failed_count == 0:
+            msg = f"No images converted: {skipped_same_format_count} selected image(s) are already {self.target_format}."
+        else:
+            msg = f"Converted 0 images to {self.target_format}{qual_str}."
+
+        if skipped_same_format_count > 0 and success_count > 0:
+            msg += f" ({skipped_same_format_count} skipped - already {self.target_format})"
         if failed_count > 0:
             msg += f" ({failed_count} failed)."
         self.signals.finished.emit(success_count, failed_count, msg)
@@ -409,7 +560,7 @@ class BatchConvertWorker(QRunnable):
 
 class ComfyMetadataScannerSignals(QObject):
     """Lightweight worker signals for scanning PNG files for embedded ComfyUI workflows."""
-    comfy_batch_ready = Signal(int, list)  # scan_id, list of file_paths with ComfyUI metadata
+    comfy_batch_ready = Signal(int, list)
 
 
 class ComfyMetadataScannerTask(QRunnable):
@@ -445,13 +596,17 @@ class ComfyMetadataScannerTask(QRunnable):
 class CacheCleanupTask(QRunnable):
     """Background task to enforce SQLite thumbnail cache limits and purge legacy loose files."""
 
-    def __init__(self, cache_dir):
+    def __init__(self, cache_dir, settings_file=None):
         super().__init__()
         self.cache_dir = cache_dir
+        self.settings_file = settings_file or SETTINGS_FILE
+        settings_init = load_settings(self.settings_file)
+        self.debug_mode = bool(settings_init.get("debug_mode", False))
 
     def run(self):
         try:
-            settings = load_settings()
+            resolved_settings = self.settings_file or SETTINGS_FILE
+            settings = load_settings(resolved_settings)
             limit_str = settings.get("disk_cache_limit_mb", "1 GB")
             encrypt_enabled = bool(settings.get("encrypt_thumbnail_cache", True))
 
@@ -473,7 +628,7 @@ class CacheCleanupTask(QRunnable):
                 db_cache.flush()
                 return
 
-            limit_bytes = 1024 * 1024 * 1024  # Default 1 GB
+            limit_bytes = 1024 * 1024 * 1024
             parts = limit_str.strip().split()
             if len(parts) >= 2:
                 val = float(parts[0])
@@ -488,11 +643,11 @@ class CacheCleanupTask(QRunnable):
             db_cache.flush()
             db_cache.enforce_limit_bytes(limit_bytes)
             total_size = db_cache.total_size_bytes()
-            if total_size <= limit_bytes:
+            if total_size <= limit_bytes and self.debug_mode:
                 print(
                     f"CacheCleanupTask (disk cache size):{total_size / (1024 * 1024):.1f} mb / {limit_bytes / (1024 * 1024):.1f} mb "
                 )
-                return
+            return
 
         except Exception as e:
             print(f"Cache cleanup error: {e}")
