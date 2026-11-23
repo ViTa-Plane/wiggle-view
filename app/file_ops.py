@@ -58,11 +58,7 @@ def build_rename_plan(paths, pattern: str, start_index: int = 1, pad_width: int 
     if not raw_pattern:
         raw_pattern = "image_{n}" if is_batch else os.path.splitext(os.path.basename(unique_paths[0]))[0]
 
-    effective_pad = (
-        max(1, int(pad_width))
-        if int(pad_width or 0) > 0
-        else (max(2, len(str(len(unique_paths) + int(start_index)))) if is_batch else 1)
-    )
+    effective_pad = max(1, int(pad_width)) if int(pad_width or 0) > 0 else (max(2, len(str(len(unique_paths) + int(start_index)))) if is_batch else 1)
     all_selected_lower = {os.path.normcase(p) for p in unique_paths}
     reserved_targets = set()
     plan = []
@@ -95,9 +91,7 @@ def build_rename_plan(paths, pattern: str, start_index: int = 1, pad_width: int 
         candidate_name = f"{target_stem}{ext}"
         candidate_abs = os.path.abspath(os.path.join(parent_dir, candidate_name))
         if os.path.commonpath([parent_dir, candidate_abs]) != parent_dir:
-            candidate_abs = os.path.abspath(
-                os.path.join(parent_dir, f"{sanitize_filename_component(target_stem, fallback='image')}_{num_str}{ext}")
-            )
+            candidate_abs = os.path.abspath(os.path.join(parent_dir, f"{sanitize_filename_component(target_stem, fallback='image')}_{num_str}{ext}"))
 
         counter = 1
         while True:
@@ -134,8 +128,8 @@ class RenamePreviewDialog(QDialog, WindowDragHandler):
         self._result_plan = []
 
         self.setWindowTitle("Batch Rename Preview" if self.is_batch else "Rename File")
-        self.resize(780 if self.is_batch else 560, 480 if self.is_batch else 250)
-        self.setMinimumSize(540 if self.is_batch else 480, 380 if self.is_batch else 220)
+        self.resize(780 if self.is_batch else 620, 480 if self.is_batch else 360)
+        self.setMinimumSize(540 if self.is_batch else 520, 380 if self.is_batch else 330)
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint
         )
@@ -265,6 +259,7 @@ class RenamePreviewDialog(QDialog, WindowDragHandler):
 
         form = QFormLayout()
         form.setSpacing(8)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         if not self.is_batch:
             stem, _ = os.path.splitext(os.path.basename(self.paths[0]))
@@ -275,6 +270,7 @@ class RenamePreviewDialog(QDialog, WindowDragHandler):
             label_text = "Name pattern:"
 
         self.pattern_edit = QLineEdit(default_pattern)
+        self.pattern_edit.setMinimumHeight(30)
         self.pattern_edit.selectAll()
         self.pattern_edit.textChanged.connect(self._refresh_preview)
         form.addRow(label_text, self.pattern_edit)
@@ -319,6 +315,8 @@ class RenamePreviewDialog(QDialog, WindowDragHandler):
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(28)
+        self.table.setMinimumHeight(88 if not self.is_batch else 180)
         self.table.setColumnWidth(0, 230)
         container_layout.addWidget(self.table, stretch=1)
 
