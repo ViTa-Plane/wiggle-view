@@ -93,15 +93,18 @@ def build_rename_plan(paths, pattern: str, start_index: int = 1, pad_width: int 
         if os.path.commonpath([parent_dir, candidate_abs]) != parent_dir:
             candidate_abs = os.path.abspath(os.path.join(parent_dir, f"{sanitize_filename_component(target_stem, fallback='image')}_{num_str}{ext}"))
 
-        counter = 1
-        while True:
-            norm_cand = os.path.normcase(candidate_abs)
-            exists_outside_selection = os.path.exists(candidate_abs) and (norm_cand not in all_selected_lower)
-            already_used = norm_cand in reserved_targets
-            if not exists_outside_selection and not already_used:
-                break
-            candidate_abs = os.path.join(parent_dir, f"{target_stem}_{counter:03d}{ext}")
-            counter += 1
+        # If the computed target matches this exact source file, keep it without
+        # appending a collision suffix; only suffix when colliding with another file.
+        if os.path.normcase(candidate_abs) != os.path.normcase(src_abs):
+            counter = 1
+            while True:
+                norm_cand = os.path.normcase(candidate_abs)
+                exists_outside_selection = os.path.exists(candidate_abs) and (norm_cand not in all_selected_lower)
+                already_used = norm_cand in reserved_targets
+                if not exists_outside_selection and not already_used:
+                    break
+                candidate_abs = os.path.join(parent_dir, f"{target_stem}_{counter:03d}{ext}")
+                counter += 1
 
         reserved_targets.add(os.path.normcase(candidate_abs))
         final_name = os.path.basename(candidate_abs)
@@ -128,8 +131,8 @@ class RenamePreviewDialog(QDialog, WindowDragHandler):
         self._result_plan = []
 
         self.setWindowTitle("Batch Rename Preview" if self.is_batch else "Rename File")
-        self.resize(780 if self.is_batch else 620, 480 if self.is_batch else 360)
-        self.setMinimumSize(540 if self.is_batch else 520, 380 if self.is_batch else 330)
+        self.resize(780 if self.is_batch else 640, 500 if self.is_batch else 440)
+        self.setMinimumSize(540 if self.is_batch else 540, 420 if self.is_batch else 410)
         self.setWindowFlags(
             Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint
         )
