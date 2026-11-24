@@ -502,6 +502,8 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         self._toggling_topmost = False
         self._has_positioned_window = False
         self._dragging_window = False
+        self._programmatic_resizing = False
+        self._anchor_center = None
         self.image_path = image_path
         self.items = list(items_list) if items_list else []
         self.main_parent = parent
@@ -694,30 +696,42 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         return final_w, final_h, screen_geom
 
     def _apply_size_preserving_center(self, final_w, final_h, screen_geom, max_screen_fraction=1.0):
-        """Resizes the window around its current center point (or centers on first open)."""
+        """Resizes the window around a stable center point without drifting on repeated navigation."""
         if not self._has_positioned_window:
-            self.resize(final_w, final_h)
-            center_point = screen_geom.center()
-            window_geom = self.frameGeometry()
-            window_geom.moveCenter(center_point)
-            self.move(window_geom.topLeft())
-            self._has_positioned_window = True
+            self._programmatic_resizing = True
+            try:
+                self.resize(final_w, final_h)
+                center_point = screen_geom.center()
+                window_geom = self.frameGeometry()
+                window_geom.moveCenter(center_point)
+                self.move(window_geom.topLeft())
+                self._anchor_center = self.frameGeometry().center()
+                self._has_positioned_window = True
+            finally:
+                self._programmatic_resizing = False
             return
 
         if self._user_resized:
             return
 
-        current_geom = self.frameGeometry()
-        anchor_center = current_geom.center()
+        # Lock onto the established anchor center so integer half-width/half-height rounding
+        # across repeated left/right arrow navigation never accumulates top-left drift.
+        if self._anchor_center is None:
+            self._anchor_center = self.frameGeometry().center()
 
+        current_geom = self.frameGeometry()
         # Frame offset accounts for non-client/translucent margins if frameGeometry differs from geometry()
         frame_dx = self.geometry().x() - current_geom.x()
         frame_dy = self.geometry().y() - current_geom.y()
 
-        new_top_left_x = anchor_center.x() - (final_w // 2) + frame_dx
-        new_top_left_y = anchor_center.y() - (final_h // 2) + frame_dy
+        new_top_left_x = round(self._anchor_center.x() - (final_w / 2.0)) + frame_dx
+        new_top_left_y = round(self._anchor_center.y() - (final_h / 2.0)) + frame_dy
 
-        self.setGeometry(int(new_top_left_x), int(new_top_left_y), final_w, final_h)
+        self._programmatic_resizing = True
+        try:
+            self.setGeometry(int(new_top_left_x), int(new_top_left_y), final_w, final_h)
+        finally:
+            self._programmatic_resizing = False
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         if self._closing:
@@ -925,9 +939,17 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         self.resize_grip.show()
         self.resize_grip.raise_()
 
+    def moveEvent(self, event):
+        super().moveEvent(event)
+        # Keep the stored center in sync whenever the user drags or moves the window manually.
+        if self._has_positioned_window and not self._programmatic_resizing and not self.isFullScreen():
+            self._anchor_center = self.frameGeometry().center()
+
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._position_corner_grip()
+        if self._has_positioned_window and not self._programmatic_resizing and not self.isFullScreen():
+            self._anchor_center = self.frameGeometry().center()
 
     def showEvent(self, event):
         super().showEvent(event)
