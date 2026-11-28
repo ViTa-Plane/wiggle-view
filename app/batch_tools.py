@@ -1,3 +1,4 @@
+import gc
 import io
 import json
 import os
@@ -6,11 +7,11 @@ import tempfile
 import time
 
 from PIL import Image, PngImagePlugin
-from PIL.ExifTags import TAGS
+from PIL.ExifTags import TAGS, GPSTAGS, IFD
 from PySide6.QtCore import QObject, QRunnable, Signal, QTimer
-from PySide6.QtWidgets import QDialog, QFileDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QFileDialog
 
-from .dialogs import BatchCompleteDialog, BatchConvertDialog
+from .dialogs import BatchCompleteDialog, BatchConvertDialog, NoImageSelectedDialog, ConfirmDestructiveDialog
 from .helpers import extract_image_metadata
 from .workers import BatchConvertWorker, BatchConvertWorkerSignals, ComfyMetadataScannerTask
 
@@ -107,13 +108,18 @@ def write_bytes_atomic(target_path, data_bytes, is_closing=None):
     fd, tmp_path = tempfile.mkstemp(prefix=".tmp_", suffix=".part", dir=parent_dir)
     try:
         try:
-            with os.fdopen(fd, "wb") as tmp_file:
-                tmp_file.write(data_bytes)
-                tmp_file.flush()
-                os.fsync(tmp_file.fileno())
+            tmp_file = os.fdopen(fd, "wb")
         except Exception:
-            fd = None
+            try:
+                os.close(fd)
+            except OSError:
+                pass
             raise
+
+        with tmp_file:
+            tmp_file.write(data_bytes)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
 
         try:
             shutil.copystat(target_abs, tmp_path)
@@ -132,9 +138,10 @@ def write_bytes_atomic(target_path, data_bytes, is_closing=None):
 
 def write_text_atomic(target_path, text_content, encoding="utf-8", newline="", is_closing=None):
     """Writes text atomically via a same-directory temp file and os.replace."""
-    data_bytes = text_content.encode(encoding)
-    if newline is not None and "\r\n" not in text_content and os.linesep != "\n":
-        data_bytes = text_content.replace("\n", newline).encode(encoding)
+    normalized_text = text_content
+    if newline is not None:
+        normalized_text = text_content.replace("\r\n", "\n").replace("\n", newline)
+    data_bytes = normalized_text.encode(encoding)
     write_bytes_atomic(target_path, data_bytes, is_closing=is_closing)
 
 
@@ -152,11 +159,23 @@ def _save_pil_atomic(img, target_path, is_closing=None, **save_kwargs):
             ".gif": "GIF",
         }
         fmt = fmt_map.get(ext)
+
+    work_img = img
+    if fmt == "JPEG" and img.mode in ("RGBA", "LA", "PA", "P"):
+        rgba = img.convert("RGBA")
+        bg = Image.new("RGB", rgba.size, (255, 255, 255))
+        if "A" in rgba.getbands():
+            alpha = rgba.getchannel("A")
+            bg.paste(rgba.convert("RGB"), mask=alpha)
+        else:
+            bg.paste(rgba.convert("RGB"))
+        work_img = bg
+
     buf = io.BytesIO()
     if fmt:
-        img.save(buf, format=fmt, **save_kwargs)
+        work_img.save(buf, format=fmt, **save_kwargs)
     else:
-        img.save(buf, **save_kwargs)
+        work_img.save(buf, **save_kwargs)
     write_bytes_atomic(target_path, buf.getvalue(), is_closing=is_closing)
 
 
@@ -200,10 +219,15 @@ def _extract_comfy_chunks_from_json_payload(content):
             if isinstance(val, str):
                 stripped = val.strip()
                 if stripped:
-                    try:
-                        parsed = json.loads(stripped)
-                        chunks[key] = json.dumps(parsed)
-                    except Exception:
+                    # Avoid passing huge strings to json.loads on worker threads if they
+                    # can trigger C-level stack/buffer pressure alongside GUI painting.
+                    if len(stripped) <= 2_000_000:
+                        try:
+                            parsed = json.loads(stripped)
+                            chunks[key] = json.dumps(parsed, separators=(",", ":"))
+                        except Exception:
+                            chunks[key] = stripped
+                    else:
                         chunks[key] = stripped
             elif isinstance(val, (dict, list)):
                 chunks[key] = json.dumps(val)
@@ -228,16 +252,20 @@ class _BatchTaskSignals(QObject):
     progress = Signal(str)
     finished = Signal(str, str, list)
 
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
 
 class _BatchFunctionWorker(QRunnable):
     """Executes batch EXIF / ComfyUI file operations off the GUI thread with shutdown guards."""
 
-    def __init__(self, fn, signals, is_closing_getter=None):
+    def __init__(self, fn, signals, is_closing_getter=None, on_complete=None):
         super().__init__()
         self.setAutoDelete(True)
         self.fn = fn
         self.signals = signals
         self.is_closing_getter = is_closing_getter
+        self.on_complete = on_complete
 
     def _is_closing(self):
         return callable(self.is_closing_getter) and self.is_closing_getter()
@@ -251,16 +279,33 @@ class _BatchFunctionWorker(QRunnable):
             pass
 
     def _emit_finished(self, title, msg, modified_paths=None):
+        safe_paths = list(modified_paths or [])
+        if callable(self.on_complete):
+            try:
+                self.on_complete(self.signals)
+            except Exception:
+                pass
         if self._is_closing() or self.signals is None:
             return
         try:
-            self.signals.finished.emit(title, msg, list(modified_paths or []))
+            self.signals.finished.emit(title, msg, safe_paths)
         except RuntimeError:
             pass
 
     def run(self):
         if self._is_closing():
+            if callable(self.on_complete):
+                try:
+                    self.on_complete(self.signals)
+                except Exception:
+                    pass
             return
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
+        gc_was_enabled = gc.isenabled()
+        if gc_was_enabled:
+            gc.disable()
         try:
             result = self.fn(self._emit_progress, self._is_closing)
             if isinstance(result, tuple) and len(result) == 3:
@@ -270,6 +315,12 @@ class _BatchFunctionWorker(QRunnable):
                 modified_paths = []
         except Exception as e:
             title, msg, modified_paths = "Batch Operation Failed", f"Batch operation failed: {e}", []
+        finally:
+            if gc_was_enabled and not gc.isenabled():
+                try:
+                    gc.enable()
+                except Exception:
+                    pass
         self._emit_finished(title, msg, modified_paths)
 
 
@@ -281,7 +332,7 @@ class BatchToolsController:
         self._active_dialog = None
         self._picker_busy = False
         self.convert_signals = None
-        self._task_signals = None
+        self._active_task_signals = set()
 
     def _is_closing(self):
         return bool(getattr(self.win, "_is_closing", False))
@@ -298,34 +349,8 @@ class BatchToolsController:
         self.win.set_status(msg)
         if not self._is_closing():
             parent = self.win if self.win is not None and self.win.isVisible() else None
-            box = QMessageBox(parent)
-            box.setIcon(QMessageBox.Icon.Information)
-            box.setWindowTitle("No Image Selected")
-            box.setText("Please select an image first.")
-            box.setInformativeText(f"Select one or more images in the gallery to run {action_label}.")
-            box.setStandardButtons(QMessageBox.StandardButton.Ok)
-            box.setStyleSheet("""
-                QMessageBox {
-                    background-color: #0d1321;
-                    color: #e2e8f0;
-                }
-                QLabel {
-                    color: #e2e8f0;
-                    background: transparent;
-                }
-                QPushButton {
-                    background-color: #3b82f6;
-                    color: #ffffff;
-                    border: none;
-                    border-radius: 6px;
-                    padding: 6px 18px;
-                    font-weight: bold;
-                }
-                QPushButton:hover {
-                    background-color: #2563eb;
-                }
-            """)
-            box.exec()
+            dialog = NoImageSelectedDialog(action_label, parent=parent)
+            dialog.exec()
         return []
 
     def _confirm_destructive_operation(self, title, headline, detail_text, cancel_status):
@@ -333,35 +358,8 @@ class BatchToolsController:
         if self._is_closing():
             return False
         parent = self.win if self.win is not None and self.win.isVisible() else None
-        box = QMessageBox(parent)
-        box.setIcon(QMessageBox.Icon.Warning)
-        box.setWindowTitle(title)
-        box.setText(headline)
-        box.setInformativeText(detail_text)
-        box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-        box.setDefaultButton(QMessageBox.StandardButton.No)
-        box.setStyleSheet("""
-            QMessageBox {
-                background-color: #0d1321;
-                color: #e2e8f0;
-            }
-            QLabel {
-                color: #e2e8f0;
-                background: transparent;
-            }
-            QPushButton {
-                background-color: #1e293b;
-                color: #e2e8f0;
-                border: 1px solid #334155;
-                border-radius: 6px;
-                padding: 6px 16px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #334155;
-            }
-        """)
-        if box.exec() != QMessageBox.StandardButton.Yes:
+        dialog = ConfirmDestructiveDialog(title, headline, detail_text, parent=parent)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             self.win.set_status(cancel_status)
             return False
         return True
@@ -405,13 +403,24 @@ class BatchToolsController:
         finally:
             self._picker_busy = False
 
+    def _release_task_signals(self, sig_obj):
+        if sig_obj is not None:
+            self._active_task_signals.discard(sig_obj)
+
     def _run_background_batch(self, worker_fn):
         if self._is_closing():
             return
-        self._task_signals = _BatchTaskSignals()
-        self._task_signals.progress.connect(self.win.set_status)
-        self._task_signals.finished.connect(self._on_background_batch_finished)
-        worker = _BatchFunctionWorker(worker_fn, self._task_signals, is_closing_getter=self._is_closing)
+        from PySide6.QtCore import Qt
+        task_signals = _BatchTaskSignals(self.win)
+        self._active_task_signals.add(task_signals)
+        task_signals.progress.connect(self.win.set_status, Qt.ConnectionType.QueuedConnection)
+        task_signals.finished.connect(self._on_background_batch_finished, Qt.ConnectionType.QueuedConnection)
+        worker = _BatchFunctionWorker(
+            worker_fn,
+            task_signals,
+            is_closing_getter=self._is_closing,
+            on_complete=self._release_task_signals,
+        )
         self.win.thread_pool.start(worker)
 
     def _refresh_modified_files_metadata(self, modified_paths):
@@ -424,7 +433,7 @@ class BatchToolsController:
         for p in modified_paths:
             if not p:
                 continue
-            ap = os.path.abspath(p)
+            ap = os.path.abspath(str(p))
             abs_paths.append(ap)
             norm_set.add(os.path.normcase(ap))
 
@@ -461,39 +470,65 @@ class BatchToolsController:
             if watched:
                 folder_scan_cache.pop(os.path.abspath(watched), None)
 
-        thread_pool = getattr(self.win, "thread_pool", None)
-        comfy_signals = getattr(self.win, "comfy_signals", None)
-        scan_id = getattr(self.win, "scan_id", 0)
-        if thread_pool is not None and comfy_signals is not None and modified_items:
-            comfy_task = ComfyMetadataScannerTask(
-                modified_items,
-                scan_id,
-                comfy_signals,
-                active_scan_getter=getattr(self.win, "get_active_scan_id", None),
-            )
-            thread_pool.start(comfy_task)
+        # Directly inspect modified files on the spot for ComfyUI metadata so the badge
+        # and ComfyUI tab update immediately without waiting on background scanner queue/timing.
+        any_comfy_found = False
+        for item in modified_items:
+            fp = item.get("file_path")
+            has_c = False
+            if fp and os.path.isfile(fp) and fp.lower().endswith(".png"):
+                try:
+                    with Image.open(fp) as img:
+                        txt = getattr(img, "text", None) or {}
+                        has_c = bool(txt.get("workflow") or txt.get("prompt"))
+                except Exception:
+                    has_c = False
+            item["has_comfy"] = has_c
+            if has_c:
+                any_comfy_found = True
 
+        # Keep folder_scan_cache in sync with updated item dicts so cached folder reloads
+        # also reflect the newly injected ComfyUI metadata.
+        watched = getattr(self.win, "current_watched_dir", None)
+        if isinstance(folder_scan_cache, dict) and watched and isinstance(loaded_items, list):
+            folder_scan_cache[os.path.abspath(watched)] = list(loaded_items)
+
+        workspace_grid = getattr(self.win, "workspace_grid", None)
+        if workspace_grid is not None:
+            if hasattr(self.win, "loaded_items") and hasattr(workspace_grid, "set_cards"):
+                workspace_grid.set_cards(self.win.loaded_items)
+            elif hasattr(workspace_grid, "update"):
+                workspace_grid.update()
         schedule_repaint = getattr(self.win, "_schedule_grid_repaint", None)
         if callable(schedule_repaint):
             schedule_repaint(relayout=False)
-        else:
-            workspace_grid = getattr(self.win, "workspace_grid", None)
-            if workspace_grid is not None:
-                if hasattr(self.win, "loaded_items") and hasattr(workspace_grid, "set_cards"):
-                    workspace_grid.set_cards(self.win.loaded_items)
-                elif hasattr(workspace_grid, "update"):
-                    workspace_grid.update()
 
         workspace_grid = getattr(self.win, "workspace_grid", None)
         selected_paths = getattr(workspace_grid, "selected_file_paths", None) if workspace_grid is not None else None
         if selected_paths:
             selected_abs = {os.path.normcase(os.path.abspath(p)) for p in selected_paths if p}
             matched_selected = [ap for ap in abs_paths if os.path.normcase(ap) in selected_abs]
-            if matched_selected and hasattr(self.win, "on_selection_changed"):
-                self.win.on_selection_changed(list(selected_paths))
+            if matched_selected:
+                first_matched = matched_selected[0]
+                sidebar = getattr(self.win, "right_sidebar", None)
+                comfy_view = getattr(sidebar, "comfy_view", None) if sidebar is not None else None
+                if comfy_view is not None and first_matched.lower().endswith(".png"):
+                    try:
+                        with Image.open(first_matched) as img:
+                            txt = getattr(img, "text", None) or {}
+                            raw_wf = txt.get("workflow") or txt.get("prompt") or ""
+                            if raw_wf:
+                                try:
+                                    comfy_view.setPlainText(json.dumps(json.loads(raw_wf), indent=4))
+                                except Exception:
+                                    comfy_view.setPlainText(raw_wf)
+                    except Exception:
+                        pass
+                if hasattr(self.win, "on_selection_changed"):
+                    self.win.on_selection_changed(list(selected_paths))
 
     def _on_background_batch_finished(self, title, msg, modified_paths=None):
-        """Completes batch UI refresh safely after modal dialog/paint state settles."""
+        """Completes batch UI refresh and shows completion dialog on the GUI thread."""
         if self._is_closing():
             return
 
@@ -502,11 +537,18 @@ class BatchToolsController:
         dialog_title = title
         dialog_msg = msg
 
+        if pending_paths:
+            try:
+                self._refresh_modified_files_metadata(pending_paths)
+            except Exception as e:
+                print(f"Error refreshing modified files metadata: {e}")
+
         def _finalize_after_dialog():
             if self._is_closing():
                 return
             try:
-                self._refresh_modified_files_metadata(pending_paths)
+                if pending_paths:
+                    self._refresh_modified_files_metadata(pending_paths)
             except Exception as e:
                 print(f"Error refreshing modified files metadata: {e}")
             try:
@@ -515,9 +557,12 @@ class BatchToolsController:
                 pass
 
         try:
-            BatchCompleteDialog(self.win, dialog_title, dialog_msg).exec()
+            parent = self.win if self.win is not None and self.win.isVisible() else None
+            self._active_dialog = BatchCompleteDialog(parent, dialog_title, dialog_msg)
+            self._active_dialog.exec()
         finally:
-            QTimer.singleShot(0, _finalize_after_dialog)
+            self._active_dialog = None
+            QTimer.singleShot(50, _finalize_after_dialog)
 
     def batch_convert_images(self):
         paths = self._get_selected_existing_paths("batch conversion")
@@ -546,19 +591,22 @@ class BatchToolsController:
             return
 
         self.win.set_status(msg)
+        scan_cache = getattr(self.win, "folder_scan_cache", None)
         if success_count > 0 and original_paths:
             affected_dirs = {
                 os.path.abspath(os.path.dirname(p))
                 for p in original_paths
                 if p and os.path.dirname(p)
             }
-            for folder in affected_dirs:
-                self.win.folder_scan_cache.pop(folder, None)
+            if isinstance(scan_cache, dict):
+                for folder in affected_dirs:
+                    scan_cache.pop(folder, None)
 
             watched = getattr(self.win, "current_watched_dir", None)
             if watched and os.path.isdir(watched):
                 abs_watched = os.path.abspath(watched)
-                self.win.folder_scan_cache.pop(abs_watched, None)
+                if isinstance(scan_cache, dict):
+                    scan_cache.pop(abs_watched, None)
                 if hasattr(self.win, "folder_sync"):
                     self.win.folder_sync.perform_smooth_folder_sync()
                 else:
@@ -590,6 +638,7 @@ class BatchToolsController:
 
         def _work(emit_progress, is_closing):
             success_count = 0
+            failed_count = 0
             modified_paths = []
             for idx, path in enumerate(paths, 1):
                 if is_closing():
@@ -613,17 +662,24 @@ class BatchToolsController:
                     if ext in (".jpg", ".jpeg"):
                         save_kwargs["quality"] = 95
                         save_kwargs["subsampling"] = 0
+                        save_kwargs["exif"] = b""
                     elif ext == ".webp":
                         save_kwargs["quality"] = 95
+                        save_kwargs["exif"] = b""
 
                     _save_pil_atomic(clean_img, path, is_closing=is_closing, **save_kwargs)
                     success_count += 1
                     modified_paths.append(path)
                 except Exception as e:
+                    failed_count += 1
                     print(f"Failed to purge EXIF for {path}: {e}")
+
+            msg = f"Successfully purged EXIF data from {success_count} images."
+            if failed_count > 0:
+                msg += f" ({failed_count} failed)."
             return (
-                "EXIF Purge Complete",
-                f"Successfully purged EXIF data from {success_count} images.",
+                "EXIF Purge Complete" if success_count > 0 or failed_count == 0 else "EXIF Purge Failed",
+                msg,
                 modified_paths,
             )
 
@@ -642,6 +698,7 @@ class BatchToolsController:
 
         def _work(emit_progress, is_closing):
             success_count = 0
+            failed_count = 0
             last_json_filename = ""
             export_abs = os.path.abspath(export_dir)
 
@@ -655,6 +712,7 @@ class BatchToolsController:
                     json_filename = f"{safe_stem}_EXIF.json"
                     out_json = os.path.abspath(os.path.join(export_abs, json_filename))
                     if os.path.commonpath([export_abs, out_json]) != export_abs:
+                        failed_count += 1
                         continue
                     last_json_filename = json_filename
 
@@ -663,6 +721,7 @@ class BatchToolsController:
                     write_text_atomic(out_json, payload, encoding="utf-8", newline="\n", is_closing=is_closing)
                     success_count += 1
                 except Exception as e:
+                    failed_count += 1
                     print(f"Failed to export EXIF for {path}: {e}")
 
             if success_count == 1:
@@ -671,6 +730,9 @@ class BatchToolsController:
                 msg = f"Exported {success_count} EXIF reports (e.g., {last_json_filename})"
             else:
                 msg = "Failed to export EXIF reports."
+
+            if failed_count > 0 and success_count > 0:
+                msg += f" ({failed_count} failed)."
 
             return "EXIF Export Complete", msg, []
 
@@ -716,6 +778,13 @@ class BatchToolsController:
                 exif_data_bytes, exif_dict = extract_image_metadata(source_file)
                 try:
                     with Image.open(source_file) as src_img:
+                        if not exif_data_bytes and hasattr(src_img, "getexif"):
+                            raw_exif = src_img.getexif()
+                            if raw_exif:
+                                try:
+                                    exif_data_bytes = raw_exif.tobytes()
+                                except Exception:
+                                    pass
                         if getattr(src_img, "text", None):
                             for k in ("workflow", "prompt"):
                                 if k in src_img.text and src_img.text[k]:
@@ -727,8 +796,79 @@ class BatchToolsController:
             if not comfy_chunks and isinstance(exif_dict, dict):
                 comfy_chunks = _extract_comfy_chunks_from_json_payload(exif_dict)
 
-            tags_rev = {v: k for k, v in TAGS.items()}
+            ifd0_rev = {str(v): k for k, v in TAGS.items()}
+            exif_ifd_rev = {str(v): k for k, v in TAGS.items()}
+            gps_ifd_rev = {str(v): k for k, v in GPSTAGS.items()}
+
+            def _resolve_tag_id(key, rev_map):
+                if isinstance(key, int):
+                    return key
+                k_str = str(key).strip()
+                if k_str.isdigit():
+                    return int(k_str)
+                if k_str.startswith("0x") or k_str.startswith("0X"):
+                    try:
+                        return int(k_str, 16)
+                    except ValueError:
+                        pass
+                return rev_map.get(k_str)
+
+            def _populate_ifd(target_ifd, source_mapping, rev_map):
+                if not isinstance(source_mapping, dict):
+                    return
+                for raw_k, raw_v in source_mapping.items():
+                    if raw_v is None:
+                        continue
+                    tag_id = _resolve_tag_id(raw_k, rev_map)
+                    if tag_id is None:
+                        continue
+                    val = json.dumps(raw_v) if isinstance(raw_v, (dict, list)) else raw_v
+                    try:
+                        target_ifd[tag_id] = val
+                    except Exception:
+                        try:
+                            target_ifd[tag_id] = str(val)
+                        except Exception:
+                            pass
+
+            def _build_exif_bytes_from_dict(base_target, mapping):
+                exif_obj = Image.Exif()
+                try:
+                    existing = base_target.getexif()
+                    if existing:
+                        for tid, tval in existing.items():
+                            exif_obj[tid] = tval
+                except Exception:
+                    pass
+
+                # Support nested sub-IFD dicts ("Exif", "GPS") if present in JSON/metadata
+                nested_exif = mapping.get("Exif") if isinstance(mapping.get("Exif"), dict) else None
+                nested_gps = mapping.get("GPS") if isinstance(mapping.get("GPS"), dict) else None
+
+                top_level = {
+                    k: v for k, v in mapping.items()
+                    if k not in ("Exif", "GPS", "workflow", "prompt")
+                }
+                _populate_ifd(exif_obj, top_level, ifd0_rev)
+
+                if nested_exif:
+                    try:
+                        sub_exif = exif_obj.get_ifd(IFD.Exif)
+                        _populate_ifd(sub_exif, nested_exif, exif_ifd_rev)
+                    except Exception:
+                        _populate_ifd(exif_obj, nested_exif, exif_ifd_rev)
+
+                if nested_gps:
+                    try:
+                        sub_gps = exif_obj.get_ifd(IFD.GPSInfo)
+                        _populate_ifd(sub_gps, nested_gps, gps_ifd_rev)
+                    except Exception:
+                        _populate_ifd(exif_obj, nested_gps, gps_ifd_rev)
+
+                return exif_obj.tobytes()
+
             success_count = 0
+            failed_count = 0
             modified_paths = []
 
             for idx, path in enumerate(paths, 1):
@@ -746,12 +886,12 @@ class BatchToolsController:
                             existing_text = {}
                             if hasattr(target, "text") and target.text:
                                 for k, v in target.text.items():
-                                    if not k.lower().startswith("jfif"):
-                                        existing_text[k] = str(v)
+                                    if not str(k).lower().startswith("jfif"):
+                                        existing_text[str(k)] = str(v)
 
                             # Apply imported ComfyUI chunks under canonical 'workflow' / 'prompt' keys
                             for k, v in comfy_chunks.items():
-                                existing_text[k] = str(v)
+                                existing_text[str(k)] = str(v)
 
                             # Apply remaining metadata entries while avoiding overwriting canonical ComfyUI keys
                             # with non-JSON or stringified wrapper values unless no canonical chunk was extracted
@@ -761,7 +901,10 @@ class BatchToolsController:
                                     continue
                                 if k_str in ("workflow", "prompt") and k_str in comfy_chunks:
                                     continue
-                                existing_text[k_str] = str(v)
+                                if k_str not in existing_text:
+                                    existing_text[k_str] = (
+                                        json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                                    )
 
                             for k, v in existing_text.items():
                                 meta.add_text(k, v)
@@ -774,29 +917,26 @@ class BatchToolsController:
                                 save_kwargs["exif"] = exif_data_bytes
                             elif exif_dict:
                                 try:
-                                    exif_obj = target.getexif()
-                                    if exif_obj is None:
-                                        exif_obj = Image.Exif()
-                                    for k, v in exif_dict.items():
-                                        if k in tags_rev:
-                                            tag_id = tags_rev[k]
-                                            try:
-                                                exif_obj[tag_id] = v
-                                            except Exception:
-                                                pass
-                                    save_kwargs["exif"] = exif_obj.tobytes()
+                                    built_bytes = _build_exif_bytes_from_dict(target, exif_dict)
+                                    if built_bytes:
+                                        save_kwargs["exif"] = built_bytes
                                 except Exception:
                                     pass
 
-                    _save_pil_atomic(target, path, is_closing=is_closing, **save_kwargs)
+                        _save_pil_atomic(target, path, is_closing=is_closing, **save_kwargs)
                     success_count += 1
                     modified_paths.append(path)
                 except Exception as e:
+                    failed_count += 1
                     print(f"Failed to inject EXIF for {path}: {e}")
 
+            msg = f"Successfully injected metadata into {success_count} images."
+            if failed_count > 0:
+                msg += f" ({failed_count} failed)."
+
             return (
-                "EXIF Injection Complete",
-                f"Successfully injected metadata into {success_count} images.",
+                "EXIF Injection Complete" if success_count > 0 or failed_count == 0 else "EXIF Injection Failed",
+                msg,
                 modified_paths,
             )
 
@@ -816,12 +956,14 @@ class BatchToolsController:
         def _work(emit_progress, is_closing):
             success_count = 0
             failed_count = 0
+            skipped_non_png = 0
             export_abs = os.path.abspath(export_dir)
 
             for idx, path in enumerate(paths, 1):
                 if is_closing():
                     break
                 if not path.lower().endswith(".png"):
+                    skipped_non_png += 1
                     continue
 
                 emit_progress(f"Scanning workflow ({idx}/{len(paths)}): {os.path.basename(path)}")
@@ -856,9 +998,21 @@ class BatchToolsController:
 
             if success_count > 0:
                 msg = f"Successfully exported {success_count} ComfyUI workflow(s)."
+                details = []
                 if failed_count > 0:
-                    msg += f" ({failed_count} skipped/failed)."
+                    details.append(f"{failed_count} without workflow/failed")
+                if skipped_non_png > 0:
+                    details.append(f"{skipped_non_png} non-PNG skipped")
+                if details:
+                    msg += f" ({', '.join(details)})."
                 return "ComfyUI Workflow Export Complete", msg, []
+
+            if skipped_non_png == len(paths):
+                return (
+                    "Export Failed",
+                    "No PNG images were selected (ComfyUI workflows are stored in PNG metadata).",
+                    [],
+                )
 
             return (
                 "Export Failed",

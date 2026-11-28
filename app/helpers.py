@@ -19,6 +19,8 @@ def resolve_settings_file(settings_file=None):
 # Define your default schema here. Add any future settings keys to this dictionary.
 DEFAULT_SETTINGS = {
     "last_folder": "",
+    "clip_folder": "",
+    "clip_overwrite_existing": False,
     "keep_detached_viewers_alive": False,
     "favorites": [],
     "max_favorites": 15,
@@ -44,7 +46,7 @@ DEFAULT_SETTINGS = {
     "invert_mouse_wheel_zoom": False,
     "mouse_zoom": True,
     "viewer_always_on_top": True,
-    "debug_mode": False
+    "debug_mode": False,
 }
 
 

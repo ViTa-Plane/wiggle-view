@@ -5,7 +5,7 @@ from PIL import Image
 from PySide6.QtCore import QObject, QRunnable, QTimer, Signal
 
 from .helpers import load_settings
-from .workers import ComfyMetadataScannerTask
+from .workers import AnimatedGifScannerTask, ComfyMetadataScannerTask
 
 
 def _path_key(path):
@@ -58,7 +58,7 @@ class _DiskCacheSizeTask(QRunnable):
 class ChildFolderScanTask(QRunnable):
     """Scans child/root gallery folders and builds item metadata off the main GUI thread."""
 
-    _VALID_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
+    _VALID_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif'}
 
     def __init__(self, root_folder, scan_id, existing_paths_set, include_subfolders, max_depth, signals, active_scan_getter, is_closing_getter=None):
         super().__init__()
@@ -89,7 +89,7 @@ class ChildFolderScanTask(QRunnable):
                             return
                         try:
                             if entry.is_file(follow_symlinks=False):
-                                if os.path.splitext(entry.name)[1].lower() in self._VALID_EXTS:
+                                if os.path.splitext(entry.name)[1].lower() in self._VALID_IMAGE_EXTS:
                                     disk_files.add(os.path.abspath(entry.path))
                         except OSError:
                             continue
@@ -104,7 +104,7 @@ class ChildFolderScanTask(QRunnable):
                 if current_depth >= self.max_depth:
                     dirs[:] = []
                 for fname in files:
-                    if os.path.splitext(fname)[1].lower() in self._VALID_EXTS:
+                    if os.path.splitext(fname)[1].lower() in self._VALID_IMAGE_EXTS:
                         disk_files.add(os.path.abspath(os.path.join(root, fname)))
 
         if self._is_stale():
@@ -133,6 +133,7 @@ class ChildFolderScanTask(QRunnable):
                 "mtime": mtime,
                 "thumb_path": None,
                 "has_comfy": False,
+                "is_animated_gif": False,
             })
 
         if not self._is_stale():
@@ -407,11 +408,10 @@ class FolderSyncController:
                             except OSError:
                                 continue
                 except OSError:
-                    pass
-            if not disk_files:
-                for name, kind, _sz, _mt in snap[2]:
-                    if kind == "F":
-                        disk_files.add(os.path.join(abs_root, name))
+                    # Fall back to entries already captured in the directory snapshot if scandir fails.
+                    for name, kind, _sz, _mt in snap[2]:
+                        if kind == "F":
+                            disk_files.add(os.path.abspath(os.path.join(abs_root, name)))
             return disk_files
 
         watched_dirs = self._collect_watched_dirs(abs_root, include_subfolders, max_depth)
@@ -520,6 +520,7 @@ class FolderSyncController:
             "mtime": mtime,
             "thumb_path": None,
             "has_comfy": has_comfy,
+            "is_animated_gif": False,
         }
 
     def perform_smooth_folder_sync(self):
@@ -743,13 +744,28 @@ class FolderSyncController:
         self.win.total_thumbs_to_generate = total_items
         self.win.thumbs_ready_count = min(total_items, already_cached)
 
+        # Pass a list snapshot to background scanners
+        items_snapshot = list(self.win.loaded_items)
+
         comfy_task = ComfyMetadataScannerTask(
-            self.win.loaded_items,
+            items_snapshot,
             scan_id,
             self.win.comfy_signals,
             active_scan_getter=self.win.get_active_scan_id,
         )
         self.win.thread_pool.start(comfy_task)
+
+        gif_signals = getattr(self.win, "gif_signals", None)
+        if gif_signals is not None:
+            gif_task = AnimatedGifScannerTask(
+                items_snapshot,
+                scan_id,
+                gif_signals,
+                active_scan_getter=self.win.get_active_scan_id,
+                is_closing_getter=self._is_closing,
+            )
+            self.win.thread_pool.start(gif_task)
+
         self.win.set_footer_status(self.win.build_full_gallery_status())
 
         cap_notes = []

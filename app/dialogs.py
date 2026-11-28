@@ -1,7 +1,7 @@
 from PySide6.QtWidgets import (
     QDialog, QWidget, QVBoxLayout, QHBoxLayout, QSpinBox, QLabel, QPushButton,
     QSlider, QFrame, QGraphicsDropShadowEffect, QCheckBox, QComboBox, QFormLayout,
-    QTabWidget, QPlainTextEdit, QMessageBox
+    QTabWidget, QPlainTextEdit, QTextBrowser, QMessageBox, QLineEdit, QFileDialog
 )
 from PySide6.QtCore import Qt, QEvent, QTimer
 from PySide6.QtGui import QColor
@@ -71,15 +71,15 @@ class AboutDialog(QDialog, WindowDragHandler):
         self.content_label.setWordWrap(True)
         self.content_label.setOpenExternalLinks(True)
         self.content_label.setText(
-            f"<b>WiggleView</b>  {__version__}<br><br>"
+            f"<b>WiggleView</b> {__version__}<br><br>"
             "gallery/image viewer with "
             "high-performance multithreaded scanning, custom EXIF tools, encrypted database,batch conversion, and "
             "detached ref image canvas with smooth zooming & panning.<br><br>"
             "<b>GitHub Repository:</b><br>"
             "<a href='https://github.com/ViTa-Plane/wiggle-view' style='color: #3b82f6; text-decoration: none;'>https://github.com/ViTa-Plane/wiggle-view</a>"
-            # "<br><br><br>If you like the app:   "
+            # "<br><br><br>If you like the app: "
             # "<a href='https://ko-fi.com/andybunny' style='color: #3b82f6; text-decoration: none;'>Buy me a Ko-Fi ^.^</a>"
-            # "<b>    Thank you!</b>"
+            # "<b> Thank you!</b>"
 
 
         )
@@ -116,6 +116,242 @@ class AboutDialog(QDialog, WindowDragHandler):
         """)
         okay_btn.clicked.connect(self.accept)
         btn_layout.addWidget(okay_btn)
+
+        container_layout.addLayout(btn_layout)
+        main_layout.addWidget(self.container)
+
+    def mousePressEvent(self, event):
+        self.handle_mouse_press(self, event)
+
+    def mouseMoveEvent(self, event):
+        self.handle_mouse_move(self, event)
+
+
+class NoImageSelectedDialog(QDialog, WindowDragHandler):
+    """Borderless dark-theme warning dialog matching WiggleView's dialog style."""
+
+    def __init__(self, action_label: str, parent=None):
+        super().__init__(parent)
+        WindowDragHandler.__init__(self)
+        self.action_label = action_label
+        self.setFixedSize(410, 210)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._setup_ui()
+
+    def done(self, result):
+        if hasattr(self, "container") and self.container is not None:
+            self.container.setGraphicsEffect(None)
+        super().done(result)
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.container = QFrame(self)
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: #0d1321;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+            }
+        """)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(shadow)
+
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(16, 16, 16, 16)
+        container_layout.setSpacing(12)
+
+        container_layout.addWidget(TitleBar("No Image Selected", self, show_min_max=False))
+
+        body_frame = QFrame(self.container)
+        body_frame.setStyleSheet("""
+            QFrame {
+                background-color: #05070a;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+            }
+        """)
+        body_layout = QVBoxLayout(body_frame)
+        body_layout.setContentsMargins(12, 10, 12, 10)
+        body_layout.setSpacing(6)
+
+        title_label = QLabel("Please select an image first.")
+        title_label.setStyleSheet(
+            "color: #f8fafc; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+        )
+
+        info_label = QLabel(
+            f"Select one or more images in the gallery to run {self.action_label}."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 12px; border: none; background: transparent;"
+        )
+
+        body_layout.addWidget(title_label)
+        body_layout.addWidget(info_label)
+        container_layout.addWidget(body_frame, stretch=1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        ok_btn = QPushButton("OK")
+        ok_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        ok_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 20px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
+        ok_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(ok_btn)
+
+        container_layout.addLayout(btn_layout)
+        main_layout.addWidget(self.container)
+
+    def mousePressEvent(self, event):
+        self.handle_mouse_press(self, event)
+
+    def mouseMoveEvent(self, event):
+        self.handle_mouse_move(self, event)
+
+
+class ConfirmDestructiveDialog(QDialog, WindowDragHandler):
+    """Borderless dark-theme confirmation dialog for destructive operations."""
+
+    def __init__(self, title: str, headline: str, detail_text: str, parent=None):
+        super().__init__(parent)
+        WindowDragHandler.__init__(self)
+        self.dialog_title = title
+        self.headline = headline
+        self.detail_text = detail_text
+        self.setFixedSize(440, 225)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._setup_ui()
+
+    def done(self, result):
+        if hasattr(self, "container") and self.container is not None:
+            self.container.setGraphicsEffect(None)
+        super().done(result)
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.container = QFrame(self)
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: #0d1321;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+            }
+        """)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(shadow)
+
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(16, 16, 16, 16)
+        container_layout.setSpacing(12)
+
+        container_layout.addWidget(TitleBar(self.dialog_title, self, show_min_max=False))
+
+        body_frame = QFrame(self.container)
+        body_frame.setStyleSheet("""
+            QFrame {
+                background-color: #05070a;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+            }
+        """)
+        body_layout = QVBoxLayout(body_frame)
+        body_layout.setContentsMargins(12, 10, 12, 10)
+        body_layout.setSpacing(6)
+
+        headline_label = QLabel(self.headline)
+        headline_label.setWordWrap(True)
+        headline_label.setStyleSheet(
+            "color: #fbbf24; font-size: 13px; font-weight: bold; border: none; background: transparent;"
+        )
+
+        detail_label = QLabel(self.detail_text)
+        detail_label.setWordWrap(True)
+        detail_label.setStyleSheet(
+            "color: #cbd5e1; font-size: 12px; border: none; background: transparent;"
+        )
+
+        body_layout.addWidget(headline_label)
+        body_layout.addWidget(detail_label)
+        container_layout.addWidget(body_frame, stretch=1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        no_btn = QPushButton("No")
+        no_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        no_btn.setDefault(True)
+        no_btn.setAutoDefault(True)
+        no_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #1e293b;
+                color: #e2e8f0;
+                border: 1px solid #334155;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #334155;
+            }
+        """)
+        no_btn.clicked.connect(self.reject)
+
+        yes_btn = QPushButton("Yes")
+        yes_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        yes_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #dc2626;
+                color: #ffffff;
+                border: none;
+                border-radius: 6px;
+                padding: 6px 18px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #b91c1c;
+            }
+        """)
+        yes_btn.clicked.connect(self.accept)
+
+        btn_layout.addWidget(no_btn)
+        btn_layout.addWidget(yes_btn)
 
         container_layout.addLayout(btn_layout)
         main_layout.addWidget(self.container)
@@ -420,6 +656,17 @@ class SettingsDialog(QDialog, WindowDragHandler):
             self.container.setGraphicsEffect(None)
         super().done(result)
 
+    def _on_browse_clip_folder(self):
+        current_dir = self.clip_folder_edit.text().strip()
+        selected = QFileDialog.getExistingDirectory(
+            self,
+            "Select Clip Folder",
+            current_dir,
+            QFileDialog.Option.ShowDirsOnly | QFileDialog.Option.DontResolveSymlinks,
+        )
+        if selected:
+            self.clip_folder_edit.setText(selected)
+
     def _on_disk_limit_changed(self, text):
         """Disables disk-dependent cache checkboxes when disk cache is disabled."""
         is_enabled = (text != "Disabled")
@@ -473,6 +720,9 @@ class SettingsDialog(QDialog, WindowDragHandler):
         lang_map = {"English (US)": 0}
         self.lang_combo.setCurrentIndex(lang_map.get(settings.get("language"), 0))
 
+        self.clip_folder_edit.setText(str(settings.get("clip_folder", "") or ""))
+        self.clip_overwrite_chk.setChecked(bool(settings.get("clip_overwrite_existing", False)))
+
         self.keep_alive_chk.setChecked(settings.get("keep_detached_viewers_alive", False))
         self.prefetch_chk.setChecked(settings.get("prefetch_images", True))
         self.hw_accel_chk.setChecked(settings.get("smooth_scaling", True))
@@ -509,8 +759,9 @@ class SettingsDialog(QDialog, WindowDragHandler):
 
         disk_limit_map = {"Disabled": 0, "500 MB": 1, "1 GB": 2, "2 GB": 3, "Unlimited": 4}
         current_limit = settings.get("disk_cache_limit_mb", "1 GB")
-        self.disk_limit_combo.setCurrentIndex(disk_limit_map.get(current_limit, 0))
-        self._on_disk_limit_changed(current_limit)
+        resolved_index = disk_limit_map.get(current_limit, 2)
+        self.disk_limit_combo.setCurrentIndex(resolved_index)
+        self._on_disk_limit_changed(self.disk_limit_combo.currentText())
 
         thread_map = {"2 Threads": 0, "4 Threads": 1, "Auto (Max Cores)": 2}
         self.thread_combo.setCurrentIndex(thread_map.get(settings.get("thread_pool_concurrency"), 2))
@@ -538,6 +789,8 @@ class SettingsDialog(QDialog, WindowDragHandler):
         new_values = {
             "theme_style": self.theme_combo.currentText(),
             "language": self.lang_combo.currentText(),
+            "clip_folder": self.clip_folder_edit.text().strip(),
+            "clip_overwrite_existing": self.clip_overwrite_chk.isChecked(),
             "keep_detached_viewers_alive": self.keep_alive_chk.isChecked(),
             "prefetch_images": self.prefetch_chk.isChecked(),
             "smooth_scaling": self.hw_accel_chk.isChecked(),
@@ -579,6 +832,17 @@ class SettingsDialog(QDialog, WindowDragHandler):
                 font-size: 13px;
                 border: none;
                 background: transparent;
+            }
+            QLineEdit {
+                background-color: #05070a;
+                color: #e2e8f0;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border-color: #3b82f6;
             }
             QCheckBox {
                 color: #cbd5e1;
@@ -679,7 +943,47 @@ class SettingsDialog(QDialog, WindowDragHandler):
         _configure_stable_combobox(self.lang_combo, self)
         form_layout.addRow("Language:", self.lang_combo)
 
+        clip_row = QHBoxLayout()
+        clip_row.setSpacing(8)
+        self.clip_folder_edit = QLineEdit()
+        self.clip_folder_edit.setPlaceholderText("Select destination folder for 'C' clip copy...")
+        self.clip_folder_edit.setToolTip(
+            "Destination folder where the currently viewed image is copied when pressing 'C' in the viewer."
+        )
+
+        self.clip_browse_btn = QPushButton("Browse...")
+        self.clip_browse_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.clip_browse_btn.setStyleSheet("""
+                    QPushButton {
+                        background-color: #131b2e;
+                        color: #cbd5e1;
+                        border: 1px solid #1e293b;
+                        border-radius: 6px;
+                        padding: 6px 12px;
+                        font-weight: 600;
+                        font-size: 12px;
+                    }
+                    QPushButton:hover {
+                        background-color: #1e293b;
+                        color: #f8fafc;
+                        border-color: #334155;
+                    }
+                """)
+        self.clip_browse_btn.clicked.connect(self._on_browse_clip_folder)
+
+        clip_row.addWidget(self.clip_folder_edit, stretch=1)
+        clip_row.addWidget(self.clip_browse_btn)
+        form_layout.addRow("Clip Folder:", clip_row)
+
+        self.clip_overwrite_chk = QCheckBox("Overwrite existing")
+        self.clip_overwrite_chk.setToolTip(
+            "When checked, overwrites an existing file with the same name in Clip Folder. "
+            "When unchecked, appends a numeric suffix (_001, _002, ...)."
+        )
+        form_layout.addRow("", self.clip_overwrite_chk)
+
         general_layout.addLayout(form_layout)
+        general_layout.addStretch()
         self.tab_widget.addTab(general_tab, "General")
 
         # 2. Browsing Tab
@@ -1033,16 +1337,13 @@ class SettingsDialog(QDialog, WindowDragHandler):
         btn_layout.addWidget(cancel_btn)
         btn_layout.addWidget(save_btn)
 
-        # self.resize_handle = ResizeHandleWidget(self)
-        # btn_layout.addWidget(self.resize_handle, 0, Qt.AlignmentFlag.AlignBottom | Qt.AlignmentFlag.AlignRight)
-
         container_layout.addLayout(btn_layout)
         main_layout.addWidget(self.container)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
             self._dragging_window = True
-        self.handle_mouse_press(self, event)
+            self.handle_mouse_press(self, event)
 
     def mouseMoveEvent(self, event):
         if getattr(self, "_dragging_window", False):
@@ -1056,6 +1357,238 @@ class SettingsDialog(QDialog, WindowDragHandler):
         if getattr(self, "_dragging_window", False):
             self._dragging_window = False
             self._locked_pos = self.pos()
+            self.handle_mouse_release(event)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+def _build_shortcuts_html(sections):
+    """Renders grouped shortcut rows into a clean, aligned two-column HTML table."""
+    parts = [
+        "<style>"
+        "body { background-color: #05070a; color: #e2e8f0; font-family: 'Segoe UI', sans-serif; "
+        "       font-size: 12px; margin: 0; }"
+        "h3 { color: #f8fafc; font-size: 12px; font-weight: 700; letter-spacing: 0.6px; "
+        "     margin: 14px 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #1e293b; }"
+        "h3.first { margin-top: 2px; }"
+        "table { width: 100%; border-collapse: collapse; }"
+        "td.key-col { width: 195px; padding: 6px 12px 6px 4px; vertical-align: top; white-space: nowrap; }"
+        "td.desc-col { padding: 6px 4px; color: #cbd5e1; vertical-align: top; }"
+        "tr:nth-child(even) td { background-color: #0b0f19; }"
+        "kbd { background-color: #131b2e; color: #38bdf8; border: 1px solid #1e293b; "
+        "      border-radius: 4px; padding: 2px 6px; font-family: Consolas, monospace; "
+        "      font-size: 11px; font-weight: 600; }"
+        "</style>"
+    ]
+
+    for idx, (section_title, rows) in enumerate(sections):
+        h3_cls = " class='first'" if idx == 0 else ""
+        parts.append(f"<h3{h3_cls}>{section_title}</h3>")
+        parts.append("<table>")
+        for key_combo, description in rows:
+            parts.append(
+                f"<tr>"
+                f"<td class='key-col'><kbd>{key_combo}</kbd></td>"
+                f"<td class='desc-col'>{description}</td>"
+                f"</tr>"
+            )
+        parts.append("</table>")
+
+    return "".join(parts)
+
+
+_KEYBOARD_SHORTCUT_SECTIONS = [
+    (
+        "GALLERY & MAIN WINDOW",
+        [
+            ("Ctrl + A", "Select all images in the current folder"),
+            ("Ctrl + D", "Deselect all images"),
+            ("Ctrl + I", "Invert current selection"),
+            ("Ctrl + Z", "Undo last file operation"),
+            ("Ctrl + Shift + Z", "Redo last undone file operation"),
+            ("Delete / Backspace", "Delete selected files (respects confirmation & Recycle Bin settings)"),
+            ("Space", "Open selected (or first) image in the viewer"),
+            ("U", "Center active folder in the directory tree"),
+            ("Y", "Scroll to selected thumbnail in the gallery grid"),
+            ("F", "Toggle subfolder scanning"),
+        ],
+    ),
+    (
+        "IMAGE VIEWER",
+        [
+            ("Left / Right Arrow", "Navigate to previous / next image (loops if enabled)"),
+            ("Up Arrow / +", "Zoom in (1.15x step)"),
+            ("Down Arrow / -", "Zoom out (0.85x step)"),
+            ("C", "Copy current image to configured Clip Folder"),
+            ("Space", "Toggle fullscreen mode"),
+            ("Esc", "Exit focus mode if active, or close the viewer"),
+        ],
+    ),
+]
+
+_MOUSE_SHORTCUT_SECTIONS = [
+    (
+        "GALLERY & DIRECTORY TREE",
+        [
+            ("Left Click", "Select an image card or folder in the directory tree"),
+            ("Double Click", "Open image in the viewer window"),
+            ("Alt + Double Click", "Open image in a pinned/detached viewer window"),
+            ("Right Click", "Open context menu on the gallery grid"),
+            ("Drag & Drop to Tree", "Move dropped files to target folder (hold Ctrl to copy)"),
+            ("Drag Title Bar / Grip", "Move window or resize from the bottom-right corner"),
+        ],
+    ),
+    (
+        "IMAGE VIEWER",
+        [
+            ("Left Drag", "Pan zoomed image canvas"),
+            ("Right Drag", "Move frameless viewer window (when not fullscreen)"),
+            ("Middle Click", "Toggle borderless focus mode"),
+            ("Double Click (Left)", "Toggle fullscreen mode"),
+            ("Scroll Wheel", "Zoom in/out (or navigate images if Mouse Zoom is disabled)"),
+            ("Back / Forward Buttons", "Navigate to previous / next image"),
+        ],
+    ),
+]
+
+
+class ShortcutsDialog(QDialog, WindowDragHandler):
+    """Frameless dark-theme dialog displaying keyboard and mouse shortcuts in aligned tables."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        WindowDragHandler.__init__(self)
+        self.resize(580, 580)
+        self.setMinimumSize(520, 460)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowSystemMenuHint
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self._setup_ui()
+
+    def done(self, result):
+        if hasattr(self, "container") and self.container is not None:
+            self.container.setGraphicsEffect(None)
+        super().done(result)
+
+    def _create_shortcuts_browser(self, sections):
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setStyleSheet("""
+            QTextBrowser {
+                background-color: #05070a;
+                border: 1px solid #1e293b;
+                border-radius: 6px;
+                padding: 8px;
+            }
+        """)
+        browser.setHtml(_build_shortcuts_html(sections))
+        return browser
+
+    def _setup_ui(self):
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(12, 12, 12, 12)
+
+        self.container = QFrame(self)
+        self.container.setStyleSheet("""
+            QFrame {
+                background-color: #0d1321;
+                border: 1px solid #1e293b;
+                border-radius: 12px;
+            }
+            QTabWidget::pane {
+                border: 1px solid #1e293b;
+                background-color: #0b0f19;
+                border-radius: 8px;
+                padding: 6px;
+            }
+            QTabBar::tab {
+                background-color: #131b2e;
+                color: #94a3b8;
+                border: 1px solid #1e293b;
+                padding: 6px 14px;
+                border-top-left-radius: 6px;
+                border-top-right-radius: 6px;
+                margin-right: 2px;
+                font-size: 12px;
+                font-weight: 600;
+            }
+            QTabBar::tab:selected {
+                background-color: #1e293b;
+                color: #f8fafc;
+                border-bottom-color: #1e293b;
+            }
+        """)
+
+        shadow = QGraphicsDropShadowEffect(self)
+        shadow.setBlurRadius(20)
+        shadow.setColor(QColor(0, 0, 0, 160))
+        shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(shadow)
+
+        container_layout = QVBoxLayout(self.container)
+        container_layout.setContentsMargins(16, 16, 16, 16)
+        container_layout.setSpacing(14)
+
+        container_layout.addWidget(TitleBar("Keyboard & Mouse Shortcuts", self, show_min_max=False))
+
+        self.tab_widget = QTabWidget()
+
+        kb_tab = QWidget()
+        kb_layout = QVBoxLayout(kb_tab)
+        kb_layout.setContentsMargins(8, 8, 8, 8)
+        kb_layout.addWidget(self._create_shortcuts_browser(_KEYBOARD_SHORTCUT_SECTIONS))
+        self.tab_widget.addTab(kb_tab, "Keyboard")
+
+        mouse_tab = QWidget()
+        mouse_layout = QVBoxLayout(mouse_tab)
+        mouse_layout.setContentsMargins(8, 8, 8, 8)
+        mouse_layout.addWidget(self._create_shortcuts_browser(_MOUSE_SHORTCUT_SECTIONS))
+        self.tab_widget.addTab(mouse_tab, "Mouse")
+
+        container_layout.addWidget(self.tab_widget, stretch=1)
+
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+
+        close_btn = QPushButton("Close")
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #3b82f6;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                padding: 8px 24px;
+                font-weight: bold;
+                font-size: 12px;
+            }
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+        """)
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+
+        container_layout.addLayout(btn_layout)
+        main_layout.addWidget(self.container)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._dragging_window = True
+            self.handle_mouse_press(self, event)
+
+    def mouseMoveEvent(self, event):
+        if getattr(self, "_dragging_window", False):
+            self.handle_mouse_move(self, event)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if getattr(self, "_dragging_window", False):
+            self._dragging_window = False
             self.handle_mouse_release(event)
             event.accept()
             return

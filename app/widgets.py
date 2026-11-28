@@ -4,12 +4,12 @@ from collections import OrderedDict
 from PySide6.QtCore import Qt, QSize, Signal, QRect, QPoint, QTimer, QMimeData, QUrl
 from PySide6.QtGui import QColor, QPixmap, QPainter, QFont, QPen, QMouseEvent, QPolygon, QDrag, QBrush
 from PySide6.QtWidgets import QWidget, QSizePolicy, QLabel, QPushButton, QHBoxLayout, QVBoxLayout, QApplication
-from .helpers import load_settings
+from .helpers import DEFAULT_SETTINGS_FILE, load_settings
 from .workers import ThumbnailLoaderTask
 
 from pathlib import Path
-BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
-SETTINGS_FILE = str(BASE_DIR / "settings.json")
+
+SETTINGS_FILE = DEFAULT_SETTINGS_FILE
 
 
 class WindowDragHandler:
@@ -588,6 +588,12 @@ class ResponsiveGridWidget(QWidget):
         try:
             if not self.isVisible() or self.width() <= 0 or self.height() <= 0:
                 return
+            main_win = self.window()
+            if main_win is not None and (
+                bool(getattr(main_win, "_is_closing", False))
+                or (callable(getattr(main_win, "_is_shutting_down", None)) and main_win._is_shutting_down())
+            ):
+                return
         except RuntimeError:
             return
 
@@ -672,24 +678,33 @@ class ResponsiveGridWidget(QWidget):
                     img_y = y + 8
 
                     px = self.pixmap_cache.get(file_path)
-                    if isinstance(px, QPixmap) and not px.isNull():
-                        draw_x = img_x + (self.image_size - px.width()) // 2
-                        draw_y = img_y + (self.image_size - px.height()) // 2
-                        painter.drawPixmap(draw_x, draw_y, px)
-                    else:
+                    try:
+                        px_valid = isinstance(px, QPixmap) and not px.isNull()
+                    except RuntimeError:
+                        px_valid = False
+                    if px_valid:
+                        try:
+                            draw_x = img_x + (self.image_size - px.width()) // 2
+                            draw_y = img_y + (self.image_size - px.height()) // 2
+                            painter.drawPixmap(draw_x, draw_y, px)
+                        except RuntimeError:
+                            px_valid = False
+                    if not px_valid:
                         painter.fillRect(QRect(img_x, img_y, self.image_size, self.image_size), placeholder_bg)
 
                         if has_worker_pool and not self.is_thumbnail_pending(file_path):
                             queued_updates.append((file_path, item.get("thumb_path")))
+
+                    badge_cursor_x = img_x + self.image_size - 6
+                    badge_y = img_y + 6
+                    badge_h = 18
 
                     if item.get("has_comfy"):
                         badge_text = "ComfyUI"
                         painter.setFont(badge_font)
                         text_width = painter.fontMetrics().horizontalAdvance(badge_text)
                         badge_w = text_width + 12
-                        badge_h = 18
-                        badge_x = img_x + self.image_size - badge_w - 6
-                        badge_y = img_y + 6
+                        badge_x = badge_cursor_x - badge_w
                         badge_rect = QRect(badge_x, badge_y, badge_w, badge_h)
 
                         painter.setBrush(QColor(15, 23, 42, 220))
@@ -698,6 +713,23 @@ class ResponsiveGridWidget(QWidget):
 
                         painter.setPen(QColor("#f8fafc"))
                         painter.drawText(badge_rect, Qt.AlignmentFlag.AlignCenter, badge_text)
+
+                        badge_cursor_x = badge_x - 4
+
+                    if item.get("is_animated_gif"):
+                        gif_badge_text = "GIF"
+                        painter.setFont(badge_font)
+                        gif_text_width = painter.fontMetrics().horizontalAdvance(gif_badge_text)
+                        gif_badge_w = gif_text_width + 12
+                        gif_badge_x = badge_cursor_x - gif_badge_w
+                        gif_badge_rect = QRect(gif_badge_x, badge_y, gif_badge_w, badge_h)
+
+                        painter.setBrush(QColor(15, 23, 42, 220))
+                        painter.setPen(QPen(QColor("#34d399"), 1))
+                        painter.drawRoundedRect(gif_badge_rect, 4, 4)
+
+                        painter.setPen(QColor("#ecfdf5"))
+                        painter.drawText(gif_badge_rect, Qt.AlignmentFlag.AlignCenter, gif_badge_text)
 
                     painter.setPen(QColor("#ffffff" if is_selected else "#cbd5e1"))
                     painter.setFont(font_bold if is_selected else font_normal)
@@ -738,12 +770,19 @@ class ResponsiveGridWidget(QWidget):
         if main_window is None or not hasattr(main_window, "thread_pool") or not hasattr(main_window, "thumbnail_signals"):
             return
 
+        is_closing_getter = getattr(main_window, "_is_shutting_down", None)
+        if callable(is_closing_getter) and is_closing_getter():
+            return
+
         active_scan_getter = (
             getattr(main_window, "get_active_scan_id", None)
             or getattr(main_window, "_get_active_scan_id", None)
         )
         current_scan_id = getattr(main_window, "scan_id", 0)
-        cached_encrypt = getattr(main_window, "_cached_encrypt_thumbnail_cache", None)
+        cached_quality = getattr(main_window, "_cached_jpeg_quality", 90)
+        cached_encrypt = getattr(main_window, "_cached_encrypt_thumbnail_cache", True)
+        db_cache = getattr(main_window, "thumb_db_cache", None)
+        cache_dir = getattr(main_window, "thumb_cache_dir", None)
 
         for fp, existing_tp in pending.items():
             if self.is_thumbnail_pending(fp):
@@ -751,13 +790,16 @@ class ResponsiveGridWidget(QWidget):
             self.mark_thumbnail_in_flight(fp)
             task = ThumbnailLoaderTask(
                 fp,
-                getattr(main_window, "thumb_cache_dir", None),
+                cache_dir,
                 self.image_size,
                 main_window.thumbnail_signals,
                 scan_id=current_scan_id,
                 active_scan_getter=active_scan_getter,
                 existing_thumb_path=existing_tp,
+                jpeg_quality=cached_quality,
                 encrypt_thumbnail_cache=cached_encrypt,
+                db_cache=db_cache,
+                is_closing_getter=is_closing_getter,
             )
             main_window.thread_pool.start(task)
 

@@ -1,15 +1,18 @@
 import os
+import shutil
 from collections import OrderedDict
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
-from PySide6.QtCore import Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject, QTimer, QPointF
-from PySide6.QtGui import QColor, QPixmap, QImage, QPainter, QWheelEvent, QMouseEvent, QKeyEvent, QImageReader, QPen, QPainterPath
+from PySide6.QtCore import (
+    Qt, Signal, QRect, QPoint, QSize, QRunnable, QThreadPool, QObject,
+    QTimer, QPointF
+)
+from PySide6.QtGui import (
+    QColor, QPixmap, QImage, QMovie, QPainter, QWheelEvent, QMouseEvent,
+    QKeyEvent, QImageReader, QPen, QPainterPath
+)
 from .widgets import ResizeHandleWidget, WindowDragHandler
 from .helpers import load_settings, save_settings
-
-
-PIN_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="17" x2="12" y2="22"></line><path d="M5 17h14v-1.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V6h1a2 2 0 0 0 0-4H8a2 2 0 0 0 0 4h1v4.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24Z"></path></svg>"""
-
-UNPIN_ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="2" y1="2" x2="22" y2="22"></line><line x1="12" y1="17" x2="12" y2="22"></line><path d="M9 9v1.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V17h12"></path><path d="M15 9.34V6h1a2 2 0 0 0 0-4H7.89"></path></svg>"""
+from .workers import is_animated_gif
 
 
 class PinIconButton(QPushButton):
@@ -102,9 +105,9 @@ class PinIconButton(QPushButton):
 
 
 class ImageLoaderSignals(QObject):
-    image_loaded = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
-    image_prefetched = Signal(str, QImage, QSize)  # file_path, decoded_qimage, full_size
-    full_res_loaded = Signal(str, QPixmap)  # file_path, loaded_full_pixmap
+    image_loaded = Signal(str, QImage, QSize)      # file_path, decoded_qimage, full_size
+    image_prefetched = Signal(str, QImage, QSize)    # file_path, decoded_qimage, full_size
+    full_res_loaded = Signal(str, QPixmap)           # file_path, loaded_full_pixmap
 
 
 def _decode_image_proxy(file_path):
@@ -199,7 +202,7 @@ class FullResLoaderTask(QRunnable):
 
 
 class ImageViewerCanvas(QWidget):
-    """Custom paint canvas handling high-performance rendering, zooming, panning, and lazy full-res switching."""
+    """Custom paint canvas handling high-performance rendering, zooming, panning, animation, and lazy full-res switching."""
     double_clicked = Signal()
     key_pressed = Signal(QKeyEvent)
     navigate_requested = Signal(int)
@@ -210,9 +213,10 @@ class ImageViewerCanvas(QWidget):
 
     def __init__(self, pixmap, image_path, parent=None):
         super().__init__(parent)
-        self.display_pixmap = pixmap
+        self.display_pixmap = pixmap if isinstance(pixmap, QPixmap) else QPixmap()
         self.image_path = image_path
         self.full_res_pixmap = None
+        self.movie = None
         self.zoom = 1.0
         self.offset = QPoint(0, 0)
         self.dragging = False
@@ -232,8 +236,56 @@ class ImageViewerCanvas(QWidget):
         self._is_right_dragging = False
         self._drag_start_pos = None
 
+    def stop_movie(self):
+        """Stops and cleans up any active QMovie animation."""
+        if self.movie is not None:
+            try:
+                self.movie.frameChanged.disconnect(self._on_movie_frame_changed)
+            except Exception:
+                pass
+            try:
+                self.movie.stop()
+                self.movie.deleteLater()
+            except Exception:
+                pass
+            self.movie = None
+            self._movie_frame_size = QSize(0, 0)
+
+    def _on_movie_frame_changed(self):
+        if self.movie is None:
+            return
+        frame_px = self.movie.currentPixmap()
+        if frame_px is not None and not frame_px.isNull():
+            self.display_pixmap = frame_px
+            if not self._initial_fit_calculated and frame_px.size().isValid():
+                self._movie_frame_size = frame_px.size()
+            self.update()
+
+    def set_movie(self, movie: QMovie, image_path: str):
+        """Attaches and starts an animated QMovie while preserving canvas zoom/pan support."""
+        self.stop_movie()
+        self.image_path = image_path
+        self.full_res_pixmap = None
+        self._full_res_requested_for = None
+        self.movie = movie
+
+        if self.movie is not None:
+            self.movie.setCacheMode(QMovie.CacheMode.CacheAll)
+            self.movie.frameChanged.connect(self._on_movie_frame_changed)
+            self.reset_fit()
+            self.movie.start()
+            initial_px = self.movie.currentPixmap()
+            self.display_pixmap = (
+                initial_px if (initial_px is not None and not initial_px.isNull()) else QPixmap()
+            )
+            self.update()
+        else:
+            self.display_pixmap = QPixmap()
+            self.reset_fit()
+
     def set_pixmap(self, pixmap, image_path):
-        self.display_pixmap = pixmap
+        self.stop_movie()
+        self.display_pixmap = pixmap if isinstance(pixmap, QPixmap) else QPixmap()
         self.image_path = image_path
         self.full_res_pixmap = None
         self._full_res_requested_for = None
@@ -264,6 +316,8 @@ class ImageViewerCanvas(QWidget):
         self.update()
 
     def check_full_res_load(self):
+        if self.movie is not None:
+            return
         if self.zoom > 1.2 and self.full_res_pixmap is None:
             if self.image_path and self._full_res_requested_for != self.image_path and os.path.exists(self.image_path):
                 self._full_res_requested_for = self.image_path
@@ -385,7 +439,7 @@ class ImageViewerCanvas(QWidget):
 
         active_pixmap = (
             self.full_res_pixmap
-            if (self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
+            if (self.movie is None and self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
             else self.display_pixmap
         )
 
@@ -420,7 +474,7 @@ class ImageViewerCanvas(QWidget):
     def get_effective_zoom(self):
         active_pixmap = (
             self.full_res_pixmap
-            if (self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
+            if (self.movie is None and self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
             else self.display_pixmap
         )
         if active_pixmap.isNull():
@@ -459,7 +513,7 @@ class ImageViewerCanvas(QWidget):
         if old_size.isValid() and old_size.width() > 0 and old_size.height() > 0 and not self.display_pixmap.isNull():
             active_pixmap = (
                 self.full_res_pixmap
-                if (self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
+                if (self.movie is None and self.zoom > 1.2 and self.full_res_pixmap is not None and not self.full_res_pixmap.isNull())
                 else self.display_pixmap
             )
             p_w = active_pixmap.width()
@@ -483,8 +537,9 @@ class ImageViewerCanvas(QWidget):
 class ImageViewerWindow(QWidget, WindowDragHandler):
     """
     Multithreaded image viewer window supporting persistent shared RAM caching,
-    instant proxy loading for huge images (>2MP), background neighbor prefetching,
-    cursor-centered zooming, click-and-drag panning, and navigation.
+    animated GIF playback via QMovie, instant proxy loading for huge images (>2MP),
+    background neighbor prefetching, cursor-centered zooming, click-and-drag panning,
+    and navigation.
     """
     _SHARED_PIXMAP_CACHE = OrderedDict()
     _MAX_CACHE_ITEMS = 30
@@ -518,7 +573,7 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
 
         self.setWindowTitle("Image Viewer")
         self.resize(900, 650)
-        self.setMinimumSize(300, 280)
+        self.setMinimumSize(150, 150)
 
         settings = load_settings()
         self.is_always_on_top = bool(settings.get("viewer_always_on_top", True))
@@ -603,8 +658,44 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         while len(cache) > ImageViewerWindow._MAX_CACHE_ITEMS:
             cache.popitem(last=False)
 
+    def _try_play_animated_gif(self, path: str, max_screen_fraction: float = 1.0) -> bool:
+        """Starts QMovie playback if path is a multi-frame GIF; returns True if handled."""
+        if not is_animated_gif(path):
+            return False
+
+        movie = QMovie(path, parent=self)
+        if not movie.isValid():
+            movie.deleteLater()
+            return False
+
+        movie.setCacheMode(QMovie.CacheMode.CacheAll)
+        movie.start()
+
+        frame_rect = movie.frameRect()
+        frame_size = frame_rect.size()
+        if not frame_size.isValid() or frame_size.width() <= 0 or frame_size.height() <= 0:
+            first_px = movie.currentPixmap()
+            frame_size = first_px.size() if (first_px is not None and not first_px.isNull()) else QSize(400, 300)
+
+        self.full_pixmap_size = frame_size
+        if frame_size.isValid() and not self.isFullScreen():
+            final_w, final_h, screen_geom = self._compute_target_window_size(
+                frame_size, max_screen_fraction=max_screen_fraction
+            )
+            self._apply_size_preserving_center(
+                final_w, final_h, screen_geom, max_screen_fraction=max_screen_fraction
+            )
+
+        self.canvas.set_movie(movie, path)
+        self.update_title_zoom()
+        return True
+
     def load_image_threaded(self, path):
         if self._closing:
+            return
+
+        if self._try_play_animated_gif(path, max_screen_fraction=1.0):
+            self.prefetch_neighbors()
             return
 
         cache = ImageViewerWindow._SHARED_PIXMAP_CACHE
@@ -647,13 +738,15 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
     def on_full_res_loaded(self, file_path, pixmap):
         if self._closing:
             return
-        if file_path == self.image_path:
+        if file_path == self.image_path and self.canvas.movie is None:
             self.canvas.full_res_pixmap = pixmap
             self.canvas.update()
             self.update_title_zoom()
 
     def request_async_full_res(self, file_path):
         """Starts background task to load full resolution image."""
+        if self.canvas.movie is not None:
+            return
         if not self._closing and file_path and os.path.exists(file_path):
             task = FullResLoaderTask(file_path, self.loader_signals, is_closing_getter=self._is_closing)
             self.thread_pool.start(task)
@@ -735,7 +828,7 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
 
     def _display_ready_pixmap(self, file_path, pixmap, full_size):
         if self._closing:
-            return
+            return False
 
         self.full_pixmap_size = full_size
 
@@ -743,14 +836,10 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
             final_w, final_h, screen_geom = self._compute_target_window_size(full_size, max_screen_fraction=1.0)
             self._apply_size_preserving_center(final_w, final_h, screen_geom, max_screen_fraction=1.0)
 
-        self.canvas.display_pixmap = pixmap
-        self.canvas.image_path = file_path
-        self.canvas.full_res_pixmap = None
-        self.canvas._full_res_requested_for = None
-
-        self.canvas.reset_fit()
+        self.canvas.set_pixmap(pixmap, file_path)
         QTimer.singleShot(10, self.canvas.reset_fit)
         self.update_title_zoom()
+        return True
 
     def update_title_zoom(self):
         if self._closing:
@@ -764,6 +853,57 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         effective_scale = self.canvas.get_effective_zoom()
         zoom_pct = int(effective_scale * 100)
         self.title_label.setText(f"{file_title}{dim_info} ({zoom_pct}%)")
+
+    def _show_transient_status(self, message: str, timeout_ms: int = 1800):
+        """Temporarily shows a status message in the viewer title bar and main window."""
+        if self._closing:
+            return
+        if hasattr(self, "title_label") and self.title_label is not None:
+            self.title_label.setText(message)
+        if self.main_parent and hasattr(self.main_parent, "set_status"):
+            try:
+                self.main_parent.set_status(message)
+            except Exception:
+                pass
+        QTimer.singleShot(timeout_ms, self.update_title_zoom)
+
+    def _resolve_clip_dest_path(self, clip_dir: str, src_path: str, overwrite_existing: bool) -> str:
+        """Resolves destination path in clip_dir, appending a numeric suffix when overwrite is False."""
+        base_name = os.path.basename(src_path)
+        candidate = os.path.join(clip_dir, base_name)
+        if overwrite_existing or not os.path.exists(candidate):
+            return candidate
+
+        stem, ext = os.path.splitext(base_name)
+        counter = 1
+        while True:
+            numbered_name = f"{stem}_{counter:03d}{ext}"
+            candidate = os.path.join(clip_dir, numbered_name)
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
+    def copy_current_image_to_clip_folder(self):
+        """Copies the currently viewed image to the configured Clip Folder."""
+        if not self.image_path or not os.path.isfile(self.image_path):
+            self._show_transient_status("Clip failed: no valid source image.")
+            return
+
+        settings = load_settings()
+        clip_folder = str(settings.get("clip_folder", "") or "").strip()
+        overwrite_existing = bool(settings.get("clip_overwrite_existing", False))
+
+        if not clip_folder:
+            self._show_transient_status("Clip folder not configured (set in Settings -> General).")
+            return
+
+        try:
+            os.makedirs(clip_folder, exist_ok=True)
+            dest_path = self._resolve_clip_dest_path(clip_folder, self.image_path, overwrite_existing)
+            shutil.copy2(self.image_path, dest_path)
+            self._show_transient_status(f"Clipped -> {os.path.basename(dest_path)}")
+        except Exception as exc:
+            self._show_transient_status(f"Clip error: {exc}")
 
     def prefetch_neighbors(self):
         if self._closing or not self._prefetch_enabled or len(self.items) <= 1:
@@ -783,6 +923,8 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         for idx in neighbor_indices:
             path = self.items[idx].get("file_path")
             if path and path != self.image_path and path not in cache and path not in self.in_flight_prefetches:
+                if is_animated_gif(path):
+                    continue
                 self.in_flight_prefetches.add(path)
                 self.thread_pool.start(
                     ImagePreloadTask(path, self.loader_signals, is_closing_getter=self._is_closing)
@@ -790,6 +932,8 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
 
     def closeEvent(self, event):
         self._closing = True
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.stop_movie()
         if self.main_parent and hasattr(self.main_parent, 'workspace_grid'):
             self.main_parent.workspace_grid.selected_file_paths = {self.image_path}
             self.main_parent.workspace_grid.update()
@@ -817,6 +961,9 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         elif key in (Qt.Key.Key_Down, Qt.Key.Key_Minus):
             self.canvas.zoom_by_step(0.85)
             event.accept()
+        elif key == Qt.Key.Key_C:
+            self.copy_current_image_to_clip_folder()
+            event.accept()
         elif key == Qt.Key.Key_Space:
             self.toggle_fullscreen()
             event.accept()
@@ -839,6 +986,7 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
             if new_index < 0 or new_index >= len(self.items):
                 return
 
+        self.canvas.stop_movie()
         self.current_index = new_index % len(self.items)
         next_item = self.items[self.current_index]
         self.image_path = next_item["file_path"]
@@ -953,6 +1101,10 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
 
     def showEvent(self, event):
         super().showEvent(event)
+        self._position_corner_grip()
+        if hasattr(self, "canvas") and self.canvas and self.canvas.movie is not None:
+            if self.canvas.movie.state() != QMovie.MovieState.Running:
+                self.canvas.movie.start()
         self._position_corner_grip()
 
     def toggle_focus_mode(self):
@@ -1152,8 +1304,8 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
             self.setCursor(Qt.CursorShape.ArrowCursor)
             if was_dragging:
                 self.handle_mouse_release(event)
-                event.accept()
-                return
+            event.accept()
+            return
 
         super().mouseReleaseEvent(event)
 
@@ -1187,9 +1339,21 @@ class DetachedImageViewerWindow(ImageViewerWindow):
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._position_corner_grip()
 
-    def _display_ready_pixmap(self, file_path, pixmap, full_size):
+    def load_image_threaded(self, path):
         if self._closing:
             return
+
+        max_frac = 0.5 if self._is_first_open else 1.0
+        if self._try_play_animated_gif(path, max_screen_fraction=max_frac):
+            self._is_first_open = False
+            self.prefetch_neighbors()
+            return
+
+        super().load_image_threaded(path)
+
+    def _display_ready_pixmap(self, file_path, pixmap, full_size):
+        if self._closing:
+            return False
 
         self.full_pixmap_size = full_size
 
@@ -1198,28 +1362,26 @@ class DetachedImageViewerWindow(ImageViewerWindow):
             final_w, final_h, screen_geom = self._compute_target_window_size(full_size, max_screen_fraction=0.5)
             self._apply_size_preserving_center(final_w, final_h, screen_geom, max_screen_fraction=0.5)
 
-        self.canvas.display_pixmap = pixmap
-        self.canvas.image_path = file_path
-        self.canvas.full_res_pixmap = None
-        self.canvas._full_res_requested_for = None
-
-        self.canvas.reset_fit()
+        self.canvas.set_pixmap(pixmap, file_path)
         QTimer.singleShot(10, self.canvas.reset_fit)
         self.update_title_zoom()
+        return True
 
     def closeEvent(self, event):
         self._closing = True
+        if hasattr(self, "canvas") and self.canvas is not None:
+            self.canvas.stop_movie()
         if self.main_parent and hasattr(self.main_parent, 'detached_viewers'):
             if self in self.main_parent.detached_viewers:
                 self.main_parent.detached_viewers.remove(self)
-            if (
-                hasattr(self.main_parent, 'workspace_grid')
-                and getattr(self.main_parent.workspace_grid, 'selected_file_paths', None)
-            ):
-                if hasattr(self.main_parent, 'scroll_to_selected_thumbnail_in_grid'):
-                    QTimer.singleShot(0, self.main_parent.scroll_to_selected_thumbnail_in_grid)
-                elif hasattr(self.main_parent.workspace_grid, 'scroll_to_selected'):
-                    QTimer.singleShot(
-                        0, lambda: self.main_parent.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
-                    )
+        if (
+            hasattr(self.main_parent, 'workspace_grid')
+            and getattr(self.main_parent.workspace_grid, 'selected_file_paths', None)
+        ):
+            if hasattr(self.main_parent, 'scroll_to_selected_thumbnail_in_grid'):
+                QTimer.singleShot(0, self.main_parent.scroll_to_selected_thumbnail_in_grid)
+            elif hasattr(self.main_parent.workspace_grid, 'scroll_to_selected'):
+                QTimer.singleShot(
+                    0, lambda: self.main_parent.workspace_grid.scroll_to_selected(only_if_out_of_view=True)
+                )
         event.accept()

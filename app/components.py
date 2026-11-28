@@ -17,6 +17,7 @@ class TopMenuBar(QMenuBar):
     deselect_requested = Signal()
     inverse_selection_requested = Signal()
     about_requested = Signal()
+    shortcuts_requested = Signal()
     favorite_selected = Signal(str)  # Emits selected folder path from favorites
     add_favorite_requested = Signal()  # Emits signal to add current folder to favorites
     # --- Tool Signals ---
@@ -174,9 +175,16 @@ class TopMenuBar(QMenuBar):
         tools_menu.addSeparator()
         tools_menu.addAction(settings_action)
 
+        help_menu = self.addMenu("Help")
+        shortcuts_action = QAction("Shortcuts", self)
+        shortcuts_action.triggered.connect(self.shortcuts_requested.emit)
+        help_menu.addAction(shortcuts_action)
+
+        help_menu.addSeparator()
+
         about_action = QAction("About", self)
         about_action.triggered.connect(self.about_requested.emit)
-        self.addAction(about_action)
+        help_menu.addAction(about_action)
 
     def _on_sort_selected(self, criteria: str):
         self.sort_name_action.setChecked(criteria == "name")

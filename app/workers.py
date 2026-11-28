@@ -4,13 +4,12 @@ import shutil
 import struct
 import tempfile
 import time
-from pathlib import Path
-from PIL import Image, PngImagePlugin
+from PIL import Image, ImageSequence, PngImagePlugin
 from PIL.ExifTags import TAGS, GPSTAGS
 
-from PySide6.QtCore import QRunnable, Signal, QObject
-from PySide6.QtGui import QImage
-from .helpers import extract_image_metadata, load_settings
+from PySide6.QtCore import QRunnable, Signal, QObject, QByteArray
+from PySide6.QtGui import QImage, QImageReader
+from .helpers import DEFAULT_SETTINGS_FILE, extract_image_metadata, load_settings
 from .sqlite_thumb_cache import ThumbnailSQLiteCache
 
 
@@ -20,8 +19,8 @@ _TAGS_BY_NAME = {v: k for k, v in TAGS.items()}
 _GPSTAGS_BY_NAME = {v: k for k, v in GPSTAGS.items()}
 _INVALID_FILENAME_CHARS = '<>:"/\\|?*'
 
-BASE_DIR = Path(__file__).resolve().parent.parent  # root wiggle-view folder
-SETTINGS_FILE = str(BASE_DIR / "settings.json")
+
+SETTINGS_FILE = DEFAULT_SETTINGS_FILE
 
 
 def _ensure_pil_initialized():
@@ -146,6 +145,140 @@ def _png_has_comfy_metadata(file_path):
         return False
 
 
+def is_animated_gif(file_path: str) -> bool:
+    """Checks whether a .gif file contains more than one animation frame."""
+    if not isinstance(file_path, str) or not file_path:
+        return False
+
+    clean_path = file_path.strip()
+    if not clean_path.lower().endswith(".gif") or not os.path.isfile(clean_path):
+        return False
+
+    try:
+        reader = QImageReader(clean_path, QByteArray(b"gif"))
+        if reader.isValid():
+            count = reader.imageCount()
+            if count > 1:
+                return True
+            if reader.canRead() and reader.jumpToNextImage():
+                return reader.canRead()
+    except Exception:
+        pass
+
+    try:
+        with Image.open(clean_path) as img:
+            if getattr(img, "is_animated", False) or getattr(img, "n_frames", 1) > 1:
+                return True
+            try:
+                img.seek(1)
+                return True
+            except EOFError:
+                return False
+    except Exception:
+        return False
+
+
+def get_gif_animation_info(file_path: str) -> dict | None:
+    """Extracts frame count, total duration (s), average FPS, and loop count for an animated GIF."""
+    if not isinstance(file_path, str) or not file_path:
+        return None
+
+    clean_path = file_path.strip()
+    if not clean_path.lower().endswith(".gif") or not os.path.isfile(clean_path):
+        return None
+
+    try:
+        with Image.open(clean_path) as img:
+            frame_count = int(getattr(img, "n_frames", 1) or 1)
+            if frame_count <= 1 and not getattr(img, "is_animated", False):
+                return None
+
+            default_dur = img.info.get("duration", 100)
+            total_ms = 0.0
+            actual_frames = 0
+
+            for frame in ImageSequence.Iterator(img):
+                actual_frames += 1
+                raw_dur = frame.info.get("duration", default_dur)
+                try:
+                    dur_ms = float(raw_dur)
+                except (TypeError, ValueError):
+                    dur_ms = 100.0
+                # GIF viewers commonly clamp 0ms or very fast frame delays to ~100ms (or keep positive values)
+                if dur_ms <= 0:
+                    dur_ms = 100.0
+                total_ms += dur_ms
+
+            frames = max(frame_count, actual_frames)
+            if frames <= 1:
+                return None
+
+            duration_sec = total_ms / 1000.0
+            fps = (frames / duration_sec) if duration_sec > 0 else 0.0
+
+            raw_loop = img.info.get("loop", 0)
+            try:
+                loop_val = int(raw_loop)
+            except (TypeError, ValueError):
+                loop_val = 0
+
+            if loop_val <= 0:
+                loop_str = "Infinite"
+            elif loop_val == 1:
+                loop_str = "1 loop"
+            else:
+                loop_str = f"{loop_val} loops"
+
+            return {
+                "frames": frames,
+                "duration_sec": duration_sec,
+                "fps": fps,
+                "loop_str": loop_str,
+            }
+    except Exception:
+        return None
+
+
+class AnimatedGifScannerSignals(QObject):
+    """Lightweight worker signals for scanning GIF files for multi-frame animation."""
+    animated_gif_batch_ready = Signal(int, list)
+
+
+class AnimatedGifScannerTask(QRunnable):
+    """Background worker task to detect animated GIFs without blocking UI/thumbnails."""
+
+    def __init__(self, items, scan_id, signals, active_scan_getter=None, is_closing_getter=None):
+        super().__init__()
+        self.items = list(items)
+        self.scan_id = scan_id
+        self.signals = signals
+        self.active_scan_getter = active_scan_getter
+        self.is_closing_getter = is_closing_getter
+
+    def _is_cancelled(self):
+        if callable(self.is_closing_getter) and self.is_closing_getter():
+            return True
+        return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
+
+    def run(self):
+        batch = []
+        for item in self.items:
+            if self._is_cancelled():
+                return
+
+            file_path = item.get("file_path") if isinstance(item, dict) else None
+            if file_path and file_path.lower().endswith(".gif"):
+                if is_animated_gif(file_path):
+                    batch.append(file_path)
+
+            if len(batch) >= 50:
+                self.signals.animated_gif_batch_ready.emit(self.scan_id, batch)
+                batch = []
+
+        if batch and not self._is_cancelled():
+            self.signals.animated_gif_batch_ready.emit(self.scan_id, batch)
+
+
 class FolderScannerSignals(QObject):
     batch_scanned = Signal(int, list)
     scan_complete = Signal(int, int)
@@ -181,7 +314,8 @@ class FolderScannerTask(QRunnable):
             "mtime": file_mtime,
             "filename": filename.lower(),
             "dirname_lower": os.path.dirname(file_path).lower(),
-            "has_comfy": False
+            "has_comfy": False,
+            "is_animated_gif": False
         }
 
     def _flush_batch(self, batch, total_count):
@@ -296,6 +430,8 @@ class ThumbnailLoaderTask(QRunnable):
         persist_to_db=True,
         encrypt_thumbnail_cache=None,
         settings_file=None,
+        db_cache=None,
+        is_closing_getter=None,
     ):
         super().__init__()
         self.file_path = file_path
@@ -311,24 +447,31 @@ class ThumbnailLoaderTask(QRunnable):
             None if encrypt_thumbnail_cache is None else bool(encrypt_thumbnail_cache)
         )
         self.settings_file = settings_file or SETTINGS_FILE
+        self.db_cache = db_cache
+        self.is_closing_getter = is_closing_getter
 
     def _is_cancelled(self):
-        return self.active_scan_getter is not None and self.active_scan_getter() != self.scan_id
+        if callable(self.is_closing_getter) and self.is_closing_getter():
+            return True
+        return callable(self.active_scan_getter) and self.active_scan_getter() != self.scan_id
 
     def run(self):
         if self._is_cancelled():
             return
 
         try:
+            if not self.file_path or not os.path.exists(self.file_path):
+                return
+
             settings = None
             resolved_settings_file = self.settings_file or SETTINGS_FILE
             if self.jpeg_quality is None:
                 settings = load_settings(resolved_settings_file)
-                raw_q = settings.get("thumbnail_jpeg_quality", 88)
+                raw_q = settings.get("thumbnail_jpeg_quality", 90)
                 try:
                     jpeg_quality = max(1, min(100, int(raw_q)))
                 except (TypeError, ValueError):
-                    jpeg_quality = 88
+                    jpeg_quality = 90
             else:
                 jpeg_quality = max(1, min(100, int(self.jpeg_quality)))
 
@@ -339,11 +482,14 @@ class ThumbnailLoaderTask(QRunnable):
             else:
                 encrypt_enabled = self.encrypt_thumbnail_cache
 
-            cache_dir = self.cache_dir or os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
-            db_cache = ThumbnailSQLiteCache.get_shared(
-                cache_dir,
-                encrypt_enabled=encrypt_enabled,
-            )
+            db_cache = self.db_cache
+            if db_cache is None:
+                cache_dir = self.cache_dir or os.path.join(tempfile.gettempdir(), "pyqt_slate_thumbnail_cache")
+                db_cache = ThumbnailSQLiteCache.get_shared(
+                    cache_dir,
+                    encrypt_enabled=encrypt_enabled,
+                )
+
             qimg, virtual_path = db_cache.generate_and_cache_qimage(
                 self.file_path,
                 target_size=self.target_size,
@@ -351,7 +497,10 @@ class ThumbnailLoaderTask(QRunnable):
                 persist_to_db=self.persist_to_db,
             )
             if not self._is_cancelled() and qimg is not None and not qimg.isNull():
-                self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, virtual_path or "", qimg)
+                try:
+                    self.signals.thumbnail_ready.emit(self.scan_id, self.file_path, virtual_path or "", qimg)
+                except RuntimeError:
+                    pass
         except Exception:
             pass
 
