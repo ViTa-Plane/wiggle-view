@@ -623,6 +623,7 @@ class MainWindow(QMainWindow, WindowDragHandler):
 
         if folder and os.path.isdir(folder):
             abs_folder = os.path.abspath(folder)
+            print(f"abs_folder: {abs_folder}")
             self.left_browser.set_selected_folder(abs_folder)
             self.load_images_from_folder(abs_folder)
             self._center_folder_in_tree_for_path(abs_folder)
@@ -819,11 +820,12 @@ class MainWindow(QMainWindow, WindowDragHandler):
         if hasattr(self, 'thumb_db_cache') and self.thumb_db_cache is not None:
             self.thumb_db_cache.flush()
 
-        if hasattr(self, 'initial_target_image') and self.initial_target_image:
+        if hasattr(self, "initial_target_image") and self.initial_target_image:
             target = self.initial_target_image
             self.initial_target_image = None
             self.open_image_viewer(target)
         else:
+            self._sync_viewer_items_order()
             self._reload_active_viewer_if_needed()
 
     def on_comfy_batch_ready(self, scan_id, file_paths):
@@ -1159,6 +1161,26 @@ class MainWindow(QMainWindow, WindowDragHandler):
         elif criteria == "type":
             self.loaded_items.sort(key=self._item_type_sort_key, reverse=is_rev)
 
+    def _sync_viewer_items_order(self):
+        """Keeps any open viewer's item list and current_index aligned with self.loaded_items."""
+        viewer = getattr(self, "viewer_window", None)
+        detached = getattr(self, "detached_viewers", None) or []
+        if viewer is None and not detached:
+            return
+
+        if viewer is not None and _qt_alive(viewer) and hasattr(viewer, "sync_items_order"):
+            try:
+                viewer.sync_items_order(self.loaded_items)
+            except Exception:
+                pass
+
+        for dv in list(detached):
+            if dv is not None and _qt_alive(dv) and hasattr(dv, "sync_items_order"):
+                try:
+                    dv.sync_items_order(self.loaded_items)
+                except Exception:
+                    pass
+
     def apply_sorting(self):
         if self._is_closing or not _qt_alive(self) or not self.loaded_items:
             return
@@ -1186,6 +1208,8 @@ class MainWindow(QMainWindow, WindowDragHandler):
         grid = getattr(self, "workspace_grid", None)
         if _qt_alive(grid):
             grid.set_cards(self.loaded_items)
+
+        self._sync_viewer_items_order()
 
     def select_all_items(self):
         grid = getattr(self, "workspace_grid", None)

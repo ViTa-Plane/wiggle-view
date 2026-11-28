@@ -1,5 +1,6 @@
 import os
 import shutil
+import traceback
 from collections import OrderedDict
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QFrame
 from PySide6.QtCore import (
@@ -11,9 +12,10 @@ from PySide6.QtGui import (
     QKeyEvent, QImageReader, QPen, QPainterPath
 )
 from .widgets import ResizeHandleWidget, WindowDragHandler
-from .helpers import load_settings, save_settings
+from .helpers import load_settings, save_settings, DEFAULT_SETTINGS_FILE
 from .workers import is_animated_gif
 
+SETTINGS_FILE = DEFAULT_SETTINGS_FILE
 
 class PinIconButton(QPushButton):
     """Custom button rendering pin/unpin icons cleanly on Windows frameless windows."""
@@ -552,6 +554,10 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         super().__init__(parent)
         WindowDragHandler.__init__(self)
 
+        self.settings_file = SETTINGS_FILE
+        settings_init = load_settings(self.settings_file)
+        self.debug_mode = bool(settings_init.get("debug_mode", False))
+
         self._closing = False
         self._user_resized = False
         self._toggling_topmost = False
@@ -566,8 +572,10 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         self._resize_edge = None
 
         self.current_index = 0
+        target_norm = os.path.normcase(os.path.abspath(image_path)) if image_path else ""
         for i, item in enumerate(self.items):
-            if item.get("file_path") == image_path:
+            fp = item.get("file_path")
+            if fp and os.path.normcase(os.path.abspath(fp)) == target_norm:
                 self.current_index = i
                 break
 
@@ -839,6 +847,14 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
         self.canvas.set_pixmap(pixmap, file_path)
         QTimer.singleShot(10, self.canvas.reset_fit)
         self.update_title_zoom()
+        if self.debug_mode:
+            stack_hint = " <- ".join(frame.name for frame in traceback.extract_stack()[-5:-1])
+            print(
+                f"_display_ready_pixmap:"
+                f"[ready={os.path.basename(file_path or '')} "
+                f"active={os.path.basename(self.image_path or '')} idx={self.current_index} | {stack_hint}"
+            )
+
         return True
 
     def update_title_zoom(self):
@@ -866,6 +882,47 @@ class ImageViewerWindow(QWidget, WindowDragHandler):
             except Exception:
                 pass
         QTimer.singleShot(timeout_ms, self.update_title_zoom)
+
+    def sync_items_order(self, items_list):
+        """Updates viewer item ordering and re-syncs current_index to self.image_path."""
+        if getattr(self, "_closing", False):
+            return
+
+        if self.debug_mode:
+            print(
+                f"[SYNC_ORDER] incoming={len(items_list or [])} cur_before={self.current_index} "
+                f"img={os.path.basename(self.image_path or '')}"
+            )
+
+        self.items = list(items_list) if items_list else []
+        if not self.items:
+            self.current_index = 0
+            return
+
+        target_path = getattr(self, "image_path", None)
+        target_norm = os.path.normcase(os.path.abspath(target_path)) if target_path else ""
+
+        matched_idx = None
+        if target_norm:
+            for idx, item in enumerate(self.items):
+                if not isinstance(item, dict):
+                    continue
+                fp = item.get("file_path")
+                if fp and os.path.normcase(os.path.abspath(fp)) == target_norm:
+                    matched_idx = idx
+                    self.image_path = os.path.abspath(fp)
+                    break
+
+        if matched_idx is not None:
+            self.current_index = matched_idx
+        else:
+            self.current_index = max(0, min(self.current_index, len(self.items) - 1))
+            fallback_fp = self.items[self.current_index].get("file_path")
+            if fallback_fp:
+                self.image_path = os.path.abspath(fallback_fp)
+
+        if getattr(self, "_prefetch_enabled", False):
+            self.prefetch_neighbors()
 
     def _resolve_clip_dest_path(self, clip_dir: str, src_path: str, overwrite_existing: bool) -> str:
         """Resolves destination path in clip_dir, appending a numeric suffix when overwrite is False."""
