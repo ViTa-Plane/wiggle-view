@@ -393,7 +393,8 @@ class DirectoryBrowserPanel(QFrame):
     def on_dir_clicked(self, index: QModelIndex):
         dir_path = self.fs_model.filePath(index)
         if os.path.isdir(dir_path):
-            self.folder_selected.emit(dir_path)
+            abs_path = os.path.abspath(dir_path)
+            self.folder_selected.emit(abs_path)
 
     def set_selected_folder(self, folder_path):
         if folder_path and os.path.isdir(folder_path):
